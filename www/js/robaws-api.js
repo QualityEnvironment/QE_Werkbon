@@ -553,13 +553,15 @@ const RobawsAPI = {
      * @param {string} date - YYYY-MM-DD
      */
     async getTimeRegistrations(employeeId, date) {
-        // Robaws filtert op employeeId, we filteren zelf op datum
+        // Robaws filtert op employeeId, we filteren zelf op datum + dubbele employeeId check
         const res = await this.get(`time-registrations?employeeId=${employeeId}&limit=100`);
         if (res.code !== 200 || !res.data || !res.data.items) return [];
-        // Filter op datum (startDate begint met YYYY-MM-DD)
         return res.data.items.filter(item => {
             const itemDate = (item.startDate || '').substring(0, 10);
-            return itemDate === date;
+            // Dubbele check: alleen registraties van deze werknemer
+            const itemEmpId = item.employeeId || (item.employee && item.employee.id);
+            const empMatch = !itemEmpId || String(itemEmpId) === String(employeeId);
+            return itemDate === date && empMatch;
         });
     },
 
@@ -685,13 +687,17 @@ const RobawsAPI = {
             if (page >= (res.data.totalPages || 1)) break;
         } while (page < 10);
 
-        // Filter op laatste X dagen
+        // Filter op laatste X dagen + dubbele check employeeId
         const cutoff = new Date();
         cutoff.setDate(cutoff.getDate() - days);
         const cutoffStr = cutoff.toISOString();
 
         return allItems
-            .filter(item => item.startDate >= cutoffStr)
+            .filter(item => {
+                const itemEmpId = item.employeeId || (item.employee && item.employee.id);
+                const empMatch = !itemEmpId || String(itemEmpId) === String(employeeId);
+                return item.startDate >= cutoffStr && empMatch;
+            })
             .sort((a, b) => b.startDate.localeCompare(a.startDate));
     },
 

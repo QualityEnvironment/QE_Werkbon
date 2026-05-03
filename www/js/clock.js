@@ -659,13 +659,18 @@ window.QEClock = {
             const res = await RobawsAPI.get(`time-registrations?employeeId=${user.robawsEmployeeId}&limit=100`);
             if (res.code !== 200 || !res.data || !res.data.items) return [];
 
-            // Filter op laatste X dagen
+            // Filter op laatste X dagen + dubbele check employeeId
             const cutoff = new Date();
             cutoff.setDate(cutoff.getDate() - days);
             const cutoffStr = cutoff.toISOString();
+            const empId = String(user.robawsEmployeeId);
 
             return res.data.items
-                .filter(item => item.startDate >= cutoffStr)
+                .filter(item => {
+                    const itemEmpId = item.employeeId || (item.employee && item.employee.id);
+                    const empMatch = !itemEmpId || String(itemEmpId) === empId;
+                    return item.startDate >= cutoffStr && empMatch;
+                })
                 .sort((a, b) => b.startDate.localeCompare(a.startDate));
         } catch (e) {
             console.warn('[Clock] Kon geschiedenis niet ophalen:', e.message);
