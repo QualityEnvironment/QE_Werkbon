@@ -335,7 +335,47 @@ const app = {
         // Dark mode toggle synchroniseren
         const dmToggle = document.getElementById('darkModeToggle');
         if (dmToggle) dmToggle.checked = document.body.classList.contains('dark-mode');
+        // App versie tonen
+        const versionEl = document.getElementById('appVersionInfo');
+        if (versionEl) {
+            const v = (window.QEBridge && QEBridge.getAppVersion) ? QEBridge.getAppVersion() : 0;
+            versionEl.textContent = v > 0 ? `Huidige versie: ${v}` : 'Basisversie (geen updates)';
+        }
+        const updateStatus = document.getElementById('updateStatus');
+        if (updateStatus) updateStatus.style.display = 'none';
         this.navigate('screenProfile');
+    },
+
+    checkForUpdate() {
+        const btn = document.getElementById('btnCheckUpdate');
+        const status = document.getElementById('updateStatus');
+        if (btn) { btn.disabled = true; btn.textContent = 'Zoeken...'; }
+        if (status) { status.style.display = 'block'; status.style.color = 'var(--qe-grey)'; status.textContent = 'Controleren op updates...'; }
+
+        if (window.QEBridge && QEBridge.checkForUpdate) {
+            QEBridge.checkForUpdate();
+            // Poll elke seconde of de versie veranderd is
+            const startVersion = QEBridge.getAppVersion ? QEBridge.getAppVersion() : 0;
+            let checks = 0;
+            const poll = setInterval(() => {
+                checks++;
+                const newVersion = QEBridge.getAppVersion ? QEBridge.getAppVersion() : 0;
+                if (newVersion > startVersion) {
+                    clearInterval(poll);
+                    if (status) { status.style.color = 'var(--qe-green)'; status.textContent = `✅ Bijgewerkt naar versie ${newVersion}!`; }
+                    if (btn) { btn.disabled = false; btn.textContent = 'Controleren'; }
+                    const versionEl = document.getElementById('appVersionInfo');
+                    if (versionEl) versionEl.textContent = `Huidige versie: ${newVersion}`;
+                } else if (checks >= 30) {
+                    clearInterval(poll);
+                    if (status) { status.style.color = 'var(--qe-grey)'; status.textContent = 'Geen update beschikbaar'; }
+                    if (btn) { btn.disabled = false; btn.textContent = 'Controleren'; }
+                }
+            }, 1000);
+        } else {
+            if (status) { status.style.color = '#c62828'; status.textContent = 'Updates niet beschikbaar in deze versie'; }
+            if (btn) { btn.disabled = false; btn.textContent = 'Controleren'; }
+        }
     },
 
     profilePickPhoto(source) {

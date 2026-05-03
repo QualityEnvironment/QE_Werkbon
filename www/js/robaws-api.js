@@ -626,20 +626,27 @@ const RobawsAPI = {
             camionetten: [],        // [{ name, fieldName, tagId }]
             startuur: null,         // verwachte starttijd "HH:MM"
         };
+        // Velden die we moeten overslaan (niet-tag velden)
+        const skipFields = ['Startuur werknemer', 'Pincode'];
+
         for (const [fieldName, fieldData] of Object.entries(extraFields)) {
-            // Startuur werknemer
+            // Startuur apart behandelen
             if (fieldName === 'Startuur werknemer') {
                 const val = fieldData ? String(fieldData.stringValue ?? fieldData.value ?? '') : '';
                 if (val) result.startuur = val;
                 continue;
             }
-            // Skip velden die niet in QE Tags groep zitten en niet met NFC beginnen
-            const group = fieldData ? (fieldData.group || '') : '';
+            if (skipFields.includes(fieldName)) continue;
+
+            // Check groep info (kan via group veld of groupName)
+            const group = fieldData ? (fieldData.group || fieldData.groupName || '') : '';
             const isQETag = group === 'QE Tags';
             const isNFC = fieldName.startsWith('NFC ');
-            if (!isQETag && !isNFC) continue;
-            // Skip niet-tag velden (Pincode, Startuur, etc.)
-            if (fieldName === 'Pincode' || fieldName === 'Startuur werknemer') continue;
+
+            // Herken het veld als tag: via groepsnaam, via NFC prefix, of via nummerplaat-patroon (bv. "1-ABC-123", "2-ABA-191")
+            const isNummerplaat = /^\d+-[A-Z]{2,4}-\d+$/.test(fieldName);
+
+            if (!isQETag && !isNFC && !isNummerplaat) continue;
 
             const tagId = fieldData ? String(fieldData.stringValue ?? fieldData.value ?? '').trim() : '';
             if (fieldName === 'NFC Bureau Tag') {
@@ -647,11 +654,10 @@ const RobawsAPI = {
             } else if (fieldName === 'NFC Bureau Tag Laden & Lossen') {
                 result.ladenLossen = { fieldName, tagId: tagId || null };
             } else if (isNFC && fieldName.endsWith(' Tag')) {
-                // Oud formaat: "NFC {naam} Tag"
                 const name = fieldName.replace(/^NFC\s+/, '').replace(/\s+Tag$/, '');
                 result.camionetten.push({ name, fieldName, tagId: tagId || null });
-            } else if (isQETag && !isNFC) {
-                // Nieuw formaat: veldnaam IS de naam (bv. "2-ABA-191")
+            } else {
+                // Alles anders (nummerplaten, QE Tags groep items)
                 result.camionetten.push({ name: fieldName, fieldName, tagId: tagId || null });
             }
         }
