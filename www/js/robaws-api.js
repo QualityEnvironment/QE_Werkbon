@@ -633,17 +633,26 @@ const RobawsAPI = {
                 if (val) result.startuur = val;
                 continue;
             }
-            // NFC tag velden herkennen aan naam
-            if (!fieldName.startsWith('NFC ')) continue;
+            // Skip velden die niet in QE Tags groep zitten en niet met NFC beginnen
+            const group = fieldData ? (fieldData.group || '') : '';
+            const isQETag = group === 'QE Tags';
+            const isNFC = fieldName.startsWith('NFC ');
+            if (!isQETag && !isNFC) continue;
+            // Skip niet-tag velden (Pincode, Startuur, etc.)
+            if (fieldName === 'Pincode' || fieldName === 'Startuur werknemer') continue;
+
             const tagId = fieldData ? String(fieldData.stringValue ?? fieldData.value ?? '').trim() : '';
             if (fieldName === 'NFC Bureau Tag') {
                 result.bureau = { fieldName, tagId: tagId || null };
             } else if (fieldName === 'NFC Bureau Tag Laden & Lossen') {
                 result.ladenLossen = { fieldName, tagId: tagId || null };
-            } else if (fieldName.endsWith(' Tag')) {
-                // Camionet: extract naam uit "NFC {naam} Tag"
+            } else if (isNFC && fieldName.endsWith(' Tag')) {
+                // Oud formaat: "NFC {naam} Tag"
                 const name = fieldName.replace(/^NFC\s+/, '').replace(/\s+Tag$/, '');
                 result.camionetten.push({ name, fieldName, tagId: tagId || null });
+            } else if (isQETag && !isNFC) {
+                // Nieuw formaat: veldnaam IS de naam (bv. "2-ABA-191")
+                result.camionetten.push({ name: fieldName, fieldName, tagId: tagId || null });
             }
         }
         return result;
