@@ -872,7 +872,7 @@ const app = {
             ${displayAddress ? `
             <button onclick="app.navigateToAddress('${this.escapeHtml(displayAddress).replace(/'/g, "\\'")}')"
                 style="width:100%;margin-top:10px;padding:12px;border:none;border-radius:10px;
-                background:linear-gradient(135deg,var(--qe-purple),var(--qe-dark));color:#fff;
+                background:linear-gradient(135deg,#6A2C91,#001E45);color:#fff;
                 font-size:15px;font-weight:600;cursor:pointer;display:flex;align-items:center;
                 justify-content:center;gap:8px;box-shadow:0 2px 8px rgba(106,44,145,0.3)">
                 🧭 Navigeer naar adres
@@ -2577,11 +2577,16 @@ const app = {
             const desc = li.description || 'Artikel';
             const qty = li.quantity || 1;
             const unit = li.unitType || 'stuk';
+            const checkId = `planItem_${this.currentWO?.id || 'x'}_${i}`;
+            const checked = localStorage.getItem(checkId) === '1';
             return `
-                <div class="card" style="display:flex;align-items:center;gap:14px;padding:16px;margin-bottom:10px">
-                    <div style="width:40px;height:40px;border-radius:10px;background:rgba(106,44,145,0.08);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">📦</div>
+                <div class="card" style="display:flex;align-items:center;gap:14px;padding:16px;margin-bottom:10px;${checked ? 'opacity:0.5;' : ''}" id="planItemCard_${i}">
+                    <label style="width:40px;height:40px;border-radius:10px;background:${checked ? 'var(--qe-green)' : 'rgba(106,44,145,0.08)'};display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;cursor:pointer;transition:background 0.2s">
+                        <input type="checkbox" ${checked ? 'checked' : ''} onchange="app.togglePlanItem(${i}, this.checked)" style="display:none">
+                        <span style="font-size:20px">${checked ? '✅' : '📦'}</span>
+                    </label>
                     <div style="flex:1;min-width:0">
-                        <div style="font-size:15px;font-weight:600;color:var(--qe-darkblue);line-height:1.3">${this.escapeHtml(desc)}</div>
+                        <div style="font-size:15px;font-weight:600;color:var(--qe-darkblue);line-height:1.3;${checked ? 'text-decoration:line-through;' : ''}">${this.escapeHtml(desc)}</div>
                     </div>
                     <div style="text-align:right;flex-shrink:0">
                         <div style="font-size:18px;font-weight:700;color:var(--qe-purple)">${qty}</div>
@@ -2589,6 +2594,21 @@ const app = {
                     </div>
                 </div>`;
         }).join('');
+    },
+
+    togglePlanItem(index, checked) {
+        const checkId = `planItem_${this.currentWO?.id || 'x'}_${index}`;
+        localStorage.setItem(checkId, checked ? '1' : '0');
+        const card = document.getElementById(`planItemCard_${index}`);
+        if (card) {
+            card.style.opacity = checked ? '0.5' : '1';
+            const icon = card.querySelector('label span');
+            if (icon) icon.textContent = checked ? '✅' : '📦';
+            const label = card.querySelector('label');
+            if (label) label.style.background = checked ? 'var(--qe-green)' : 'rgba(106,44,145,0.08)';
+            const desc = card.querySelector('div[style*="font-weight:600"]');
+            if (desc) desc.style.textDecoration = checked ? 'line-through' : 'none';
+        }
     },
 
     // Planning documenten/bestanden tonen

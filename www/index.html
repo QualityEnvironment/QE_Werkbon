@@ -785,6 +785,18 @@
         </label>
     </div>
 
+    <!-- App update -->
+    <div class="card" style="margin-bottom:12px">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+            <div>
+                <div style="font-size:14px;font-weight:600">🔄 App bijwerken</div>
+                <div style="font-size:12px;color:var(--qe-grey)" id="appVersionInfo">Versie laden...</div>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btnCheckUpdate" onclick="app.checkForUpdate()">Controleren</button>
+        </div>
+        <div id="updateStatus" style="font-size:13px;text-align:center;margin-top:8px;display:none"></div>
+    </div>
+
     <!-- PIN wijzigen -->
     <div class="card" style="margin-bottom:12px">
         <div style="font-size:14px;font-weight:600;margin-bottom:8px">PIN wijzigen</div>
