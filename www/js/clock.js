@@ -1,0 +1,954 @@
+/**
+ * QE Clock v2 — Tijdsregistratie via Robaws
+ *
+ * Volledig systeem gebaseerd op Robaws time-registrations API.
+ * Geen lokale database meer — alles via Robaws + localStorage cache.
+ *
+ * NFC Tags (3 soorten, beheerd in Robaws extra velden groep "QE Tags"):
+ *   - Bureau Tag:           inclocken/uitclocken op kantoor
+ *   - Camionet Tags:        inclocken vanuit de wagen (per nummerplaat)
+ *   - Bureau Laden & Lossen: aparte tag voor laden/lossen sessies
+ *
+ * Tijdsregistratie types (Robaws statussen):
+ *   - "Op tijd"        eerste scan van de dag, binnen verwachte starttijd
+ *   - "Te laat"        eerste scan van de dag, na verwachte starttijd
+ *   - "Extra uren"     elke scan NA de eerste in/uit cyclus
+ *   - "Laden & Lossen" gestart door de aparte L&L bureau-tag
+ *
+ * Flow:
+ *   1. Scan NFC → identificeer tag (bureau/camionet/L&L)
+ *   2. Eerste scan dag → start registratie, bepaal "Op tijd"/"Te laat"
+ *   3. GPS locatie ophalen → in opmerkingen van registratie
+ *   4. Tweede scan → stop registratie, upload naar Robaws
+ *   5. Volgende scans → "Extra uren" registratie
+ *   6. L&L tag → "Laden & Lossen" registratie
+ *
+ * Verwachte starttijd: per werknemer via extra veld "Startuur werknemer"
+ * Fallback: monteur 06:45, technieker 07:30, kantoor 08:00
+ */
+
+window.QEClock = {
+
+    // =============================================
+    // CONFIGURATIE
+    // =============================================
+
+    /** Fallback starttijden per rol (als Robaws veld leeg is) */
+    FALLBACK_START_TIMES: {
+        monteur:    '06:45',
+        technieker: '07:30',
+        kantoor:    '08:00',
+    },
+
+    // =============================================
+    // HELPERS
+    // =============================================
+
+    /** Lokale datum als YYYY-MM-DD */
+    _localDate(d) {
+        const dt = d || new Date();
+        return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+    },
+
+    /** Lokale tijd als HH:MM */
+    _localTime(d) {
+        const dt = d || new Date();
+        return dt.toTimeString().slice(0, 5);
+    },
+
+    /** Bereken uren verschil tussen twee ISO datums */
+    _calcHours(startISO, endISO) {
+        const ms = new Date(endISO).getTime() - new Date(startISO).getTime();
+        return Math.round((ms / 3600000) * 100) / 100; // 2 decimalen
+    },
+
+    // =============================================
+    // NFC TAG CONFIGURATIE (uit Robaws)
+    // =============================================
+
+    /** Gecachte tag configuratie */
+    _tagConfig: null,
+
+    /** Haal NFC tags op van Robaws en cache lokaal */
+    async loadTagConfig() {
+        try {
+            const config = await RobawsAPI.getNfcTagConfig();
+            this._tagConfig = config;
+            localStorage.setItem('qe_nfc_tags', JSON.stringify(config));
+            console.log('[Clock] NFC tags geladen:', JSON.stringify(config));
+            return config;
+        } catch (e) {
+            console.warn('[Clock] Kon NFC tags niet ophalen:', e.message);
+            // Gebruik cache
+            const cached = localStorage.getItem('qe_nfc_tags');
+            if (cached) {
+                this._tagConfig = JSON.parse(cached);
+                return this._tagConfig;
+            }
+            return null;
+        }
+    },
+
+    /** Haal gecachte tag config op */
+    getTagConfig() {
+        if (this._tagConfig) return this._tagConfig;
+        const cached = localStorage.getItem('qe_nfc_tags');
+        if (cached) {
+            this._tagConfig = JSON.parse(cached);
+            return this._tagConfig;
+        }
+        return null;
+    },
+
+    /**
+     * Identificeer een gescande NFC tag.
+     * @returns {Object|null} - { type: 'bureau'|'camionet'|'laden_lossen', name: string } of null
+     */
+    identifyTag(tagId) {
+        const config = this.getTagConfig();
+        if (!config) return null;
+
+        // Bureau tag
+        if (config.bureau && config.bureau.tagId === tagId) {
+            return { type: 'bureau', name: 'Bureau' };
+        }
+
+        // Laden & Lossen tag
+        if (config.ladenLossen && config.ladenLossen.tagId === tagId) {
+            return { type: 'laden_lossen', name: 'Laden & Lossen' };
+        }
+
+        // Camionet tags
+        for (const cam of (config.camionetten || [])) {
+            if (cam.tagId === tagId) {
+                return { type: 'camionet', name: cam.name };
+            }
+        }
+
+        return null; // Onbekende tag
+    },
+
+    /** Haal verwachte starttijd op voor de ingelogde gebruiker */
+    getExpectedStartTime() {
+        const config = this.getTagConfig();
+        if (config && config.startuur) return config.startuur;
+        // Fallback op basis van rol
+        const user = RobawsAPI.getLoggedInUser();
+        if (user) return this.FALLBACK_START_TIMES[user.role] || '07:30';
+        return '07:30';
+    },
+
+    // =============================================
+    // ACTIEVE SESSIE (localStorage)
+    // =============================================
+
+    /**
+     * Actieve clock sessie voor vandaag.
+     * Opgeslagen in localStorage als:
+     * {
+     *   date: "2026-05-03",
+     *   employeeId: "1",
+     *   active: true/false,
+     *   startTime: "06:45",
+     *   startISO: "2026-05-03T04:45:00.000Z",
+     *   tagType: "bureau|camionet|laden_lossen",
+     *   tagName: "Bureau|2-ABA-191|Laden & Lossen",
+     *   registrationType: "Op tijd|Te laat|Extra uren|Laden & Lossen",
+     *   robawsId: null|"3",  // Robaws registratie ID na upload
+     *   gpsLat: null|51.243,
+     *   gpsLng: null|4.525,
+     *   completedSessions: [  // eerder voltooide sessies vandaag
+     *     { startTime, endTime, type, robawsId, tagName }
+     *   ]
+     * }
+     */
+    _getSessionKey() {
+        const user = RobawsAPI.getLoggedInUser();
+        if (!user) return null;
+        return `qe_clock_v2_${this._localDate()}_${user.email}`;
+    },
+
+    getSession() {
+        const key = this._getSessionKey();
+        if (!key) return null;
+        const stored = localStorage.getItem(key);
+        if (stored) {
+            const session = JSON.parse(stored);
+            // Controleer of het vandaag is
+            if (session.date !== this._localDate()) {
+                localStorage.removeItem(key);
+                return null;
+            }
+            return session;
+        }
+        return null;
+    },
+
+    _saveSession(session) {
+        const key = this._getSessionKey();
+        if (!key) return;
+        localStorage.setItem(key, JSON.stringify(session));
+    },
+
+    _newSession() {
+        const user = RobawsAPI.getLoggedInUser();
+        return {
+            date: this._localDate(),
+            employeeId: user ? String(user.robawsEmployeeId) : null,
+            active: false,
+            startTime: null,
+            startISO: null,
+            tagType: null,
+            tagName: null,
+            registrationType: null,
+            robawsId: null,
+            gpsLat: null,
+            gpsLng: null,
+            completedSessions: [],
+        };
+    },
+
+    /** Is er een actieve (lopende) sessie? */
+    isActive() {
+        const session = this.getSession();
+        return session ? session.active : false;
+    },
+
+    /** Is er al minstens 1 voltooide sessie vandaag? */
+    hasCompletedToday() {
+        const session = this.getSession();
+        return session ? (session.completedSessions || []).length > 0 : false;
+    },
+
+    // =============================================
+    // NFC SCAN (aangeroepen vanuit Java/MainActivity)
+    // =============================================
+
+    async onNfcScan(tagId) {
+        console.log('[Clock] NFC scan:', tagId);
+        const user = RobawsAPI.getLoggedInUser();
+        if (!user) {
+            if (window.app) app.toast('Log eerst in om te clocken');
+            return;
+        }
+
+        // ── TOEWIJZINGSMODUS: tag wordt toegewezen aan gekozen locatie ──
+        if (this._pendingAssignment) {
+            await this._handleAssignmentScan(tagId);
+            return;
+        }
+
+        // Zorg dat tag config geladen is
+        if (!this.getTagConfig()) {
+            await this.loadTagConfig();
+        }
+
+        // Identificeer de tag
+        const tag = this.identifyTag(tagId);
+
+        if (!tag) {
+            // Onbekende tag
+            if (window.app) app.toast('Onbekende NFC tag — wijs deze eerst toe via Tag beheer', true);
+            return;
+        }
+
+        // Haal of maak sessie
+        let session = this.getSession() || this._newSession();
+
+        // ── LADEN & LOSSEN ──
+        if (tag.type === 'laden_lossen') {
+            await this._handleLadenLossen(session, tag);
+            return;
+        }
+
+        // ── ACTIEVE SESSIE → UITCLOCKEN ──
+        if (session.active) {
+            await this._clockOut(session, tag);
+            return;
+        }
+
+        // ── GEEN ACTIEVE SESSIE → INCLOCKEN ──
+        await this._clockIn(session, tag);
+    },
+
+    // =============================================
+    // INCLOCKEN
+    // =============================================
+
+    async _clockIn(session, tag) {
+        const now = new Date();
+        const time = this._localTime(now);
+        const isFirstOfDay = (session.completedSessions || []).length === 0;
+
+        // Bepaal type
+        let type;
+        if (!isFirstOfDay) {
+            type = 'Extra uren';
+        } else {
+            const expectedStart = this.getExpectedStartTime();
+            type = time <= expectedStart ? 'Op tijd' : 'Te laat';
+        }
+
+        // GPS ophalen
+        let gpsLat = null, gpsLng = null, gpsText = '';
+        try {
+            const pos = await this._getGPS();
+            gpsLat = pos.latitude;
+            gpsLng = pos.longitude;
+            gpsText = `https://maps.google.com/?q=${gpsLat.toFixed(6)},${gpsLng.toFixed(6)}`;
+        } catch (e) {
+            console.warn('[Clock] GPS niet beschikbaar:', e.message);
+            gpsText = 'GPS niet beschikbaar';
+        }
+
+        // Opmerkingen opbouwen
+        const remarks = `${tag.name} — ${gpsText} — ${time}`;
+
+        // Sessie bijwerken
+        session.active = true;
+        session.startTime = time;
+        session.startISO = now.toISOString();
+        session.tagType = tag.type;
+        session.tagName = tag.name;
+        session.registrationType = type;
+        session.robawsId = null;
+        session.gpsLat = gpsLat;
+        session.gpsLng = gpsLng;
+        session.pendingRemarks = remarks;
+        this._saveSession(session);
+
+        // Upload naar Robaws
+        try {
+            const result = await RobawsAPI.createTimeRegistration({
+                employeeId: session.employeeId,
+                startDate: session.startISO,
+                type: type,
+                remarks: remarks,
+            });
+            if (result.code === 200 || result.code === 201) {
+                session.robawsId = result.data ? String(result.data.id) : null;
+                this._saveSession(session);
+                console.log('[Clock] Registratie aangemaakt in Robaws, ID:', session.robawsId);
+            } else {
+                console.warn('[Clock] Robaws registratie aanmaken mislukt:', result.code);
+            }
+        } catch (e) {
+            console.warn('[Clock] Robaws niet bereikbaar bij inclocken:', e.message);
+            // Sessie blijft lokaal, wordt later gesynchroniseerd
+        }
+
+        // UI feedback
+        const emoji = type === 'Op tijd' ? '✅' : (type === 'Te laat' ? '⚠️' : '🔄');
+        const lateMsg = type === 'Te laat' ? ' (te laat!)' : '';
+        if (window.app) {
+            app.toast(`${emoji} Ingeklokt om ${time} — ${tag.name}${lateMsg}`);
+            app.updateClockUI();
+            app.navigate(app.currentScreen);
+        }
+    },
+
+    // =============================================
+    // UITCLOCKEN
+    // =============================================
+
+    async _clockOut(session, tag) {
+        const now = new Date();
+        const endTime = this._localTime(now);
+        const endISO = now.toISOString();
+        const hours = this._calcHours(session.startISO, endISO);
+
+        // Sessie afronden
+        session.active = false;
+        const completedEntry = {
+            startTime: session.startTime,
+            endTime: endTime,
+            type: session.registrationType,
+            robawsId: session.robawsId,
+            tagName: session.tagName,
+            hours: hours,
+        };
+        session.completedSessions = session.completedSessions || [];
+        session.completedSessions.push(completedEntry);
+        this._saveSession(session);
+
+        // Update in Robaws (endDate + hours toevoegen)
+        if (session.robawsId) {
+            try {
+                await RobawsAPI.updateTimeRegistration(session.robawsId, {
+                    endDate: endISO,
+                    hours: hours,
+                });
+                console.log('[Clock] Registratie afgesloten in Robaws:', session.robawsId);
+            } catch (e) {
+                console.warn('[Clock] Robaws update mislukt:', e.message);
+                // Sla op als pending sync
+                this._addPendingSync({
+                    action: 'update',
+                    id: session.robawsId,
+                    endDate: endISO,
+                    hours: hours,
+                });
+            }
+        } else {
+            // Was nooit geüpload → sla volledige registratie op als pending
+            this._addPendingSync({
+                action: 'create_complete',
+                employeeId: session.employeeId,
+                startDate: session.startISO,
+                endDate: endISO,
+                hours: hours,
+                type: session.registrationType,
+                remarks: session.pendingRemarks || '',
+            });
+        }
+
+        // UI feedback
+        if (window.app) {
+            app.toast(`🏁 Uitgeklokt om ${endTime} — ${hours} uur gewerkt`);
+            app.updateClockUI();
+            app.navigate(app.currentScreen);
+        }
+    },
+
+    // =============================================
+    // LADEN & LOSSEN
+    // =============================================
+
+    async _handleLadenLossen(session, tag) {
+        // Check of er al een actieve L&L sessie loopt
+        if (session.active && session.registrationType === 'Laden & Lossen') {
+            // Stop de L&L sessie
+            await this._clockOut(session, tag);
+            return;
+        }
+
+        // Start nieuwe L&L sessie
+        const now = new Date();
+        const time = this._localTime(now);
+
+        // GPS
+        let gpsLat = null, gpsLng = null, gpsText = '';
+        try {
+            const pos = await this._getGPS();
+            gpsLat = pos.latitude;
+            gpsLng = pos.longitude;
+            gpsText = `https://maps.google.com/?q=${gpsLat.toFixed(6)},${gpsLng.toFixed(6)}`;
+        } catch (e) {
+            gpsText = 'GPS niet beschikbaar';
+        }
+
+        const remarks = `Laden & Lossen — ${gpsText} — ${time}`;
+
+        // Als er een andere actieve sessie loopt, sluit die eerst
+        if (session.active) {
+            await this._clockOut(session, tag);
+            session = this.getSession() || this._newSession();
+        }
+
+        // Start L&L sessie
+        session.active = true;
+        session.startTime = time;
+        session.startISO = now.toISOString();
+        session.tagType = 'laden_lossen';
+        session.tagName = 'Laden & Lossen';
+        session.registrationType = 'Laden & Lossen';
+        session.robawsId = null;
+        session.gpsLat = gpsLat;
+        session.gpsLng = gpsLng;
+        session.pendingRemarks = remarks;
+        this._saveSession(session);
+
+        // Upload naar Robaws
+        try {
+            const result = await RobawsAPI.createTimeRegistration({
+                employeeId: session.employeeId,
+                startDate: session.startISO,
+                type: 'Laden & Lossen',
+                remarks: remarks,
+            });
+            if (result.code === 200 || result.code === 201) {
+                session.robawsId = result.data ? String(result.data.id) : null;
+                this._saveSession(session);
+            }
+        } catch (e) {
+            console.warn('[Clock] Robaws L&L registratie mislukt:', e.message);
+        }
+
+        if (window.app) {
+            app.toast(`📦 Laden & Lossen gestart om ${time}`);
+            app.updateClockUI();
+            app.navigate(app.currentScreen);
+        }
+    },
+
+    // =============================================
+    // GPS
+    // =============================================
+
+    _getGPS() {
+        return new Promise((resolve, reject) => {
+            if (!navigator.geolocation) {
+                reject(new Error('Geolocation niet beschikbaar'));
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(
+                pos => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
+                err => reject(err),
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+            );
+        });
+    },
+
+    // =============================================
+    // TAG TOEWIJZEN: eerst locatie kiezen, dan scannen
+    // =============================================
+
+    /** Wachtende toewijzing: { fieldName, locationName } of null */
+    _pendingAssignment: null,
+
+    /** Start toewijzingsmodus: fullscreen scan-overlay */
+    startTagAssignment(fieldName, locationName) {
+        this._pendingAssignment = { fieldName, locationName };
+
+        // Maak fullscreen overlay
+        const overlay = document.createElement('div');
+        overlay.id = 'nfcScanOverlay';
+        overlay.className = 'nfc-scan-overlay';
+        overlay.innerHTML = `
+            <div class="nfc-location-badge">${locationName}</div>
+            <div class="nfc-icon-wrap">
+                <div class="nfc-ripple"></div>
+                <div class="nfc-ripple"></div>
+                <div class="nfc-ripple"></div>
+                <div class="nfc-icon">📱</div>
+            </div>
+            <h3>Wacht op NFC scan...</h3>
+            <p>Houd de NFC tag tegen de achterkant van je telefoon</p>
+            <button class="nfc-cancel-btn" onclick="QEClock.cancelTagAssignment()">Annuleren</button>
+        `;
+        document.body.appendChild(overlay);
+    },
+
+    /** Annuleer de wachtende toewijzing */
+    cancelTagAssignment() {
+        this._pendingAssignment = null;
+        this._removeNfcOverlay();
+    },
+
+    /** Verwijder de scan overlay */
+    _removeNfcOverlay() {
+        const overlay = document.getElementById('nfcScanOverlay');
+        if (overlay) overlay.remove();
+    },
+
+    /** Toon succes-overlay (kort) en ruim dan op */
+    _showAssignmentSuccess(locationName) {
+        const overlay = document.getElementById('nfcScanOverlay');
+        if (overlay) {
+            overlay.className = 'nfc-scan-overlay nfc-success';
+            overlay.innerHTML = `
+                <div class="nfc-success-icon">✅</div>
+                <h3 style="margin-top:16px">Tag toegewezen!</h3>
+                <p>${locationName}</p>
+            `;
+            setTimeout(() => {
+                this._removeNfcOverlay();
+                if (window.app && app.currentScreen === 'screenClock') app.onNavigateToClock();
+            }, 1500);
+        }
+    },
+
+    /** Toon fout in de overlay */
+    _showAssignmentError(message) {
+        const overlay = document.getElementById('nfcScanOverlay');
+        if (overlay) {
+            overlay.style.background = 'rgba(198,40,40,0.9)';
+            overlay.innerHTML = `
+                <div style="font-size:72px;margin-bottom:16px">❌</div>
+                <h3>Toewijzing mislukt</h3>
+                <p>${message}</p>
+                <button class="nfc-cancel-btn" onclick="QEClock._removeNfcOverlay()" style="margin-top:20px">Sluiten</button>
+            `;
+        }
+    },
+
+    /** Verwerk een scan terwijl er een toewijzing wacht */
+    async _handleAssignmentScan(tagId) {
+        const assignment = this._pendingAssignment;
+        this._pendingAssignment = null;
+
+        // Toon "bezig" status in overlay
+        const overlay = document.getElementById('nfcScanOverlay');
+        if (overlay) {
+            overlay.innerHTML = `
+                <div class="spinner" style="border-top-color:#fff;width:48px;height:48px;border-width:4px;margin-bottom:20px"></div>
+                <h3>Tag opslaan...</h3>
+                <p>${assignment.locationName}</p>
+            `;
+        }
+
+        try {
+            await RobawsAPI.saveNfcTagId(assignment.fieldName, tagId);
+            await this.loadTagConfig();
+            this._showAssignmentSuccess(assignment.locationName);
+        } catch (e) {
+            this._showAssignmentError(e.message);
+        }
+    },
+
+    // =============================================
+    // OFFLINE SYNC
+    // =============================================
+
+    _addPendingSync(item) {
+        const pending = JSON.parse(localStorage.getItem('qe_clock_pending') || '[]');
+        pending.push({ ...item, timestamp: new Date().toISOString() });
+        localStorage.setItem('qe_clock_pending', JSON.stringify(pending));
+    },
+
+    async syncPending() {
+        const pending = JSON.parse(localStorage.getItem('qe_clock_pending') || '[]');
+        if (pending.length === 0) return;
+
+        console.log('[Clock] Syncing', pending.length, 'pending items');
+        const remaining = [];
+
+        for (const item of pending) {
+            try {
+                if (item.action === 'update' && item.id) {
+                    await RobawsAPI.updateTimeRegistration(item.id, {
+                        endDate: item.endDate,
+                        hours: item.hours,
+                    });
+                    console.log('[Clock] Pending update gesynchroniseerd:', item.id);
+                } else if (item.action === 'create_complete') {
+                    await RobawsAPI.createTimeRegistration({
+                        employeeId: item.employeeId,
+                        startDate: item.startDate,
+                        endDate: item.endDate,
+                        hours: item.hours,
+                        type: item.type,
+                        remarks: item.remarks,
+                    });
+                    console.log('[Clock] Pending registratie gesynchroniseerd');
+                }
+            } catch (e) {
+                console.warn('[Clock] Sync mislukt voor item:', e.message);
+                remaining.push(item);
+            }
+        }
+
+        localStorage.setItem('qe_clock_pending', JSON.stringify(remaining));
+        if (remaining.length === 0) {
+            console.log('[Clock] Alle pending items gesynchroniseerd ✓');
+        } else {
+            console.warn('[Clock] Nog', remaining.length, 'items niet gesynchroniseerd');
+        }
+    },
+
+    // =============================================
+    // GESCHIEDENIS (Robaws)
+    // =============================================
+
+    /** Haal tijdsregistraties op voor de afgelopen X dagen */
+    async getHistory(days = 7) {
+        const user = RobawsAPI.getLoggedInUser();
+        if (!user) return [];
+
+        try {
+            const res = await RobawsAPI.get(`time-registrations?employeeId=${user.robawsEmployeeId}&limit=100`);
+            if (res.code !== 200 || !res.data || !res.data.items) return [];
+
+            // Filter op laatste X dagen
+            const cutoff = new Date();
+            cutoff.setDate(cutoff.getDate() - days);
+            const cutoffStr = cutoff.toISOString();
+
+            return res.data.items
+                .filter(item => item.startDate >= cutoffStr)
+                .sort((a, b) => b.startDate.localeCompare(a.startDate));
+        } catch (e) {
+            console.warn('[Clock] Kon geschiedenis niet ophalen:', e.message);
+            return [];
+        }
+    },
+
+    // =============================================
+    // SYNC LOKALE SESSIE MET ROBAWS
+    // =============================================
+
+    /**
+     * Synchroniseer de lokale sessie met de werkelijke Robaws data.
+     * Als registraties in Robaws verwijderd zijn, worden ze ook lokaal verwijderd.
+     * Wordt aangeroepen bij het openen van het klokscherm.
+     */
+    async syncWithRobaws() {
+        const user = RobawsAPI.getLoggedInUser();
+        if (!user) return;
+
+        try {
+            const today = this._localDate();
+            const robawsRegs = await RobawsAPI.getTimeRegistrations(user.robawsEmployeeId, today);
+            console.log('[Clock] Robaws sync: gevonden', robawsRegs.length, 'registraties voor vandaag');
+
+            // Geen registraties in Robaws? Wis de lokale sessie volledig
+            if (robawsRegs.length === 0) {
+                const session = this.getSession();
+                if (session && (session.active || (session.completedSessions || []).length > 0)) {
+                    console.log('[Clock] Robaws heeft geen registraties — lokale sessie gewist');
+                    const key = this._getSessionKey();
+                    if (key) localStorage.removeItem(key);
+                }
+                return;
+            }
+
+            // Er zijn registraties in Robaws — bouw lokale sessie opnieuw op
+            let session = this.getSession() || this._newSession();
+
+            // Check of de actieve sessie (zonder endDate) nog bestaat in Robaws
+            if (session.active && session.robawsId) {
+                const stillExists = robawsRegs.find(r => String(r.id) === String(session.robawsId));
+                if (!stillExists) {
+                    // Actieve sessie is verwijderd in Robaws
+                    console.log('[Clock] Actieve sessie verwijderd in Robaws, sessie gereset');
+                    session.active = false;
+                    session.robawsId = null;
+                }
+            }
+
+            // Herbouw completedSessions op basis van Robaws data
+            const completedFromRobaws = robawsRegs
+                .filter(r => r.endDate) // alleen afgesloten registraties
+                .map(r => ({
+                    startTime: new Date(r.startDate).toTimeString().slice(0, 5),
+                    endTime: new Date(r.endDate).toTimeString().slice(0, 5),
+                    type: r.type || 'Op tijd',
+                    robawsId: String(r.id),
+                    tagName: (r.remarks || '').split(' — ')[0] || '',
+                    hours: r.hours || this._calcHours(r.startDate, r.endDate),
+                }));
+
+            session.completedSessions = completedFromRobaws;
+
+            // Als er geen actieve sessie is, bepaal registrationType op basis van eerste registratie
+            if (!session.active) {
+                const firstReg = robawsRegs.find(r => r.type === 'Op tijd' || r.type === 'Te laat');
+                if (firstReg) {
+                    session.registrationType = firstReg.type;
+                } else if (completedFromRobaws.length > 0) {
+                    session.registrationType = completedFromRobaws[0].type;
+                }
+                // Starttime van eerste registratie
+                const earliest = robawsRegs.reduce((a, b) => a.startDate < b.startDate ? a : b);
+                session.startTime = new Date(earliest.startDate).toTimeString().slice(0, 5);
+            }
+
+            // Check of er een open registratie is (zonder endDate)
+            const openReg = robawsRegs.find(r => !r.endDate);
+            if (openReg && !session.active) {
+                session.active = true;
+                session.robawsId = String(openReg.id);
+                session.startTime = new Date(openReg.startDate).toTimeString().slice(0, 5);
+                session.startISO = openReg.startDate;
+                session.registrationType = openReg.type || 'Op tijd';
+                session.tagName = (openReg.remarks || '').split(' — ')[0] || '';
+            }
+
+            this._saveSession(session);
+            console.log('[Clock] Lokale sessie gesynchroniseerd met Robaws');
+        } catch (e) {
+            console.warn('[Clock] Robaws sync mislukt:', e.message);
+            // Bij fout: gewoon doorgaan met lokale data
+        }
+    },
+
+    // =============================================
+    // ADMIN: ALLE WERKNEMERS VANDAAG (Robaws)
+    // =============================================
+
+    async getAllAttendanceToday() {
+        try {
+            const allRegs = await RobawsAPI.getAllTimeRegistrationsToday();
+
+            // Groepeer per werknemer
+            const byEmployee = {};
+            for (const reg of allRegs) {
+                const empId = reg.employeeId;
+                if (!byEmployee[empId]) byEmployee[empId] = [];
+                byEmployee[empId].push(reg);
+            }
+
+            // Haal werknemersnamen op (uit cache of Robaws)
+            const result = [];
+            for (const [empId, regs] of Object.entries(byEmployee)) {
+                const firstReg = regs[0];
+                // Probeer naam op te halen
+                let name = `Werknemer ${empId}`;
+                try {
+                    const empRes = await RobawsAPI.get(`employees/${empId}`);
+                    if (empRes.code === 200 && empRes.data) {
+                        name = empRes.data.fullName || empRes.data.name || name;
+                    }
+                } catch(e) {}
+
+                const firstOfDay = regs.find(r => r.type === 'Op tijd' || r.type === 'Te laat');
+                const clockTime = firstOfDay ? new Date(firstOfDay.startDate).toTimeString().slice(0,5) : null;
+                const isLate = firstOfDay ? firstOfDay.type === 'Te laat' : false;
+                const llSessions = regs.filter(r => r.type === 'Laden & Lossen');
+                const extraSessions = regs.filter(r => r.type === 'Extra uren');
+
+                result.push({
+                    employeeId: empId,
+                    name,
+                    clockTime,
+                    isLate,
+                    type: firstOfDay ? firstOfDay.type : null,
+                    totalRegistrations: regs.length,
+                    ladenLossen: llSessions.length,
+                    extraUren: extraSessions.length,
+                    registrations: regs,
+                });
+            }
+
+            return result.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        } catch (e) {
+            console.warn('[Clock] Admin overzicht ophalen mislukt:', e.message);
+            return [];
+        }
+    },
+
+    // =============================================
+    // TAG BEHEER SCHERM (voor kantoorpersoneel)
+    // =============================================
+
+    /** Render tag beheer HTML voor het klokscherm */
+    renderTagAdmin() {
+        const config = this.getTagConfig();
+        if (!config) return '<p class="text-grey text-sm">NFC configuratie niet geladen</p>';
+
+        let html = '';
+
+        // Bureau tag
+        html += this._renderTagRow('🏢', 'Bureau', config.bureau, 'NFC Bureau Tag');
+
+        // L&L tag
+        html += this._renderTagRow('📦', 'Laden & Lossen', config.ladenLossen, 'NFC Bureau Tag Laden & Lossen');
+
+        // Camionetten
+        for (const cam of (config.camionetten || [])) {
+            html += this._renderTagRow('🚐', cam.name, cam, cam.fieldName);
+        }
+
+        return html;
+    },
+
+    /** Hulpje: uniek ID voor elke tag-rij zodat onclick via data-attributen werkt */
+    _tagRowCounter: 0,
+
+    _renderTagRow(icon, name, tagData, fieldName) {
+        const tagId = tagData && tagData.tagId ? tagData.tagId : null;
+        const statusColor = tagId ? 'var(--qe-green)' : 'var(--qe-orange)';
+        const statusText = tagId ? tagId.substring(0, 16) + (tagId.length > 16 ? '...' : '') : 'Niet ingesteld';
+        const rowId = 'tagRow_' + (this._tagRowCounter++);
+
+        // Sla fieldName en name op als data-attributen (veilig, geen escaping issues)
+        const clearBtn = tagId ? `<button data-action="clear" data-field="${this._htmlAttr(fieldName)}" style="font-size:11px;color:#E53935;background:none;border:none;cursor:pointer;padding:4px" title="Verwijder tag">✕</button>` : '';
+        const scanBtn = `<button data-action="assign" data-field="${this._htmlAttr(fieldName)}" data-name="${this._htmlAttr(name)}" style="font-size:11px;color:var(--qe-purple);background:none;border:1px solid var(--qe-purple);border-radius:6px;cursor:pointer;padding:4px 8px">📱 Scan</button>`;
+
+        return `<div id="${rowId}" style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid #f0f0f0">
+            <div style="display:flex;align-items:center;gap:10px">
+                <span style="font-size:20px">${icon}</span>
+                <div>
+                    <div style="font-size:14px;font-weight:500">${name}</div>
+                    <div style="font-size:11px;color:${statusColor};font-family:monospace">${statusText}</div>
+                </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:4px">${scanBtn}${clearBtn}</div>
+        </div>`;
+    },
+
+    /** Escape string voor gebruik in HTML attributen */
+    _htmlAttr(str) {
+        return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    },
+
+    /** Bind click events op tag admin knoppen (aanroepen na innerHTML) */
+    bindTagAdminEvents() {
+        const container = document.getElementById('clockTagList');
+        if (!container) return;
+        container.querySelectorAll('button[data-action="assign"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const fieldName = btn.getAttribute('data-field');
+                const locName = btn.getAttribute('data-name');
+                QEClock.startTagAssignment(fieldName, locName);
+            });
+        });
+        container.querySelectorAll('button[data-action="clear"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const fieldName = btn.getAttribute('data-field');
+                QEClock._clearTag(fieldName);
+            });
+        });
+    },
+
+    async _clearTag(fieldName) {
+        if (!confirm('Weet je zeker dat je deze tag wilt verwijderen?')) return;
+        try {
+            await RobawsAPI.saveNfcTagId(fieldName, '');
+            await this.loadTagConfig();
+            if (window.app) {
+                app.toast('Tag verwijderd ✓');
+                if (app.currentScreen === 'screenClock') app.onNavigateToClock();
+            }
+        } catch (e) {
+            if (window.app) app.toast('Kon tag niet verwijderen: ' + e.message, true);
+        }
+    },
+
+    // =============================================
+    // STATUS HELPERS (voor UI)
+    // =============================================
+
+    /** Is al ingeclockt vandaag? */
+    isClockedIn() {
+        return this.isActive();
+    },
+
+    /** Is te laat? (voor statusbar) */
+    isLate() {
+        const session = this.getSession();
+        if (!session) {
+            // Nog niet gescand — check of het voorbij starttijd is
+            const now = this._localTime();
+            return now > this.getExpectedStartTime();
+        }
+        // Check eerste registratie
+        if (session.registrationType === 'Te laat') return true;
+        const completed = session.completedSessions || [];
+        return completed.some(s => s.type === 'Te laat');
+    },
+
+    /** Geeft de inclocktijd (eerste scan van vandaag) */
+    getClockTime() {
+        const session = this.getSession();
+        if (!session) return null;
+        const completed = session.completedSessions || [];
+        if (completed.length > 0) return completed[0].startTime;
+        if (session.startTime) return session.startTime;
+        return null;
+    },
+
+    /** Geeft het type van de huidige/eerste registratie */
+    getRegistrationType() {
+        const session = this.getSession();
+        if (!session) return null;
+        return session.registrationType;
+    },
+
+    /** Geeft de tag naam van de actieve sessie */
+    getActiveTagName() {
+        const session = this.getSession();
+        if (!session || !session.active) return null;
+        return session.tagName;
+    },
+};
