@@ -1,0 +1,1709 @@
+/**
+ * QE Werkbon App — Robaws API Module
+ * Directe communicatie met Robaws API v2 (geen PHP proxy nodig)
+ *
+ * Quality Environment bvba - Intern gebruik
+ */
+
+const RobawsAPI = {
+    // === CONFIGURATIE ===
+    BASE_URL: 'https://app.robaws.com/api/v2',
+
+    // === CACHE ===
+    _articleCache: null,       // Alle artikelen (1x geladen)
+    _articleCacheLoading: false,
+    API_KEY: 'KBM8UEKYPLHIXDHIQ1IL',
+    API_SECRET: 'xmFYgMmDi4xFLiPZy8qCslSKbCmSDIgIErmTWJZ5',
+    TENANT: 'qualityenvironment',
+
+    // === MEDEWERKERS MAPPING ===
+    EMPLOYEES: {
+        // Techniekers
+        'glycera@qe.be':             { employeeId: 7,  userId: null,  name: 'Glycera',    role: 'technieker' },
+        'sascha@qe.be':              { employeeId: 9,  userId: null,  name: 'Sascha',     role: 'technieker' },
+        'daxleekens@qe.be':          { employeeId: 10, userId: null,  name: 'Dax',        role: 'technieker' },
+        'olivier.puchacz@qe.be':     { employeeId: 12, userId: null,  name: 'Olivier',    role: 'technieker' },
+        'yassine@qe.be':             { employeeId: 30, userId: null,  name: 'Yassine',    role: 'technieker' },
+        // Monteurs
+        'levi@qe.be':                { employeeId: 1,  userId: null,  name: 'Levi',       role: 'monteur' },
+        'stefan@qe.be':              { employeeId: 2,  userId: null,  name: 'Stefan',     role: 'monteur' },
+        'jelle@qe.be':               { employeeId: 3,  userId: null,  name: 'Jelle',      role: 'monteur' },
+        'wim@qe.be':                 { employeeId: 4,  userId: null,  name: 'Wim',        role: 'monteur' },
+        'jens@qe.be':                { employeeId: 5,  userId: null,  name: 'Jens',       role: 'monteur' },
+        'herve@qe.be':               { employeeId: 8,  userId: null,  name: 'Herve',      role: 'monteur' },
+        'keng@qe.be':                { employeeId: 11, userId: null,  name: 'Keng',       role: 'monteur' },
+        'joshua@qe.be':              { employeeId: 13, userId: null,  name: 'Joshua',     role: 'monteur' },
+        // Bureel / kantoor
+        'vince@qe.be':               { employeeId: 16, userId: null,  name: 'Vince',      role: 'kantoor' },
+        'bjorn@qe.be':               { employeeId: 19, userId: null,  name: 'Bjorn',      role: 'kantoor' },
+        'bart@qe.be':                { employeeId: 20, userId: null,  name: 'Bart',       role: 'kantoor' },
+        'felicity@qe.be':            { employeeId: 21, userId: null,  name: 'Felicity',   role: 'kantoor' },
+        'rolf@qe.be':                { employeeId: 22, userId: null,  name: 'Rolf',       role: 'kantoor' },
+    },
+
+    // === AUTH HEADERS ===
+    getHeaders() {
+        const auth = btoa(this.API_KEY + ':' + this.API_SECRET);
+        return {
+            'Authorization': 'Basic ' + auth,
+            'X-Tenant': this.TENANT,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        };
+    },
+
+    // === BASIS API CALLS ===
+    async get(endpoint) {
+        const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
+        const res = await fetch(url, { headers: this.getHeaders() });
+        if (res.status === 204) return { code: 204, data: null };
+        const txt = await res.text();
+        if (!txt) return { code: res.status, data: null };
+        try {
+            return { code: res.status, data: JSON.parse(txt) };
+        } catch (e) {
+            return { code: res.status, data: { raw: txt } };
+        }
+    },
+
+    async post(endpoint, body) {
+        const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: this.getHeaders(),
+            body: JSON.stringify(body),
+        });
+        // 204 No Content of lege body veilig afhandelen
+        if (res.status === 204) return { code: 204, data: null };
+        const txt = await res.text();
+        if (!txt) return { code: res.status, data: null };
+        try {
+            return { code: res.status, data: JSON.parse(txt) };
+        } catch (e) {
+            return { code: res.status, data: { raw: txt } };
+        }
+    },
+
+    async put(endpoint, body) {
+        const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
+        const res = await fetch(url, {
+            method: 'PUT',
+            headers: this.getHeaders(),
+            body: JSON.stringify(body),
+        });
+        // PUT returns 204 No Content on success
+        if (res.status === 204) return { code: 204, data: null };
+        const data = await res.json();
+        return { code: res.status, data };
+    },
+
+    async uploadFile(endpoint, file, fileName) {
+        const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
+        const auth = btoa(this.API_KEY + ':' + this.API_SECRET);
+
+        const formData = new FormData();
+        formData.append('file', file, fileName);
+
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Basic ' + auth,
+                'X-Tenant': this.TENANT,
+                'Accept': 'application/json',
+                // Geen Content-Type — browser zet multipart boundary automatisch
+            },
+            body: formData,
+        });
+        const data = await res.json();
+        return { code: res.status, data };
+    },
+
+    // =============================================
+    // HELPERS
+    // =============================================
+    formatAddress(addr) {
+        if (!addr) return '';
+        if (typeof addr === 'string') return addr;
+        // Robaws address object: { addressLine1, addressLine2, postalCode, city, country, latitude, longitude }
+        const parts = [];
+        if (addr.addressLine1) parts.push(addr.addressLine1);
+        if (addr.addressLine2) parts.push(addr.addressLine2);
+        const cityPart = [addr.postalCode, addr.city].filter(Boolean).join(' ');
+        if (cityPart) parts.push(cityPart);
+        return parts.join(', ') || '';
+    },
+
+    // =============================================
+    // LOGIN
+    // =============================================
+    async login(email, password) {
+        // Simpele check tegen bekende medewerkers
+        // Wachtwoord wordt niet gevalideerd tegen Robaws (geen auth endpoint beschikbaar)
+        // Voor intern gebruik: check of email bekend is
+        const emp = this.EMPLOYEES[email.toLowerCase()];
+        if (!emp) {
+            return { success: false, error: 'Onbekend emailadres' };
+        }
+
+        // Rol dynamisch ophalen uit Robaws (werknemersrol op het medewerkerfiche).
+        // Valt terug op de hardcoded waarde als Robaws onbereikbaar is of de rol
+        // niet gevonden wordt.
+        let roleName = emp.role || '';
+        let roleKey = (emp.role || '').toLowerCase();
+        try {
+            const empRes = await this.get(`employees/${emp.employeeId}`);
+            if (empRes.code === 200 && empRes.data && empRes.data.employeeRoleId) {
+                const roleRes = await this.get(`employee-roles/${empRes.data.employeeRoleId}`);
+                if (roleRes.code === 200 && roleRes.data && roleRes.data.name) {
+                    roleName = roleRes.data.name;
+                    roleKey = roleName.toLowerCase();
+                }
+            }
+        } catch(e) { /* fallback naar hardcoded role */ }
+
+        // Normaliseer: alles wat niet 'monteur' is, geldt als volledige toegang.
+        const isMonteur = roleKey.includes('monteur');
+
+        const user = {
+            name: emp.name,
+            email: email.toLowerCase(),
+            robawsEmployeeId: emp.employeeId,
+            robawsUserId: emp.userId,
+            role: isMonteur ? 'monteur' : 'technieker',
+            roleName: roleName || (isMonteur ? 'Monteur' : 'Technieker'),
+        };
+        localStorage.setItem('qe_user', JSON.stringify(user));
+        return { success: true, user };
+    },
+
+    // ---- PIN-AUTH (lokaal per toestel) ----
+    // Robaws v2 heeft geen password-API, dus we doen PIN-auth lokaal in localStorage.
+    // De PIN wordt gehashed bewaard met de email als salt.
+    async _hashPin(email, pin) {
+        const data = new TextEncoder().encode(`qe-pin|${email.toLowerCase()}|${pin}`);
+        const buf = await crypto.subtle.digest('SHA-256', data);
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    },
+    async hasPin(email) {
+        return !!localStorage.getItem('qe_pin_' + email.toLowerCase());
+    },
+    async setPin(email, pin) {
+        if (!/^\d{4,6}$/.test(pin)) return { success: false, error: 'PIN moet 4 tot 6 cijfers zijn' };
+        const hash = await this._hashPin(email, pin);
+        localStorage.setItem('qe_pin_' + email.toLowerCase(), hash);
+        return { success: true };
+    },
+    async verifyPin(email, pin) {
+        const stored = localStorage.getItem('qe_pin_' + email.toLowerCase());
+        if (!stored) return false;
+        const hash = await this._hashPin(email, pin);
+        return hash === stored;
+    },
+    clearPin(email) {
+        localStorage.removeItem('qe_pin_' + email.toLowerCase());
+    },
+
+    // Pre-seed PINs: zet standaard PINs voor alle medewerkers als er
+    // nog geen PIN in localStorage staat. Wordt 1x aangeroepen bij app-start.
+    seedDefaultPins() {
+        const defaults = {
+            'qe_pin_glycera@qe.be':             'a54c598cbb607a2623dd1d29368d5aa64229bfc224115d6fea618b2d2e79619e',
+            'qe_pin_sascha@qe.be':              '1d432b29e5217c19439da5e02fc8bc81b5006ad09198ff0ffb275557e18f7809',
+            'qe_pin_daxleekens@qe.be':          '9b5eac84180accf54ce661a253526459a2251afb6595051f3f3be2b84e3b0864',
+            'qe_pin_olivier.puchacz@qe.be':     '8575b1f59819e2a6cb5de911df99f93e9639852cc2999bff0b382562e3654953',
+            'qe_pin_yassine@qe.be':             'a9c7fd61e0a48fd12b9afd6ab8e4520989a3fe8491c44a9c0b415dab21408be7',
+            'qe_pin_levi@qe.be':                '7dfd3cb772282ee863b8eb04eb539cf56f8e05c5e028bff353edc42151aa74ec',
+            'qe_pin_stefan@qe.be':              '3a138748f7cc4993f54392b2d47c985979eb936fcb2b5d6b6ab08cbafeead5e2',
+            'qe_pin_jelle@qe.be':               'af2ec424ed0ca866c7bf798f6eb35c04b238d34f25eb2ad573cd3e073f76e5b2',
+            'qe_pin_wim@qe.be':                 '66ba111ed4633c1d266166c3c0f6b86a0df4cd239fc0e69ca74a7534e5674e38',
+            'qe_pin_jens@qe.be':                '9da1c6b5c705013b0d4255d787ec5e2b35b47d24fcd09082b9e384473631d4dc',
+            'qe_pin_herve@qe.be':               '02ab3d13cb03f01497456162a4ef1513927ce6eb3f425e96ca6037136bec2ad6',
+            'qe_pin_keng@qe.be':                '78f36df6ef01cd5ebf531ec6327562dd5838ac95fa956e0060e00097817cb5ee',
+            'qe_pin_joshua@qe.be':              'f8403d86e335eb67affe196d046aeaa8ad573de187be6f380b40b73e484e6d05',
+            'qe_pin_vince@qe.be':               'fb23a739555cf34c451e1445185272a5c1e6bfc30d5d2758196e1ad76ad18cb2',
+            'qe_pin_bjorn@qe.be':               '90b30b51a0472f2714bdb1f896403a6b1adfb2921404845eebfddc88c5cd8b21',
+            'qe_pin_bart@qe.be':                'd141f2502ee7759d344cea4b9b019957fa61627b0dcf3c969c5a6609d7979c46',
+            'qe_pin_felicity@qe.be':            'c2ffea1001f12af0b83e9a00dbd85176f6eedd6ebb62a319a47beb6368d3fbdb',
+            'qe_pin_rolf@qe.be':                '97295e4354d4aa98782a29bb40ef2b51c54f4f1a6a5cc8b248a8960728e473cf',
+        };
+        for (const [key, hash] of Object.entries(defaults)) {
+            if (!localStorage.getItem(key)) {
+                localStorage.setItem(key, hash);
+            }
+        }
+    },
+
+    // ---- EMPLOYEE PHOTO ----
+    // Robaws heeft geen dedicated avatar-endpoint. We uploaden de foto als
+    // document op het medewerkerfiche (POST /employees/{id}/documents) en
+    // lokaal cachen we de base64 voor offline weergave + snelle render.
+    async uploadEmployeePhoto(employeeId, file, fileName = 'Foto.jpg') {
+        return await this.uploadFile(`employees/${employeeId}/documents`, file, fileName);
+    },
+    async getEmployeePhotoBlob(employeeId) {
+        try {
+            const res = await this.get(`employees/${employeeId}/documents`);
+            if (res.code !== 200 || !res.data) return null;
+            const items = res.data.items || res.data || [];
+            // Zoek meest recente document met "foto" of "photo" in de naam
+            const photos = items.filter(d => /foto|photo|profile|avatar/i.test(d.name || d.fileName || ''));
+            if (!photos.length) return null;
+            photos.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+            const doc = photos[0];
+            if (!doc.id) return null;
+            // Download de inhoud via /documents/{id}/preview of /documents/{id}
+            const url = this.BASE_URL + '/documents/' + doc.id;
+            const dlRes = await fetch(url, { headers: this.getHeaders() });
+            if (!dlRes.ok) return null;
+            const blob = await dlRes.blob();
+            return blob;
+        } catch(e) { return null; }
+    },
+    setLocalAvatar(email, dataUrl) {
+        try { localStorage.setItem('qe_avatar_' + email.toLowerCase(), dataUrl); } catch(e){}
+    },
+    getLocalAvatar(email) {
+        return localStorage.getItem('qe_avatar_' + email.toLowerCase()) || null;
+    },
+
+    getLoggedInUser() {
+        const stored = localStorage.getItem('qe_user');
+        return stored ? JSON.parse(stored) : null;
+    },
+
+    logout() {
+        localStorage.removeItem('qe_user');
+    },
+
+    // =============================================
+    // PLANNING
+    // =============================================
+    async getPlanning(employeeId, date) {
+        const today = new Date().toISOString().split('T')[0];
+        const tomorrow = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+        if (date !== today && date !== tomorrow) date = today;
+
+        // Haal planning items op met paginatie
+        let allItems = [];
+        let page = 0;
+        let totalPages = 1;
+
+        do {
+            const result = await this.get(
+                `planning-items?employeeId=${employeeId}&limit=100&page=${page}&sort=startDate:desc`
+            );
+            if (result.code !== 200) throw new Error('Kon planning niet ophalen');
+
+            const items = result.data.items || [];
+            if (items.length === 0) break;
+
+            allItems = allItems.concat(items);
+
+            // Stop als we voorbij de gewenste datum zijn
+            const lastDate = (items[items.length - 1].startDate || '').split('T')[0];
+            if (lastDate < today) break;
+
+            totalPages = result.data.totalPages || 1;
+            page++;
+        } while (page < totalPages);
+
+        // Filter op datum
+        let filtered = allItems.filter(item => {
+            const itemDate = (item.startDate || '').split('T')[0];
+            return itemDate === date;
+        });
+
+        // Sorteer op startDate (vroegste eerst)
+        filtered.sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
+
+        // Check welke planning items al een werkbon hebben
+        const planningIdsMetWerkbon = await this._getPlanningIdsWithWorkOrders();
+
+        // Verrijk elk item met klantgegevens + BTW + ordernummer
+        const enriched = [];
+        for (const item of filtered) {
+            const hasWerkbon = planningIdsMetWerkbon.has(String(item.id));
+
+            const entry = {
+                id: item.id,
+                salesOrderId: item.salesOrderId || null,
+                clientId: item.clientId || null,
+                startDate: item.startDate || '',
+                endDate: item.endDate || '',
+                summary: item.summary || '',
+                description: item.description || item.notes || '',
+                address: item.address ? this.formatAddress(item.address) : '',
+                employeeIds: item.employeeIds || [],
+                installationIds: item.installationIds || [],
+                planningTypeId: item.planningTypeId || null,
+                hourTypeId: item.hourTypeId || null,
+                hasWerkbon: hasWerkbon,
+                client: null,
+            };
+
+            // Klant ophalen
+            if (item.clientId) {
+                try {
+                    const clientResult = await this.get(`clients/${item.clientId}`);
+                    if (clientResult.code === 200) {
+                        const c = clientResult.data;
+                        entry.client = {
+                            id: c.id,
+                            name: c.name || '',
+                            email: c.email || '',
+                            tel: c.tel || '',
+                            address: this.formatAddress(c.address),
+                            vatTariffId: c.vatTariffId || null,
+                            vatPercentage: null,
+                            vatTariffName: null,
+                        };
+
+                        // BTW tarief ophalen
+                        if (c.vatTariffId) {
+                            try {
+                                const vatResult = await this.get(`vat-tariffs/${c.vatTariffId}`);
+                                if (vatResult.code === 200) {
+                                    entry.client.vatPercentage = vatResult.data.percentage ?? null;
+                                    entry.client.vatTariffName = vatResult.data.name ?? null;
+                                }
+                            } catch (e) { /* BTW niet gevonden, niet erg */ }
+                        }
+                    }
+                } catch (e) { /* Klant niet gevonden */ }
+            }
+
+            // Ordernummer ophalen
+            if (item.salesOrderId) {
+                try {
+                    const soResult = await this.get(`sales-orders/${item.salesOrderId}`);
+                    if (soResult.code === 200) {
+                        entry.orderLogicId = soResult.data.logicId || null;
+                        entry.orderStatus = soResult.data.status || null;
+                    }
+                } catch (e) { /* Order niet gevonden */ }
+            }
+
+            enriched.push(entry);
+        }
+
+        return { items: enriched, date, employeeId };
+    },
+
+    async _getPlanningIdsWithWorkOrders() {
+        // Verzamel planningItemIds waarvoor in Robaws ≥1 werkbon bestaat.
+        // Elke werkbon telt mee (ook lege), want Robaws is de enige bron van waarheid:
+        // als een werkbon daar niet (meer) staat, moet de dagplanning weer zichtbaar zijn.
+        const ids = new Set();
+        let page = 0;
+
+        try {
+            const sinceDate = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+            do {
+                const result = await this.get(`work-orders?limit=100&page=${page}&sort=createdAt:desc`);
+                const items = result.data.items || [];
+                if (items.length === 0) break;
+
+                let stop = false;
+                for (const wo of items) {
+                    const woDate = wo.date || '';
+                    if (woDate && woDate < sinceDate) { stop = true; break; }
+                    if (wo.planningItemId) ids.add(String(wo.planningItemId));
+                }
+                if (stop) break;
+
+                const totalPages = result.data.totalPages || 1;
+                page++;
+                if (page >= totalPages) break;
+                if (page > 10) break;
+            } while (true);
+        } catch (e) { /* Bij fout: geen filtering, niet erg */ }
+
+        return ids;
+    },
+
+    // =============================================
+    // UURCODES (via employee role → articles)
+    // =============================================
+    async getHourTypes(employeeId) {
+        // Stap 1: Employee → employeeRoleId
+        const empResult = await this.get(`employees/${employeeId}`);
+        if (empResult.code !== 200) throw new Error('Kon employee niet ophalen');
+
+        const employeeRoleId = empResult.data.employeeRoleId;
+        if (!employeeRoleId) return { items: [], roleName: '?' };
+
+        // Stap 2: Role → timeOperationIds
+        const roleResult = await this.get(`employee-roles/${employeeRoleId}`);
+        if (roleResult.code !== 200) throw new Error('Kon werknemersrol niet ophalen');
+
+        const roleName = roleResult.data.name || '?';
+        const timeOperationIds = roleResult.data.timeOperationIds || [];
+
+        // Stap 3: Haal elk artikel op
+        const uurcodes = [];
+        for (const articleId of timeOperationIds) {
+            try {
+                const artResult = await this.get(`articles/${articleId}`);
+                if (artResult.code === 200) {
+                    const art = artResult.data;
+                    const name = art.name || `Uurcode ${articleId}`;
+                    uurcodes.push({
+                        id: art.id,
+                        name: name,
+                        unitPrice: art.unitPrice ?? null,
+                        salePrice: art.salePrice ?? null,
+                        costPrice: art.costPrice ?? null,
+                        isVerplaatsing: name.toLowerCase().includes('verplaatsing'),
+                    });
+                }
+            } catch (e) { /* Artikel niet gevonden */ }
+        }
+
+        return { items: uurcodes, roleName, employeeRoleId };
+    },
+
+    // =============================================
+    // INSTALLATIES
+    // =============================================
+    async getInstallations(clientId, installationIds) {
+        if (installationIds && installationIds.length > 0) {
+            // Specifieke installaties ophalen
+            const installations = [];
+            for (const id of installationIds) {
+                try {
+                    const result = await this.get(`installations/${id}`);
+                    if (result.code === 200) installations.push(result.data);
+                } catch (e) {}
+            }
+            return installations;
+        } else if (clientId) {
+            // Alle installaties van klant
+            const result = await this.get(`installations?clientId=${clientId}&limit=50`);
+            return result.data.items || [];
+        }
+        return [];
+    },
+
+    // =============================================
+    // ARTIKELEN ZOEKEN (materialen)
+    // =============================================
+    async searchArticles(query, limit = 20) {
+        // Probeer eerst op naam te zoeken via de API
+        const result = await this.get(`articles?name=${encodeURIComponent(query)}&limit=${limit}`);
+        let items = result.data.items || [];
+
+        // Als query een nummer lijkt, ook op articleNumber zoeken
+        if (/^\d+/.test(query.trim())) {
+            try {
+                const numResult = await this.get(`articles?articleNumber=${encodeURIComponent(query.trim())}&limit=${limit}`);
+                const numItems = numResult.data.items || [];
+                // Merge zonder duplicaten
+                const existingIds = new Set(items.map(i => i.id));
+                numItems.forEach(i => { if (!existingIds.has(i.id)) items.push(i); });
+            } catch(e) {}
+        }
+
+        // Client-side fuzzy filter: als minder dan 3 resultaten, zoek ook door cache
+        if (items.length < 3 && this._articleCache && this._articleCache.length > 0) {
+            const q = query.toLowerCase().trim();
+            const words = q.split(/\s+/);
+            const fuzzyMatches = this._articleCache.filter(art => {
+                const name = (art.name || '').toLowerCase();
+                const nr = (art.articleNumber || '').toLowerCase();
+                // Elk woord moet voorkomen in naam of artikelnummer
+                return words.every(w => name.includes(w) || nr.includes(w));
+            }).slice(0, limit);
+            const existingIds = new Set(items.map(i => i.id));
+            fuzzyMatches.forEach(i => { if (!existingIds.has(i.id)) items.push(i); });
+        }
+
+        return items.slice(0, limit);
+    },
+
+    // =============================================
+    // WERKBON INDIENEN
+    // =============================================
+    async submitWerkbon(data) {
+        const {
+            salesOrderId, planningItemId, clientId, installationIds,
+            employeeId, userId, summary, date, clientName,
+            materials, hours, notes, uurcode, verplaatsingCode
+        } = data;
+
+        const log = [];
+
+        // BELANGRIJK: Robaws v2 API verwacht STRING IDs (niet integers).
+        // Integers worden silent genegeerd — vandaar dat klant/datum/dagplanning
+        // leeg bleven. Gebruik overal String(...).
+        const toStr = v => (v == null || v === '') ? null : String(v);
+
+        // Titel: summary uit planning, anders klantnaam + datum
+        const titleParts = [];
+        if (summary && summary.trim()) titleParts.push(summary.trim());
+        else if (clientName) titleParts.push(clientName);
+        if (date) titleParts.push(date);
+        const finalTitle = titleParts.join(' — ') || 'Werkbon via QE App';
+
+        // Stap 1: Lege werkbon aanmaken. POST /work-orders dropt velden stil,
+        // maar PUT daarna accepteert alles wél. Voordeel van deze aanpak:
+        // - werkt ook als de planning al eens verbruikt is
+        // - Robaws kopieert GEEN bestaande time-entries van de planning mee
+        //   (dat was de oorzaak van extra uur-regels in de werkbon)
+        let woResult = await this.post('work-orders', {});
+        log.push('Lege werkbon aangemaakt');
+
+        try { localStorage.setItem('qe_last_wo_create_res', JSON.stringify({ code: woResult.code, data: woResult.data })); } catch(e){}
+
+        if (woResult.code !== 200 && woResult.code !== 201) {
+            throw new Error('Kon werkbon niet aanmaken (' + woResult.code + '): ' + JSON.stringify(woResult.data));
+        }
+
+        const workOrderId = woResult.data.id;
+
+        // Stap 1b: Haal huidige werkbon op en PUT met overschrijvingen.
+        // assignedUserId → ingelogde monteur (ipv kantoor-eigenaar van planning)
+        // remark → opmerkingen uit app
+        // timeAndMaterial → true (regie-vinkje aan)
+        // create-from-planning-item vult enkel salesOrderId automatisch in.
+        // Alle andere velden (title/date/clientId/planningItemId/status/...)
+        // moeten we zelf expliciet via PUT meegeven.
+        let putResult = { code: null };
+        try {
+            const body = {
+                timeAndMaterial: true,
+                title: finalTitle,
+                status: 'nakijken',
+            };
+            if (userId) body.assignedUserId = toStr(userId);
+            if (notes) body.remark = notes;
+            if (date) body.date = date;
+            if (clientId) body.clientId = toStr(clientId);
+            if (planningItemId) body.planningItemId = toStr(planningItemId);
+            if (salesOrderId) body.salesOrderId = toStr(salesOrderId);
+            if (installationIds && installationIds.length) {
+                body.installationIds = installationIds.map(toStr);
+            }
+
+            // Adres ophalen van planning-item of client en meegeven in PUT.
+            // Robaws vult dit niet automatisch — moet expliciet.
+            try {
+                let addr = null;
+                if (planningItemId) {
+                    const p = await this.get(`planning-items/${planningItemId}`);
+                    if (p.code === 200 && p.data && p.data.address) addr = p.data.address;
+                }
+                if (!addr && clientId) {
+                    const c = await this.get(`clients/${clientId}`);
+                    if (c.code === 200 && c.data && c.data.address) addr = c.data.address;
+                }
+                if (addr && (addr.addressLine1 || addr.city || addr.postalCode)) {
+                    body.address = {
+                        addressLine1: addr.addressLine1 || null,
+                        addressLine2: addr.addressLine2 || null,
+                        postalCode: addr.postalCode || null,
+                        city: addr.city || null,
+                        country: addr.country || null,
+                        latitude: addr.latitude || 0,
+                        longitude: addr.longitude || 0,
+                    };
+                }
+            } catch(e) {
+                log.push('Adres ophalen fout: ' + e.message);
+            }
+
+            try { localStorage.setItem('qe_last_wo_put_req', JSON.stringify(body)); } catch(e){}
+            putResult = await this.put(`work-orders/${workOrderId}`, body);
+            try { localStorage.setItem('qe_last_wo_put_res', JSON.stringify({ code: putResult.code, data: putResult.data })); } catch(e){}
+            if (putResult.code !== 200 && putResult.code !== 201 && putResult.code !== 204) {
+                log.push(`PUT werkbon fout: ${putResult.code}: ${JSON.stringify(putResult.data).slice(0,200)}`);
+            } else {
+                log.push(`Werkbon bijgewerkt (title, date, client, planning, order, user, T&M)`);
+            }
+        } catch(e) {
+            log.push('PUT werkbon exception: ' + e.message);
+        }
+
+        // Stap 2: POST elke time-entry naar /work-orders/{id}/time-entries
+        let timeSuccess = 0;
+        const timeErrors = [];
+        const timeRequests = [];
+        for (const h of hours || []) {
+            if ((h.duration || 0) <= 0) continue;
+            const isVerplaatsing = (h.type || 'klant') === 'verplaatsing';
+            const code = isVerplaatsing ? verplaatsingCode : uurcode;
+            const hrs = Math.round((h.duration || 0) / 60 * 100) / 100;
+            const te = {
+                employeeId: toStr(employeeId),
+                hours: hrs,
+                billableHours: hrs,
+            };
+            if (code && code.id) te.articleId = toStr(code.id);
+            if (h.startTime && h.endTime && h.startTime !== '--:--') {
+                const [sh, sm] = h.startTime.split(':').map(Number);
+                const [eh, em] = h.endTime.split(':').map(Number);
+                te.startTime = { hour: sh, minute: sm || 0 };
+                te.endTime = { hour: eh, minute: em || 0 };
+            }
+            timeRequests.push(te);
+            const r = await this.post(`work-orders/${workOrderId}/time-entries`, te);
+            if (r.code === 200 || r.code === 201) {
+                timeSuccess++;
+                log.push(`Uur toegevoegd: ${hrs}u ${isVerplaatsing ? '(verplaatsing)' : ''}`);
+            } else {
+                timeErrors.push({ sent: te, code: r.code, response: r.data });
+                log.push(`FOUT uur: ${r.code}`);
+            }
+        }
+
+        // Stap 3: POST elke material-item naar /work-orders/{id}/line-items
+        // (het "Items" tabblad in de werkbon). material-entries is een
+        // interne stock-record en gooide 500. line-items is wat Wappy gebruikt.
+        let materialSuccess = 0;
+        const materialErrors = [];
+        const materialRequests = [];
+        for (const m of materials || []) {
+            const li = {
+                type: 'LINE',
+                articleId: toStr(m.articleId),
+                quantity: parseFloat(m.quantity || 1),
+                description: m.name || '',
+            };
+            if (m.unitPrice != null) li.price = parseFloat(m.unitPrice);
+            materialRequests.push(li);
+            const r = await this.post(`work-orders/${workOrderId}/line-items`, li);
+            if (r.code === 200 || r.code === 201) {
+                materialSuccess++;
+                log.push(`Item toegevoegd: ${li.articleId} x ${li.quantity}`);
+            } else {
+                materialErrors.push({ sent: li, code: r.code, response: r.data });
+                log.push(`FOUT item: ${r.code}`);
+            }
+        }
+
+        const commuteSuccess = 0;
+        const commuteErrors = [];
+
+        // Stap 4: Verificatie — haal werkbon + sub-entries opnieuw op
+        let verifyFields = null;
+        let verifyCounts = null;
+        try {
+            const v = await this.get(`work-orders/${workOrderId}`);
+            if (v.code === 200 && v.data) {
+                verifyFields = {
+                    title: v.data.title ?? v.data.name ?? null,
+                    date: v.data.date ?? v.data.startDate ?? null,
+                    clientId: v.data.clientId ?? null,
+                    endClientId: v.data.endClientId ?? null,
+                    salesOrderId: v.data.salesOrderId ?? null,
+                    planningItemId: v.data.planningItemId ?? null,
+                    assignedUserId: v.data.assignedUserId ?? null,
+                    status: v.data.status ?? null,
+                    allKeys: Object.keys(v.data),
+                };
+            }
+            const tr = await this.get(`work-orders/${workOrderId}/time-entries`);
+            const lr = await this.get(`work-orders/${workOrderId}/line-items`);
+            verifyCounts = {
+                timeEntriesInRobaws: ((tr.data && (tr.data.items || tr.data)) || []).length,
+                lineItemsInRobaws: ((lr.data && (lr.data.items || lr.data)) || []).length,
+                sentTime: timeRequests.length,
+                sentMaterial: materialRequests.length,
+            };
+        } catch(e){
+            log.push('Verify fout: ' + e.message);
+        }
+
+        try { localStorage.setItem('qe_last_wo_verify', JSON.stringify({ verifyFields, verifyCounts, timeErrors, materialErrors })); } catch(e){}
+
+        return {
+            success: true,
+            workOrderId,
+            materialErrors,
+            timeErrors,
+            commuteErrors,
+            timeSuccess,
+            commuteSuccess,
+            materialSuccess,
+            log,
+            verifyFields,
+            verifyCounts,
+            createCode: woResult.code,
+            putCode: putResult.code,
+        };
+    },
+
+    // =============================================
+    // CORRECTIE WERKBON — delta tov originele werkbon(s)
+    // currentState = wat de monteur nu wil dat het totaal is
+    // origineelCumulatief = wat al in Robaws staat (som van alle werkbons op de planning)
+    // We sturen enkel het verschil in een nieuwe werkbon "Correctie - [origineel]"
+    // =============================================
+    async submitWerkbonCorrectie(data) {
+        const {
+            planningItemId, clientId, salesOrderId, installationIds,
+            employeeId, userId, date, clientName,
+            origineelTitle, origineelLogicId,
+            currentHours, currentMaterials, currentRemark,
+            origineelCumulatief,
+            uurcode, verplaatsingCode,
+        } = data;
+        const log = [];
+        const toStr = v => (v == null || v === '') ? null : String(v);
+
+        // 1) Bereken delta uren per articleId
+        // currentHours = [{type:'klant'|'verplaatsing', duration: minuten, startTime, endTime}, ...]
+        const newHoursPerArticle = {};
+        for (const h of currentHours || []) {
+            if (!h.duration || h.duration <= 0) continue;
+            const isVerpl = (h.type || 'klant') === 'verplaatsing';
+            const code = isVerpl ? verplaatsingCode : uurcode;
+            const aId = code && code.id ? String(code.id) : '';
+            if (!newHoursPerArticle[aId]) newHoursPerArticle[aId] = 0;
+            newHoursPerArticle[aId] += (h.duration / 60);
+        }
+        // Round to 2 decimals
+        for (const k of Object.keys(newHoursPerArticle)) {
+            newHoursPerArticle[k] = Math.round(newHoursPerArticle[k] * 100) / 100;
+        }
+        const oldHoursPerArticle = (origineelCumulatief && origineelCumulatief.hoursPerArticle) || {};
+        const allArticleIds = new Set([
+            ...Object.keys(newHoursPerArticle),
+            ...Object.keys(oldHoursPerArticle),
+        ]);
+        const deltaHours = []; // [{articleId, deltaHours}]
+        for (const aId of allArticleIds) {
+            const oldH = parseFloat(oldHoursPerArticle[aId] || 0);
+            const newH = parseFloat(newHoursPerArticle[aId] || 0);
+            const diff = Math.round((newH - oldH) * 100) / 100;
+            if (diff !== 0) deltaHours.push({ articleId: aId, deltaHours: diff });
+        }
+
+        // 2) Bereken delta materialen per (articleId|description)
+        const oldMats = {};
+        for (const m of (origineelCumulatief && origineelCumulatief.materials) || []) {
+            const key = (m.articleId || '') + '|' + (m.description || '');
+            oldMats[key] = m;
+        }
+        const newMats = {};
+        for (const m of currentMaterials || []) {
+            const key = (m.articleId || '') + '|' + (m.name || m.description || '');
+            if (!newMats[key]) {
+                newMats[key] = {
+                    articleId: m.articleId || null,
+                    description: m.name || m.description || '',
+                    quantity: 0,
+                    unitPrice: parseFloat(m.unitPrice != null ? m.unitPrice : (m.price || 0)),
+                };
+            }
+            newMats[key].quantity += parseFloat(m.quantity || 0);
+        }
+        const allMatKeys = new Set([...Object.keys(oldMats), ...Object.keys(newMats)]);
+        const deltaMats = [];
+        for (const key of allMatKeys) {
+            const oldQ = parseFloat((oldMats[key] && oldMats[key].quantity) || 0);
+            const newQ = parseFloat((newMats[key] && newMats[key].quantity) || 0);
+            const diff = Math.round((newQ - oldQ) * 100) / 100;
+            if (diff !== 0) {
+                const ref = newMats[key] || oldMats[key];
+                deltaMats.push({
+                    articleId: ref.articleId,
+                    description: ref.description,
+                    quantity: diff,
+                    unitPrice: parseFloat(ref.unitPrice || 0),
+                });
+            }
+        }
+
+        // 3) Niets te corrigeren?
+        const remarkChanged = (currentRemark || '').trim() !== (origineelCumulatief.remark || '').trim();
+        if (deltaHours.length === 0 && deltaMats.length === 0 && !remarkChanged) {
+            return { success: true, nothingToDo: true, log: ['Geen verschillen — niets te corrigeren'] };
+        }
+
+        // 4) Maak de correctie-werkbon aan (zelfde flow als gewone werkbon: bare POST + PUT)
+        const finalTitle = 'Correctie - ' + (origineelTitle || clientName || 'Werkbon');
+        let woResult = await this.post('work-orders', {});
+        log.push('Lege correctie-werkbon aangemaakt');
+        if (woResult.code !== 200 && woResult.code !== 201) {
+            throw new Error('Kon correctie-werkbon niet aanmaken (' + woResult.code + ')');
+        }
+        const workOrderId = woResult.data.id;
+
+        // 5) PUT met alle velden
+        const putBody = {
+            timeAndMaterial: true,
+            title: finalTitle,
+            status: 'nakijken',
+        };
+        if (userId) putBody.assignedUserId = toStr(userId);
+        if (date) putBody.date = date;
+        if (clientId) putBody.clientId = toStr(clientId);
+        if (planningItemId) putBody.planningItemId = toStr(planningItemId);
+        if (salesOrderId) putBody.salesOrderId = toStr(salesOrderId);
+        if (installationIds && installationIds.length) {
+            putBody.installationIds = installationIds.map(toStr);
+        }
+        // Adres ophalen (zelfde aanpak als gewone werkbon)
+        try {
+            let addr = null;
+            if (planningItemId) {
+                const p = await this.get(`planning-items/${planningItemId}`);
+                if (p.code === 200 && p.data && p.data.address) addr = p.data.address;
+            }
+            if (!addr && clientId) {
+                const c = await this.get(`clients/${clientId}`);
+                if (c.code === 200 && c.data && c.data.address) addr = c.data.address;
+            }
+            if (addr && (addr.addressLine1 || addr.city || addr.postalCode)) {
+                putBody.address = {
+                    addressLine1: addr.addressLine1 || null,
+                    addressLine2: addr.addressLine2 || null,
+                    postalCode: addr.postalCode || null,
+                    city: addr.city || null,
+                    country: addr.country || null,
+                    latitude: addr.latitude || 0,
+                    longitude: addr.longitude || 0,
+                };
+            }
+        } catch(e) { /* negeer adres-fout */ }
+        // Opmerking: als veranderd → nieuwe volledige tekst (gemarkeerd als correctie)
+        if (remarkChanged) {
+            putBody.remark = '[Correctie] ' + (currentRemark || '');
+        } else {
+            putBody.remark = '[Correctie]';
+        }
+        const putResult = await this.put(`work-orders/${workOrderId}`, putBody);
+        if (putResult.code !== 200 && putResult.code !== 201 && putResult.code !== 204) {
+            log.push('PUT correctie fout: ' + putResult.code);
+        }
+
+        // 6) Delta uren posten
+        let timeSuccess = 0;
+        const timeErrors = [];
+        for (const dh of deltaHours) {
+            const te = {
+                employeeId: toStr(employeeId),
+                hours: dh.deltaHours,
+                billableHours: dh.deltaHours,
+            };
+            if (dh.articleId) te.articleId = toStr(dh.articleId);
+            const r = await this.post(`work-orders/${workOrderId}/time-entries`, te);
+            if (r.code === 200 || r.code === 201) timeSuccess++;
+            else timeErrors.push({ sent: te, code: r.code, response: r.data });
+        }
+
+        // 7) Delta materialen posten
+        let materialSuccess = 0;
+        const materialErrors = [];
+        for (const dm of deltaMats) {
+            const li = {
+                type: 'LINE',
+                quantity: dm.quantity,
+                description: dm.description || '',
+            };
+            if (dm.articleId) li.articleId = toStr(dm.articleId);
+            if (dm.unitPrice != null) li.price = dm.unitPrice;
+            const r = await this.post(`work-orders/${workOrderId}/line-items`, li);
+            if (r.code === 200 || r.code === 201) materialSuccess++;
+            else materialErrors.push({ sent: li, code: r.code, response: r.data });
+        }
+
+        return {
+            success: true,
+            workOrderId,
+            createCode: woResult.code,
+            putCode: putResult.code,
+            deltaHours,
+            deltaMats,
+            timeSuccess,
+            timeErrors,
+            materialSuccess,
+            materialErrors,
+            log,
+        };
+    },
+
+    // =============================================
+    // FOTO'S UPLOADEN
+    // =============================================
+    async uploadPhotos(workOrderId, photos) {
+        const results = [];
+        let success = 0;
+        let failed = 0;
+
+        // Haal installationIds op van de werkorder zodat we de foto's ook zichtbaar
+        // kunnen maken bij de gekoppelde installatie(s).
+        let installationIds = [];
+        try {
+            const wo = await this.get(`work-orders/${workOrderId}`);
+            if (wo.code === 200 && wo.data && Array.isArray(wo.data.installationIds)) {
+                installationIds = wo.data.installationIds.filter(Boolean);
+            }
+        } catch(e) { /* niet fataal */ }
+
+        for (let i = 0; i < photos.length; i++) {
+            const photo = photos[i];
+            const fileName = photo.name || `foto_${i + 1}.jpg`;
+
+            try {
+                // Base64 naar Blob
+                let base64 = photo.data;
+                if (base64.includes(',')) base64 = base64.split(',')[1];
+                const binary = atob(base64);
+                const bytes = new Uint8Array(binary.length);
+                for (let j = 0; j < binary.length; j++) {
+                    bytes[j] = binary.charCodeAt(j);
+                }
+
+                const contentType = fileName.toLowerCase().includes('.png') ? 'image/png' : 'image/jpeg';
+                const blob = new Blob([bytes], { type: contentType });
+                const file = new File([blob], fileName, { type: contentType });
+
+                // 1) Upload naar de werkorder
+                const result = await this.uploadFile(
+                    `work-orders/${workOrderId}/documents`,
+                    file,
+                    fileName
+                );
+
+                const installationUploads = [];
+                if (result.code === 200 || result.code === 201) {
+                    // 2) Ook uploaden naar elke gekoppelde installatie zodat
+                    //    ze zichtbaar zijn op het tabblad Documenten van de installatie.
+                    for (const instId of installationIds) {
+                        try {
+                            // Nieuwe File maken want de stream van de vorige is verbruikt
+                            const fileForInst = new File([blob], fileName, { type: contentType });
+                            const instRes = await this.uploadFile(
+                                `installations/${instId}/documents`,
+                                fileForInst,
+                                fileName
+                            );
+                            installationUploads.push({
+                                installationId: instId,
+                                code: instRes.code,
+                                documentId: instRes.data ? instRes.data.id : null,
+                            });
+                        } catch(e) {
+                            installationUploads.push({ installationId: instId, error: e.message });
+                        }
+                    }
+
+                    results.push({
+                        name: fileName,
+                        success: true,
+                        documentId: result.data.id,
+                        installationUploads,
+                    });
+                    success++;
+                } else {
+                    results.push({ name: fileName, success: false, error: result.data });
+                    failed++;
+                }
+            } catch (e) {
+                results.push({ name: fileName, success: false, error: e.message });
+                failed++;
+            }
+        }
+
+        return { uploaded: success, failed, total: photos.length, results, installationIds };
+    },
+
+    // =============================================
+    // ARTIKELEN CACHE — alles 1x laden, daarna instant filteren
+    // =============================================
+    async _loadAllArticles(onProgress) {
+        if (this._articleCache) return this._articleCache;
+        if (this._articleCacheLoading) {
+            // Wacht tot andere load klaar is
+            while (this._articleCacheLoading) {
+                await new Promise(r => setTimeout(r, 200));
+            }
+            return this._articleCache;
+        }
+
+        this._articleCacheLoading = true;
+        const allArticles = [];
+        let page = 0;
+
+        try {
+            // Eerst totaal opvragen
+            const first = await this.get('articles?limit=100&page=0');
+            const totalPages = first.data.totalPages || 1;
+            const totalItems = first.data.totalItems || 0;
+            const firstItems = first.data.items || [];
+            allArticles.push(...firstItems);
+
+            if (onProgress) onProgress(firstItems.length, totalItems);
+
+            // Rest ophalen
+            for (page = 1; page < totalPages; page++) {
+                const result = await this.get(`articles?limit=100&page=${page}`);
+                const items = result.data.items || [];
+                if (items.length === 0) break;
+                allArticles.push(...items);
+                if (onProgress) onProgress(allArticles.length, totalItems);
+            }
+
+            this._articleCache = allArticles;
+        } finally {
+            this._articleCacheLoading = false;
+        }
+
+        return this._articleCache;
+    },
+
+    // =============================================
+    // ARTIKELGROEPEN
+    // =============================================
+    async getArticleGroups() {
+        const allGroups = [];
+        let page = 0;
+        do {
+            const result = await this.get(`article-groups?limit=100&page=${page}`);
+            const items = result.data.items || result.data || [];
+            if (items.length === 0) break;
+            allGroups.push(...items);
+            const totalPages = result.data.totalPages || 1;
+            page++;
+            if (page >= totalPages) break;
+        } while (true);
+
+        // Filter alleen wappy=true
+        const wappyGroups = allGroups.filter(g => g.wappy === true);
+
+        // Boomstructuur
+        const rootGroups = [];
+        const childMap = {};
+        wappyGroups.forEach(g => {
+            g.children = [];
+            if (!g.parentId) rootGroups.push(g);
+            else {
+                if (!childMap[g.parentId]) childMap[g.parentId] = [];
+                childMap[g.parentId].push(g);
+            }
+        });
+        function addChildren(group) {
+            group.children = childMap[group.id] || [];
+            group.children.forEach(addChildren);
+        }
+        rootGroups.forEach(addChildren);
+
+        // Tel artikelen per groep (vanuit cache als beschikbaar)
+        if (this._articleCache) {
+            const counts = {};
+            this._articleCache.forEach(a => {
+                const gid = String(a.articleGroupId || '');
+                counts[gid] = (counts[gid] || 0) + 1;
+            });
+            wappyGroups.forEach(g => g._articleCount = counts[String(g.id)] || 0);
+        }
+
+        return { all: wappyGroups, tree: rootGroups };
+    },
+
+    async getArticlesByGroup(groupId) {
+        // Gebruik cache — instant filteren
+        const allArticles = await this._loadAllArticles();
+        return allArticles
+            .filter(a => String(a.articleGroupId) === String(groupId))
+            .map(art => ({
+                id: art.id,
+                name: art.name,
+                salePrice: art.salePrice,
+                costPrice: art.costPrice,
+                unitType: art.unitType || 'stuk',
+                articleGroupId: art.articleGroupId,
+                imageId: art.imageId || null,
+            }));
+    },
+
+    // Image URL helper
+    getImageUrl(imageId) {
+        if (!imageId) return null;
+        const auth = btoa(this.API_KEY + ':' + this.API_SECRET);
+        return `${this.BASE_URL}/images/${imageId}?tenant=${this.TENANT}`;
+    },
+
+    // =============================================
+    // UITGEVOERDE PLANNINGEN (gisteren + vandaag) — voor correctie-tool
+    // Per planning-item: som van alle gelinkte werkbons (uren, materialen, opmerkingen).
+    // =============================================
+    async getUitgevoerdPlanningen(employeeId, userId) {
+        // 1. Planning-items van afgelopen 7 dagen voor deze monteur
+        const today = new Date().toISOString().split('T')[0];
+        const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+
+        let allPlanningen = [];
+        let page = 0;
+        do {
+            const r = await this.get(
+                `planning-items?employeeId=${employeeId}&limit=100&page=${page}&sort=startDate:desc`
+            );
+            if (r.code !== 200) break;
+            const items = r.data.items || [];
+            if (items.length === 0) break;
+            allPlanningen = allPlanningen.concat(items);
+            const lastDate = (items[items.length - 1].startDate || '').split('T')[0];
+            if (lastDate < sevenDaysAgo) break;
+            const totalPages = r.data.totalPages || 1;
+            page++;
+            if (page >= totalPages || page > 10) break;
+        } while (true);
+
+        const planningenInScope = allPlanningen.filter(p => {
+            const d = (p.startDate || '').split('T')[0];
+            return d >= sevenDaysAgo && d <= today;
+        });
+
+        if (planningenInScope.length === 0) return { items: [] };
+
+        // 2. Alle werkbons van afgelopen 7 dagen ophalen → mappen op planningItemId
+        const sinceDate = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+        const werkbonsPerPlanning = {};
+        let woPage = 0;
+        do {
+            const r = await this.get(`work-orders?limit=100&page=${woPage}&sort=createdAt:desc`);
+            if (r.code !== 200) break;
+            const items = r.data.items || [];
+            if (items.length === 0) break;
+            let stop = false;
+            for (const wo of items) {
+                const d = wo.date || '';
+                if (d && d < sinceDate) { stop = true; break; }
+                if (!wo.planningItemId) continue;
+                const key = String(wo.planningItemId);
+                if (!werkbonsPerPlanning[key]) werkbonsPerPlanning[key] = [];
+                werkbonsPerPlanning[key].push(wo);
+            }
+            if (stop) break;
+            const totalPages = r.data.totalPages || 1;
+            woPage++;
+            if (woPage >= totalPages || woPage > 10) break;
+        } while (true);
+
+        // 3. Enkel plannings die al ≥1 werkbon hebben overhouden
+        const planningenMetWerkbon = planningenInScope.filter(p => werkbonsPerPlanning[String(p.id)]);
+
+        // 4. Voor elke planning: client + sub-entries van alle linked werkbons sommeren
+        const result = [];
+        for (const p of planningenMetWerkbon) {
+            const wos = werkbonsPerPlanning[String(p.id)] || [];
+            // Klant
+            let clientName = '', clientAddress = '';
+            if (p.clientId) {
+                try {
+                    const cr = await this.get(`clients/${p.clientId}`);
+                    if (cr.code === 200) {
+                        clientName = cr.data.name || '';
+                        clientAddress = this.formatAddress(cr.data.address);
+                    }
+                } catch(e) {}
+            }
+            // Order
+            let orderLogicId = null;
+            if (p.salesOrderId) {
+                try {
+                    const sr = await this.get(`sales-orders/${p.salesOrderId}`);
+                    if (sr.code === 200) orderLogicId = sr.data.logicId || null;
+                } catch(e) {}
+            }
+            // Sub-entries van elke werkbon
+            let totalHours = 0;
+            let totalCommute = 0;
+            const materialMap = {}; // key = articleId|description → { articleId, description, quantity, unitPrice }
+            const remarks = [];
+            const sourceWerkbonIds = [];
+            // We hebben de uurcode-articleIds nodig om uren te splitsen klant vs verplaatsing
+            // → niet beschikbaar zonder employee-rol; we slaan beide totals op en laten UI splitsen op articleId
+            const hoursPerArticle = {}; // articleId → totalHours
+            for (const wo of wos) {
+                sourceWerkbonIds.push(wo.id);
+                if (wo.remark && wo.remark.trim()) remarks.push(wo.remark.trim());
+                // time-entries
+                try {
+                    const te = await this.get(`work-orders/${wo.id}/time-entries`);
+                    const teItems = (te.data && (te.data.items || te.data)) || [];
+                    for (const t of teItems) {
+                        const hrs = parseFloat(t.hours || t.billableHours || 0);
+                        const aId = String(t.articleId || '');
+                        if (!hoursPerArticle[aId]) hoursPerArticle[aId] = 0;
+                        hoursPerArticle[aId] += hrs;
+                        totalHours += hrs;
+                    }
+                } catch(e) {}
+                // line-items (materialen)
+                try {
+                    const li = await this.get(`work-orders/${wo.id}/line-items`);
+                    const liItems = (li.data && (li.data.items || li.data)) || [];
+                    for (const l of liItems) {
+                        const aId = String(l.articleId || '');
+                        const desc = l.description || '';
+                        const key = aId + '|' + desc;
+                        if (!materialMap[key]) {
+                            materialMap[key] = {
+                                articleId: aId || null,
+                                description: desc,
+                                quantity: 0,
+                                unitPrice: parseFloat(l.price || 0),
+                            };
+                        }
+                        materialMap[key].quantity += parseFloat(l.quantity || 0);
+                    }
+                } catch(e) {}
+            }
+
+            // Origineel werkbon = de eerste (oudste) — dat is de "echte" werkbon, latere zijn al correcties
+            const origineel = wos.sort((a, b) => String(a.id).localeCompare(String(b.id)))[0];
+
+            result.push({
+                planningItemId: p.id,
+                clientId: p.clientId,
+                clientName,
+                clientAddress,
+                salesOrderId: p.salesOrderId,
+                orderLogicId,
+                installationIds: p.installationIds || [],
+                date: (p.startDate || '').split('T')[0],
+                summary: p.summary || '',
+                origineelWerkbonId: origineel ? origineel.id : null,
+                origineelLogicId: origineel ? (origineel.logicId || null) : null,
+                origineelTitle: origineel ? (origineel.title || '') : '',
+                aantalWerkbonnen: wos.length,
+                sourceWerkbonIds,
+                cumulatief: {
+                    totalHours,
+                    hoursPerArticle, // articleId → uren (UI splitst klant vs verplaatsing)
+                    materials: Object.values(materialMap).filter(m => m.quantity !== 0),
+                    remark: remarks.join(' | '),
+                },
+            });
+        }
+
+        // Sorteer: vandaag eerst, dan op startDate desc
+        result.sort((a, b) => {
+            if (a.date !== b.date) return b.date.localeCompare(a.date);
+            return 0;
+        });
+
+        return { items: result };
+    },
+
+    // =============================================
+    // UITGEVOERDE WERKEN (oude versie — behouden voor compat, niet meer gebruikt)
+    // =============================================
+    async getUitgevoerd(userId) {
+        const workOrders = [];
+        let page = 0;
+        // Toon werkbonnen van de afgelopen 14 dagen
+        const sinceDate = new Date(Date.now() - 14 * 86400000).toISOString().split('T')[0];
+
+        // Stap 1: Werkbonnen ophalen — enkel van deze ingelogde gebruiker
+        // (filter op assignedUserId = de Robaws userId van de technieker)
+        let done = false;
+        do {
+            const userFilter = userId ? `&assignedUserId=${encodeURIComponent(userId)}` : '';
+            const result = await this.get(`work-orders?limit=50&page=${page}&sort=date:desc${userFilter}`);
+            const items = (result.data && result.data.items) || [];
+            if (items.length === 0) break;
+
+            for (const wo of items) {
+                const woDate = wo.date || '';
+                if (woDate && woDate < sinceDate) { done = true; break; }
+                // Alleen echte werkbonnen (werkorders MET lijnen/uren), geen lege planning items
+                // De API geeft enkel werk-orders terug; planning-items zitten in /planning-items.
+                // Extra zekerheid: skip items zonder id/title.
+                if (!wo.id) continue;
+                // Dubbele check op assignedUserId (voor het geval het filter niet werd gerespecteerd)
+                if (userId && wo.assignedUserId && String(wo.assignedUserId) !== String(userId)) continue;
+                workOrders.push({
+                    id: wo.id,
+                    logicId: wo.logicId || null,
+                    title: wo.title || '',
+                    status: wo.status || '',
+                    date: wo.date || '',
+                    clientId: wo.clientId || null,
+                    clientName: null,
+                    clientAddress: null,
+                    planningItemId: wo.planningItemId || null,
+                    assignedUserId: wo.assignedUserId || null,
+                    totalExclVat: wo.totalExclVat || null,
+                });
+            }
+
+            if (done) break;
+            const totalPages = (result.data && result.data.totalPages) || 1;
+            page++;
+            if (page >= totalPages) break;
+            // Hard limit om oneindige loops te vermijden
+            if (page > 20) break;
+        } while (true);
+
+        // Stap 2: Klantgegevens ophalen (unieke clientIds)
+        const clientIds = [...new Set(workOrders.map(w => w.clientId).filter(Boolean))];
+        const clientCache = {};
+        for (const cId of clientIds) {
+            try {
+                const cResult = await this.get(`clients/${cId}`);
+                if (cResult.code === 200) {
+                    clientCache[cId] = {
+                        name: cResult.data.name || '',
+                        address: this.formatAddress(cResult.data.address),
+                    };
+                }
+            } catch (e) { /* skip */ }
+        }
+
+        // Stap 3: Klantgegevens invullen
+        for (const wo of workOrders) {
+            if (wo.clientId && clientCache[wo.clientId]) {
+                wo.clientName = clientCache[wo.clientId].name;
+                wo.clientAddress = clientCache[wo.clientId].address;
+            }
+        }
+
+        return { items: workOrders };
+    },
+
+    // =============================================
+    // FACTUUR AANMAKEN VANUIT WERKORDER
+    // =============================================
+    async createInvoice({ workOrderId, paymentConditionId = '9', vatTariffId = '4', clientId: passedClientId = null, companyId: passedCompanyId = null }) {
+        // Stap 1: Werkorder details
+        const woResult = await this.get(`work-orders/${workOrderId}`);
+        if (woResult.code !== 200) throw new Error('Werkorder niet gevonden');
+        const wo = woResult.data;
+
+        // Debug: bewaar volledige respons voor inspectie
+        try { localStorage.setItem('qe_last_wo_response', JSON.stringify(wo)); } catch(e){}
+
+        // Gebruik doorgegeven clientId (uit planning) of probeer uit werkorder-respons
+        const clientId = passedClientId
+            || wo.endClientId
+            || wo.clientId
+            || (wo.client && wo.client.id)
+            || (wo.endClient && wo.endClient.id)
+            || wo.customerId
+            || (wo.customer && wo.customer.id);
+        const companyId = passedCompanyId || wo.companyId || (wo.company && wo.company.id) || '3';
+        if (!clientId) {
+            throw new Error('Geen klant gekoppeld aan werkorder ' + workOrderId);
+        }
+
+        // Stap 2: Material-entries + time-entries ophalen
+        // submitWerkbon schrijft materialen via /work-orders/{id}/material-entries en
+        // uren via /work-orders/{id}/time-entries — dus die endpoints gebruiken we hier ook.
+        let woLineItems = [];
+        // 2a: material-entries (dit is het juiste endpoint voor materialen op een werkbon)
+        const matResult = await this.get(`work-orders/${workOrderId}/material-entries`);
+        const matEntries = (matResult.data && (matResult.data.items || matResult.data)) || [];
+        if (Array.isArray(matEntries) && matEntries.length) {
+            woLineItems = matEntries.map(me => ({
+                _source: 'material-entry',
+                articleId: me.articleId || (me.article && me.article.id),
+                description: me.description || (me.article && (me.article.name || me.article.description)) || 'Materiaal',
+                quantity: me.billableAmount ?? me.amount ?? me.quantity ?? 1,
+                price: me.salePrice ?? me.price ?? 0,
+                discount: me.discount || 0,
+                vatTariffId: me.vatTariffId || (me.vatTariff && me.vatTariff.id),
+                unitType: me.unitType || (me.article && me.article.unitType),
+                type: 'LINE',
+            }));
+        }
+        // 2b: fallback naar line-items endpoint als material-entries niets gaf
+        if (!woLineItems.length) {
+            const lineResult = await this.get(`work-orders/${workOrderId}/line-items`);
+            const rawLines = (lineResult.data && (lineResult.data.items || lineResult.data)) || [];
+            if (Array.isArray(rawLines)) woLineItems = rawLines;
+        }
+        // 2c: fallback naar genest in werkorder-respons
+        if (!woLineItems.length) {
+            const woWithLines = await this.get(`work-orders/${workOrderId}?extraFields=lineItems,adjustedLineItems,materialEntries,timeEntries`);
+            if (woWithLines.code === 200 && woWithLines.data) {
+                const nested = woWithLines.data.materialEntries || woWithLines.data.lineItems || woWithLines.data.adjustedLineItems || [];
+                if (nested.length) {
+                    woLineItems = nested.map(me => ({
+                        _source: 'nested',
+                        articleId: me.articleId || (me.article && me.article.id),
+                        description: me.description || (me.article && (me.article.name || me.article.description)) || 'Materiaal',
+                        quantity: me.billableAmount ?? me.amount ?? me.quantity ?? 1,
+                        price: me.salePrice ?? me.price ?? 0,
+                        discount: me.discount || 0,
+                        vatTariffId: me.vatTariffId || (me.vatTariff && me.vatTariff.id),
+                        unitType: me.unitType,
+                        type: 'LINE',
+                    }));
+                }
+                if (woWithLines.data.timeEntries) wo.timeEntries = woWithLines.data.timeEntries;
+            }
+        }
+
+        let timeEntries = wo.timeEntries || [];
+        if (!timeEntries.length) {
+            const timeResult = await this.get(`work-orders/${workOrderId}/time-entries`);
+            timeEntries = (timeResult.data && (timeResult.data.items || timeResult.data)) || [];
+        }
+
+        console.log('[createInvoice] Lijnen opgehaald:', woLineItems.length, 'Uren:', timeEntries.length);
+        console.log('[createInvoice] Eerste lijn:', woLineItems[0]);
+
+        // Stap 3: Factuur aanmaken — markeer als Viva Wallet betaling via remark
+        // Robaws v2 vereist STRING IDs, niet integers!
+        const toStr = v => (v == null || v === '') ? null : String(v);
+        const invResult = await this.post('sales-invoices', {
+            type: 'INVOICE',
+            clientId: toStr(clientId),
+            companyId: toStr(companyId),
+            date: new Date().toISOString().split('T')[0],
+            paymentConditionId: toStr(paymentConditionId),
+            remark: 'Viva wallet betaling',
+            internalRemark: 'Viva wallet betaling',
+        });
+
+        if (invResult.code !== 201 && invResult.code !== 200) {
+            throw new Error('Kon factuur niet aanmaken: ' + JSON.stringify(invResult.data));
+        }
+
+        const invoice = invResult.data;
+        const invoiceId = invoice.id;
+
+        // Stap 4: Kopieer line items
+        let addedLines = 0;
+        const errors = [];
+
+        console.log('[createInvoice] Work order line items:', woLineItems);
+        console.log('[createInvoice] Time entries:', timeEntries);
+
+        for (const line of woLineItems) {
+            const lineData = {
+                type: line.type || 'LINE',
+                quantity: Number(line.quantity) || 1,
+                description: line.description || line.articleName || line.name || 'Lijn',
+                price: Number(line.price) || Number(line.salePrice) || 0,
+                discount: Number(line.discount) || 0,
+                vatTariffId: toStr(line.vatTariffId || vatTariffId),
+            };
+            if (line.articleId) lineData.articleId = toStr(line.articleId);
+            if (line.unitType) lineData.unitType = line.unitType;
+
+            const addResult = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData);
+            if (addResult.code === 201 || addResult.code === 200) {
+                addedLines++;
+            } else {
+                const errMsg = addResult.data && (addResult.data.message || addResult.data.error || JSON.stringify(addResult.data));
+                console.error('[createInvoice] Line POST failed:', addResult.code, errMsg, 'data:', lineData);
+                errors.push({ line: lineData.description, code: addResult.code, error: errMsg, sent: lineData });
+            }
+        }
+
+        // Stap 4b: Uren als line items
+        for (const te of timeEntries) {
+            const hours = Number(te.billableHours) || Number(te.hours) || Number(te.duration) || 0;
+            if (hours <= 0) continue;
+            const articleId = te.articleId || (te.article && te.article.id);
+            const salePrice = Number(te.salePrice) || Number(te.price) || 0;
+            const lineData = {
+                type: 'LINE',
+                quantity: hours,
+                unitType: 'uur',
+                description: te.description || (te.article && te.article.name) || 'Werkuren',
+                price: salePrice,
+                vatTariffId: toStr(vatTariffId),
+            };
+            if (articleId) lineData.articleId = toStr(articleId);
+
+            const addResult = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData);
+            if (addResult.code === 201 || addResult.code === 200) addedLines++;
+            else {
+                const errMsg = addResult.data && (addResult.data.message || addResult.data.error || JSON.stringify(addResult.data));
+                console.error('[createInvoice] Hours POST failed:', addResult.code, errMsg);
+                errors.push({ line: 'Werkuren', code: addResult.code, error: errMsg, sent: lineData });
+            }
+        }
+
+        // Stap 4c: Factuur boeken — dit wijst logicId (factuurnummer) toe.
+        // /book stuurt NIET automatisch naar de boekhouder; dat gebeurt via
+        // /send-to-accountant of via de normale maandelijkse flow.
+        let bookResult = { code: 0, data: null };
+        if (addedLines > 0) {
+            try {
+                bookResult = await this.post(`sales-invoices/${invoiceId}/book`, {});
+            } catch(e) {
+                bookResult = { code: 0, data: { error: e.message } };
+            }
+            try { localStorage.setItem('qe_last_inv_book', JSON.stringify(bookResult)); } catch(e){}
+        }
+
+        // Debug: bewaar voor inspectie
+        try {
+            localStorage.setItem('qe_last_invoice_debug', JSON.stringify({
+                invoiceId, addedLines, errors, woLineItems, timeEntries, bookResult,
+            }));
+        } catch(e){}
+
+        // Stap 5: Factuur opnieuw ophalen voor totalen + OGM (probeer extraFields)
+        let finalInvoice = await this.get(`sales-invoices/${invoiceId}?extraFields=totalExclVat,totalInclVat,totalAmount,grossAmount,netAmount,paymentInstruction,logicId,expireDate`);
+        if (finalInvoice.code !== 200) {
+            finalInvoice = await this.get(`sales-invoices/${invoiceId}`);
+        }
+        let inv = finalInvoice.data;
+
+        // Na /book kan het enkele seconden duren voor logicId + paymentInstruction klaar zijn.
+        // Retry tot beide gevuld zijn (of max pogingen bereikt).
+        if (!inv.logicId || !inv.paymentInstruction) {
+            for (let attempt = 0; attempt < 6 && (!inv.logicId || !inv.paymentInstruction); attempt++) {
+                await new Promise(r => setTimeout(r, 700));
+                const retry = await this.get(`sales-invoices/${invoiceId}?extraFields=paymentInstruction,totalExclVat,totalInclVat,logicId`);
+                if (retry.code === 200 && retry.data) {
+                    inv = { ...inv, ...retry.data };
+                }
+            }
+        }
+
+        // Debug: bewaar respons voor inspectie
+        try { localStorage.setItem('qe_last_inv_response', JSON.stringify(inv)); } catch(e){}
+        console.log('[createInvoice] Final invoice velden:', Object.keys(inv || {}), inv);
+
+        // Probeer alle mogelijke total-veldnamen (Robaws v2 varianten)
+        let totalExclVat = inv.totalExclVat ?? inv.totalExclTax ?? inv.amountExclVat ?? inv.netAmount ?? inv.subTotal ?? null;
+        let totalInclVat = inv.totalInclVat ?? inv.totalInclTax ?? inv.amountInclVat ?? inv.grossAmount ?? inv.totalAmount ?? inv.total ?? null;
+
+        // Fallback: bereken zelf vanuit de lijnen die we net hebben toegevoegd
+        if (!totalExclVat || !totalInclVat) {
+            const linesRes = await this.get(`sales-invoices/${invoiceId}/line-items`);
+            const lines = (linesRes.data && linesRes.data.items) || [];
+            let computedExcl = 0;
+            let computedIncl = 0;
+            const vatRates = { '1': 0, '4': 0.21, '5': 0.06, '6': 0.12 }; // Robaws vatTariffId → %
+            for (const l of lines) {
+                const qty = Number(l.quantity) || 0;
+                const price = Number(l.price) || 0;
+                const disc = Number(l.discount) || 0;
+                const lineExcl = qty * price * (1 - disc / 100);
+                const vatRate = vatRates[String(l.vatTariffId)] ?? 0.21;
+                computedExcl += lineExcl;
+                computedIncl += lineExcl * (1 + vatRate);
+            }
+            totalExclVat = totalExclVat || Math.round(computedExcl * 100) / 100;
+            totalInclVat = totalInclVat || Math.round(computedIncl * 100) / 100;
+            console.log('[createInvoice] Totalen zelf berekend:', { totalExclVat, totalInclVat, lineCount: lines.length });
+        }
+
+        const ogm = inv.paymentInstruction || '';
+        let formattedOgm = '';
+        if (ogm.length === 12) {
+            formattedOgm = '+++' + ogm.substr(0, 3) + '/' + ogm.substr(3, 4) + '/' + ogm.substr(7, 5) + '+++';
+        }
+
+        return {
+            success: true,
+            invoice: {
+                id: inv.id,
+                logicId: inv.logicId,
+                date: inv.date,
+                expireDate: inv.expireDate,
+                totalExclVat: totalExclVat || 0,
+                totalInclVat: totalInclVat || 0,
+                status: inv.status,
+                paymentInstruction: ogm,
+                formattedOgm,
+            },
+            lineItemsAdded: addedLines,
+            errors,
+            debugFields: Object.keys(inv || {}),
+            debugWoLines: woLineItems.length,
+            debugTimeEntries: timeEntries.length,
+            debugFirstLine: woLineItems[0] ? Object.keys(woLineItems[0]) : [],
+            debugMaterialEntries: matEntries.length,
+            debugMatEntryKeys: matEntries[0] ? Object.keys(matEntries[0]) : [],
+            workOrder: {
+                id: wo.id,
+                logicId: wo.logicId,
+                title: wo.title,
+            },
+        };
+    },
+
+    // =============================================
+    // HANDTEKENING UPLOADEN
+    // =============================================
+    async uploadSignature({ workOrderId, signatureName, signatureData }) {
+        // Base64 naar Blob
+        let base64 = signatureData;
+        if (base64.includes(',')) base64 = base64.split(',')[1];
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let j = 0; j < binary.length; j++) {
+            bytes[j] = binary.charCodeAt(j);
+        }
+        const blob = new Blob([bytes], { type: 'image/png' });
+        const file = new File([blob], 'signature.png', { type: 'image/png' });
+
+        // Upload als document bij werkorder
+        const result = await this.uploadFile(
+            `work-orders/${workOrderId}/documents`,
+            file,
+            'signature.png'
+        );
+
+        // Probeer signatureName op te slaan.
+        // BELANGRIJK: Robaws v2 PUT is een VOLLEDIGE replace (geen PATCH).
+        // Een PUT met enkel { signatureName } zet alle andere velden terug op null.
+        // Daarom eerst GET, dan alle bestaande velden + signatureName mee PUT'en.
+        if (signatureName) {
+            try {
+                const cur = await this.get(`work-orders/${workOrderId}`);
+                if (cur.code === 200 && cur.data) {
+                    const d = cur.data;
+                    const toStr = v => (v == null || v === '') ? null : String(v);
+                    const body = {
+                        title: d.title,
+                        date: d.date,
+                        status: d.status,
+                        remark: d.remark,
+                        timeAndMaterial: d.timeAndMaterial,
+                        clientReference: d.clientReference,
+                        signatureName: signatureName,
+                    };
+                    if (d.assignedUserId != null) body.assignedUserId = toStr(d.assignedUserId);
+                    if (d.clientId != null)      body.clientId      = toStr(d.clientId);
+                    if (d.endClientId != null)   body.endClientId   = toStr(d.endClientId);
+                    if (d.planningItemId != null) body.planningItemId = toStr(d.planningItemId);
+                    if (d.salesOrderId != null)  body.salesOrderId  = toStr(d.salesOrderId);
+                    if (d.projectId != null)     body.projectId     = toStr(d.projectId);
+                    if (d.companyId != null)     body.companyId     = toStr(d.companyId);
+                    if (Array.isArray(d.installationIds) && d.installationIds.length) {
+                        body.installationIds = d.installationIds.map(toStr);
+                    }
+                    if (d.address && (d.address.addressLine1 || d.address.city || d.address.postalCode)) {
+                        body.address = d.address;
+                    }
+                    await this.put(`work-orders/${workOrderId}`, body);
+                }
+            } catch(e) { /* niet fataal */ }
+        }
+
+        return {
+            success: result.code === 200 || result.code === 201,
+            documentId: result.data ? result.data.id : null,
+        };
+    },
+
+    // =============================================
+    // FACTUUR ALS BETAALD MARKEREN
+    // =============================================
+    async markInvoicePaid(invoiceId) {
+        // Status blijft "Viva wallet betaling" — de bank zet de factuur automatisch
+        // op "betaald" via matching op de gestructureerde mededeling (OGM).
+        //
+        // We posten GEEN /payments en veranderen GEEN status, want:
+        // - Een /payments voor het volledige bedrag zet de factuur meteen op "betaald"
+        //   (openstaand saldo = 0), wat we niet willen tot de bank het bevestigt.
+        // - De status mag op "Viva wallet betaling" blijven staan zodat de factuur
+        //   in de juiste lijst zichtbaar blijft tot de bank matcht.
+        //
+        // Deze functie is dus effectief een no-op vanuit Robaws-perspectief; ze bestaat
+        // enkel nog zodat de app-flow kan doorgaan na een geslaagde terminal-betaling.
+        return { success: true, code: 200, skipped: true };
+    },
+};
