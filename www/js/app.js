@@ -3905,7 +3905,7 @@ const app = {
         const user = RobawsAPI.getLoggedInUser();
         const adminSection = document.getElementById('clockAdminSection');
         const tagAdminSection = document.getElementById('clockTagAdmin');
-        if (user && user.role === 'kantoor') {
+        if (user && user.role === 'bureel') {
             adminSection.style.display = 'block';
             this.loadClockAdmin();
             if (tagAdminSection) tagAdminSection.style.display = 'block';
@@ -4028,7 +4028,7 @@ const app = {
     /** Render tag admin HTML + bind events (aangeroepen na loadTagConfig) */
     _renderClockTagAdmin() {
         const user = RobawsAPI.getLoggedInUser();
-        if (!user || user.role !== 'kantoor') return;
+        if (!user || user.role !== 'bureel') return;
         const tagList = document.getElementById('clockTagList');
         if (!tagList) return;
         tagList.innerHTML = QEClock.renderTagAdmin();

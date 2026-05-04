@@ -28,7 +28,7 @@ const RobawsAPI = {
         'olivier.puchacz@qe.be':     { employeeId: 12, userId: 13,    name: 'Olivier',    role: 'technieker' },
         'yassine@qe.be':             { employeeId: 30, userId: 20,    name: 'Yassine',    role: 'technieker' },
         // Monteurs
-        'levi@qe.be':                { employeeId: 1,  userId: 8,     name: 'Levi',       role: 'kantoor' },
+        'levi@qe.be':                { employeeId: 1,  userId: 8,     name: 'Levi',       role: 'bureel' },
         'stefan@qe.be':              { employeeId: 2,  userId: 21,    name: 'Stefan',     role: 'monteur' },
         'jelle@qe.be':               { employeeId: 3,  userId: 14,    name: 'Jelle',      role: 'monteur' },
         'wim@qe.be':                 { employeeId: 4,  userId: 22,    name: 'Wim',        role: 'monteur' },
@@ -37,11 +37,12 @@ const RobawsAPI = {
         'keng@qe.be':                { employeeId: 11, userId: 17,    name: 'Keng',       role: 'monteur' },
         'joshua@qe.be':              { employeeId: 13, userId: 16,    name: 'Joshua',     role: 'monteur' },
         // Bureel / kantoor
-        'vince@qe.be':               { employeeId: 16, userId: 5,     name: 'Vince',      role: 'kantoor' },
-        'bjorn@qe.be':               { employeeId: 19, userId: 4,     name: 'Bjorn',      role: 'kantoor' },
-        'bart@qe.be':                { employeeId: 20, userId: 7,     name: 'Bart',       role: 'kantoor' },
-        'felicity@qe.be':            { employeeId: 21, userId: null,  name: 'Felicity',   role: 'kantoor' },
-        'rolf@qe.be':                { employeeId: 22, userId: 2,     name: 'Rolf',       role: 'kantoor' },
+        'vince@qe.be':               { employeeId: 16, userId: 5,     name: 'Vince',      role: 'bureel' },
+        'bjorn@qe.be':               { employeeId: 19, userId: 4,     name: 'Bjorn',      role: 'bureel' },
+        'bart@qe.be':                { employeeId: 20, userId: 7,     name: 'Bart',       role: 'bureel' },
+        'felicity@qe.be':            { employeeId: 21, userId: null,  name: 'Felicity',   role: 'bureel' },
+        'rolf@qe.be':                { employeeId: 22, userId: 2,     name: 'Rolf',       role: 'bureel' },
+        'els@qe.be':                 { employeeId: null, userId: null, name: 'Els',       role: 'bureel' },
     },
 
     // === AUTH HEADERS ===
@@ -268,11 +269,11 @@ const RobawsAPI = {
 
         // Normaliseer rol
         const isMonteur = roleKey.includes('monteur');
-        const isKantoor = roleKey.includes('kantoor') || roleKey.includes('bureel') || roleKey.includes('projectleider') || roleKey.includes('service');
+        const isBureel = roleKey.includes('kantoor') || roleKey.includes('bureel') || roleKey.includes('projectleider') || roleKey.includes('service');
         let normalRole = 'technieker';
         let normalRoleName = 'Technieker';
         if (isMonteur) { normalRole = 'monteur'; normalRoleName = 'Monteur'; }
-        else if (isKantoor) { normalRole = 'kantoor'; normalRoleName = 'Kantoor'; }
+        else if (isBureel) { normalRole = 'bureel'; normalRoleName = 'Bureel'; }
 
         // Stap 4: userId ophalen (gelinkte gebruiker)
         let resolvedUserId = null;
@@ -374,10 +375,10 @@ const RobawsAPI = {
             const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || email;
             const roleKey = (c.planningGroupName || '').toLowerCase();
             const isMonteur = roleKey.includes('monteur');
-            const isKantoor = roleKey.includes('kantoor') || roleKey.includes('bureel') || roleKey.includes('service');
+            const isBureel = roleKey.includes('kantoor') || roleKey.includes('bureel') || roleKey.includes('service');
             let role = 'technieker';
             if (isMonteur) role = 'monteur';
-            else if (isKantoor) role = 'kantoor';
+            else if (isBureel) role = 'bureel';
 
             user = {
                 name: name,
