@@ -224,8 +224,19 @@ window.QEClock = {
     // NFC SCAN (aangeroepen vanuit Java/MainActivity)
     // =============================================
 
+    _scanLock: false,
+
     async onNfcScan(tagId) {
         console.log('[Clock] NFC scan:', tagId);
+
+        // Debounce: voorkom dubbele scans binnen 3 seconden
+        if (this._scanLock) {
+            console.log('[Clock] Scan genegeerd (debounce)');
+            return;
+        }
+        this._scanLock = true;
+        setTimeout(() => { this._scanLock = false; }, 3000);
+
         const user = RobawsAPI.getLoggedInUser();
         if (!user) {
             if (window.app) app.toast('Log eerst in om te clocken');
@@ -252,8 +263,12 @@ window.QEClock = {
             return;
         }
 
-        // Haal of maak sessie
+        // Haal of maak sessie — controleer dat employeeId klopt met ingelogde user
         let session = this.getSession() || this._newSession();
+        if (session.employeeId && String(session.employeeId) !== String(user.robawsEmployeeId)) {
+            console.warn('[Clock] Sessie van andere werknemer gevonden, nieuwe sessie aanmaken');
+            session = this._newSession();
+        }
 
         // ── LADEN & LOSSEN ──
         if (tag.type === 'laden_lossen') {
@@ -317,10 +332,15 @@ window.QEClock = {
         session.pendingRemarks = remarks;
         this._saveSession(session);
 
-        // Upload naar Robaws
+        // Upload naar Robaws — gebruik ALTIJD de huidige user, niet de sessie
+        const currentUser = RobawsAPI.getLoggedInUser();
+        const empId = currentUser ? String(currentUser.robawsEmployeeId) : session.employeeId;
+        session.employeeId = empId; // zorg dat sessie altijd juiste ID heeft
+        this._saveSession(session);
+
         try {
             const result = await RobawsAPI.createTimeRegistration({
-                employeeId: session.employeeId,
+                employeeId: empId,
                 startDate: session.startISO,
                 type: type,
                 remarks: remarks,
