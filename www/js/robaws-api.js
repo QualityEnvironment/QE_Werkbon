@@ -603,8 +603,22 @@ const RobawsAPI = {
             try {
                 const myRes = await this.get(`employees/${user.robawsEmployeeId}`);
                 if (myRes.code === 200 && myRes.data && myRes.data.extraFields) {
-                    const startField = myRes.data.extraFields['Startuur werknemer'];
+                    console.log('[RobawsAPI] Extra velden werknemer:', JSON.stringify(Object.keys(myRes.data.extraFields)));
+                    // Zoek startuur veld (kan "Startuur werknemer" of "Startuur" heten)
+                    let startField = myRes.data.extraFields['Startuur werknemer'];
+                    if (!startField) startField = myRes.data.extraFields['Startuur'];
+                    // Zoek in alle velden naar een veld dat "startuur" bevat
+                    if (!startField) {
+                        for (const [name, data] of Object.entries(myRes.data.extraFields)) {
+                            if (name.toLowerCase().includes('startuur')) {
+                                startField = data;
+                                console.log('[RobawsAPI] Startuur gevonden als:', name);
+                                break;
+                            }
+                        }
+                    }
                     const val = startField ? String(startField.stringValue ?? startField.value ?? '') : '';
+                    console.log('[RobawsAPI] Startuur waarde voor', user.name, ':', val || 'NIET GEVONDEN');
                     if (val) config.startuur = val;
                 }
             } catch(e) {

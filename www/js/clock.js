@@ -74,6 +74,12 @@ window.QEClock = {
         try {
             const config = await RobawsAPI.getNfcTagConfig();
             this._tagConfig = config;
+            // Persoonlijk startuur apart opslaan (niet afhankelijk van tag config)
+            if (config.startuur) {
+                this._personalStartuur = config.startuur;
+                localStorage.setItem('qe_personal_startuur', config.startuur);
+                console.log('[Clock] Persoonlijk startuur:', config.startuur);
+            }
             localStorage.setItem('qe_nfc_tags', JSON.stringify(config));
             console.log('[Clock] NFC tags geladen:', JSON.stringify(config));
             return config;
@@ -95,6 +101,10 @@ window.QEClock = {
         const cached = localStorage.getItem('qe_nfc_tags');
         if (cached) {
             this._tagConfig = JSON.parse(cached);
+            // Herstel persoonlijk startuur uit cache
+            if (!this._personalStartuur) {
+                this._personalStartuur = localStorage.getItem('qe_personal_startuur') || null;
+            }
             return this._tagConfig;
         }
         return null;
@@ -128,10 +138,13 @@ window.QEClock = {
         return null; // Onbekende tag
     },
 
+    /** Persoonlijk startuur van de ingelogde werknemer (apart van tag config) */
+    _personalStartuur: null,
+
     /** Haal verwachte starttijd op voor de ingelogde gebruiker */
     getExpectedStartTime() {
-        const config = this.getTagConfig();
-        if (config && config.startuur) return config.startuur;
+        // Persoonlijk startuur heeft altijd prioriteit
+        if (this._personalStartuur) return this._personalStartuur;
         // Fallback op basis van rol
         const user = RobawsAPI.getLoggedInUser();
         if (user) return this.FALLBACK_START_TIMES[user.role] || '07:30';
