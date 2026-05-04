@@ -1981,7 +1981,29 @@ const RobawsAPI = {
             invFull.status = 'Technieker';
 
             // Verantwoordelijke = de ingelogde technieker (niet standaard Rolf)
-            if (userId) invFull.assignedUserId = toStr(userId);
+            // Als userId null is, probeer dynamisch op te halen via employeeId
+            let resolvedUserId = userId;
+            if (!resolvedUserId) {
+                try {
+                    const currentUser = this.getLoggedInUser();
+                    if (currentUser && currentUser.robawsEmployeeId) {
+                        const empRes = await this.get(`employees/${currentUser.robawsEmployeeId}`);
+                        if (empRes.code === 200 && empRes.data) {
+                            resolvedUserId = empRes.data.userId || (empRes.data.user && empRes.data.user.id) || null;
+                        }
+                        if (!resolvedUserId) {
+                            const usersRes = await this.get('users');
+                            if (usersRes.code === 200 && usersRes.data) {
+                                const usersList = usersRes.data.items || usersRes.data || [];
+                                const match = usersList.find(u => u.employeeId && String(u.employeeId) === String(currentUser.robawsEmployeeId));
+                                if (match) resolvedUserId = match.id;
+                            }
+                        }
+                        if (resolvedUserId) console.log('[Factuur] UserId dynamisch opgehaald:', resolvedUserId);
+                    }
+                } catch(e) { console.warn('[Factuur] UserId lookup mislukt:', e); }
+            }
+            if (resolvedUserId) invFull.assignedUserId = toStr(resolvedUserId);
 
             // Werfadres: installatie-adres ophalen → siteAddress (verschijnt in titel factuur)
             try {
@@ -2090,59 +2112,71 @@ const RobawsAPI = {
 
         // 3c: Uren als line items — alleen 'klant' uren factureren!
         // Verplaatsingsuren en pauze worden NIET gefactureerd (verplaatsing zit al in materialen als vast tarief)
+        // ALTIJD totaal afronden naar boven op half uur (niet per entry!)
         if (hours.length > 0) {
+            // Groepeer per articleId en tel totaal minuten op
+            const hoursByArticle = {};
             for (const h of hours) {
-                if (h.type && h.type !== 'klant') continue; // Alleen klant-uren factureren
-                const dur = Number(h.duration || 0); // minuten
-                const hrs = Math.round(dur / 60 * 100) / 100;
+                if (h.type && h.type !== 'klant') continue;
+                const dur = Number(h.duration || 0);
                 const salePrice = Number(h.salePrice || 0);
-                if (hrs <= 0 || salePrice <= 0) continue;
-
+                if (dur <= 0 || salePrice <= 0) continue;
+                const artKey = h.articleId || '_default';
+                if (!hoursByArticle[artKey]) hoursByArticle[artKey] = { totalMinutes: 0, salePrice, articleId: h.articleId };
+                hoursByArticle[artKey].totalMinutes += dur;
+            }
+            // Eén factuurregel per articleId, afgerond op totaal
+            for (const [artKey, group] of Object.entries(hoursByArticle)) {
+                const rawHrs = Math.round(group.totalMinutes / 60 * 100) / 100;
+                const billableHrs = this._roundUpHalfHour(rawHrs);
                 const desc = 'Werkuren';
-                // Facturatie: ALTIJD afronden naar boven op half uur
-                const billableHrs = this._roundUpHalfHour(hrs);
                 const lineData = {
                     type: 'LINE',
                     quantity: billableHrs,
                     unitType: 'uur',
                     description: desc,
-                    price: salePrice,
+                    price: group.salePrice,
                     vatTariffId: toStr(vatTariffId),
                 };
                 if (woSalesOrderId) lineData.orderId = woSalesOrderId;
-                if (h.articleId && !isNaN(h.articleId) && Number(h.articleId) > 0) {
-                    lineData.articleId = toStr(h.articleId);
+                if (group.articleId && !isNaN(group.articleId) && Number(group.articleId) > 0) {
+                    lineData.articleId = toStr(group.articleId);
                 }
-
+                console.log('[Factuur] Uren lijn:', rawHrs, 'u → afgerond:', billableHrs, 'u @', group.salePrice);
                 const addResult = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData);
                 if (addResult.code === 201 || addResult.code === 200) addedLines++;
                 else errors.push({ line: desc, code: addResult.code, error: addResult.data });
             }
         } else if (!onderhoud) {
             // Fallback: time-entries van werkorder (NIET bij onderhoud — dan worden uren niet gefactureerd)
+            // Tel alle uren op per article en rond totaal af
             const timeResult = await this.get(`work-orders/${workOrderId}/time-entries`);
             const timeEntries = (timeResult.data && (timeResult.data.items || timeResult.data)) || [];
+            const teByArticle = {};
             for (const te of timeEntries) {
                 const hrs = Number(te.billableHours) || Number(te.hours) || 0;
                 const salePrice = Number(te.salePrice) || 0;
                 if (hrs <= 0 || salePrice <= 0) continue;
-                // Facturatie: ALTIJD afronden naar boven op half uur
-                const billableHrs = this._roundUpHalfHour(hrs);
+                const artId = te.articleId || (te.article && te.article.id) || '_default';
+                if (!teByArticle[artId]) teByArticle[artId] = { totalHrs: 0, salePrice, articleId: artId, desc: te.description || (te.article && te.article.name) || 'Werkuren' };
+                teByArticle[artId].totalHrs += hrs;
+            }
+            for (const [aId, group] of Object.entries(teByArticle)) {
+                const billableHrs = this._roundUpHalfHour(group.totalHrs);
                 const lineData = {
                     type: 'LINE',
                     quantity: billableHrs,
                     unitType: 'uur',
-                    description: te.description || (te.article && te.article.name) || 'Werkuren',
-                    price: salePrice,
+                    description: group.desc,
+                    price: group.salePrice,
                     vatTariffId: toStr(vatTariffId),
                 };
                 if (woSalesOrderId) lineData.orderId = woSalesOrderId;
-                const artId = te.articleId || (te.article && te.article.id);
-                if (artId) lineData.articleId = toStr(artId);
-
+                if (aId && aId !== '_default') lineData.articleId = toStr(aId);
+                console.log('[Factuur] Uren lijn (fallback):', group.totalHrs, 'u → afgerond:', billableHrs, 'u');
                 const addResult = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData);
                 if (addResult.code === 201 || addResult.code === 200) addedLines++;
-                else errors.push({ line: 'Werkuren', code: addResult.code, error: addResult.data });
+                else errors.push({ line: group.desc, code: addResult.code, error: addResult.data });
             }
         }
 
