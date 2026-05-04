@@ -423,7 +423,19 @@ window.QEClock = {
         const now = new Date();
         const endTime = this._localTime(now);
         const endISO = now.toISOString();
-        const hours = this._calcHours(session.startISO, endISO);
+        const rawHours = this._calcHours(session.startISO, endISO);
+
+        // Pauze aftrekken: bureel = 1u, monteur/technieker = 0.75u (45min)
+        // Alleen bij normale registraties (niet bij Laden & Lossen of Extra uren)
+        let pauseHours = 0;
+        const isNormalShift = session.registrationType === 'Op tijd' || session.registrationType === 'Te laat';
+        if (isNormalShift) {
+            const user = RobawsAPI.getLoggedInUser();
+            const role = user ? user.role : 'technieker';
+            pauseHours = (role === 'bureel') ? 1 : 0.75;
+        }
+        const hours = Math.max(0, Math.round((rawHours - pauseHours) * 100) / 100);
+        console.log('[Clock] Uren berekend:', rawHours, '- pauze', pauseHours, '=', hours);
 
         // Sessie afronden
         session.active = false;
@@ -471,8 +483,9 @@ window.QEClock = {
         }
 
         // UI feedback
+        const pauseText = pauseHours > 0 ? ` (${pauseHours}u pauze afgetrokken)` : '';
         if (window.app) {
-            app.toast(`🏁 Uitgeklokt om ${endTime} — ${hours} uur gewerkt`);
+            app.toast(`🏁 Uitgeklokt om ${endTime} — ${hours} uur gewerkt${pauseText}`);
             app.updateClockUI();
             app.navigate(app.currentScreen);
         }
