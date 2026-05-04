@@ -56,6 +56,14 @@ const RobawsAPI = {
         };
     },
 
+    // === HELPERS ===
+
+    /** Rond uren naar boven af op halve uren (voor facturatie).
+     *  Bv: 0.22 → 0.5, 0.5 → 0.5, 0.51 → 1.0, 1.0 → 1.0, 1.1 → 1.5 */
+    _roundUpHalfHour(hours) {
+        return Math.ceil(hours * 2) / 2;
+    },
+
     // === BASIS API CALLS ===
     async get(endpoint) {
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
@@ -1175,7 +1183,7 @@ const RobawsAPI = {
             const te = {
                 employeeId: toStr(employeeId),
                 hours: hrs,
-                billableHours: (onderhoud && isKlant) ? 0 : hrs,
+                billableHours: (onderhoud && isKlant) ? 0 : this._roundUpHalfHour(hrs),
             };
             if (code && code.id) te.articleId = toStr(code.id);
             // Bij onderhoud: werkuren met verkoopprijs 0 en kostprijs 57.50
@@ -1438,7 +1446,7 @@ const RobawsAPI = {
             const te = {
                 employeeId: toStr(employeeId),
                 hours: dh.deltaHours,
-                billableHours: dh.deltaHours,
+                billableHours: this._roundUpHalfHour(dh.deltaHours),
             };
             if (dh.articleId) te.articleId = toStr(dh.articleId);
             const r = await this.post(`work-orders/${workOrderId}/time-entries`, te);
@@ -2091,9 +2099,11 @@ const RobawsAPI = {
                 if (hrs <= 0 || salePrice <= 0) continue;
 
                 const desc = 'Werkuren';
+                // Facturatie: ALTIJD afronden naar boven op half uur
+                const billableHrs = this._roundUpHalfHour(hrs);
                 const lineData = {
                     type: 'LINE',
-                    quantity: hrs,
+                    quantity: billableHrs,
                     unitType: 'uur',
                     description: desc,
                     price: salePrice,
@@ -2116,10 +2126,11 @@ const RobawsAPI = {
                 const hrs = Number(te.billableHours) || Number(te.hours) || 0;
                 const salePrice = Number(te.salePrice) || 0;
                 if (hrs <= 0 || salePrice <= 0) continue;
-
+                // Facturatie: ALTIJD afronden naar boven op half uur
+                const billableHrs = this._roundUpHalfHour(hrs);
                 const lineData = {
                     type: 'LINE',
-                    quantity: hrs,
+                    quantity: billableHrs,
                     unitType: 'uur',
                     description: te.description || (te.article && te.article.name) || 'Werkuren',
                     price: salePrice,
