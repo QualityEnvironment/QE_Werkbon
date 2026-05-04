@@ -775,33 +775,14 @@ window.QEClock = {
                 return;
             }
 
-            // Er zijn registraties in Robaws — bouw lokale sessie opnieuw op
+            // ── SESSIE VOLLEDIG HERBOUWEN vanuit Robaws ──
+            // Robaws is de enige bron van waarheid. Lokale waarden worden
+            // altijd overschreven met wat Robaws teruggeeft.
             let session = this.getSession() || this._newSession();
 
-            // Check of de actieve sessie (zonder endDate) nog bestaat in Robaws
-            if (session.active && session.robawsId) {
-                const stillExists = robawsRegs.find(r => String(r.id) === String(session.robawsId));
-                if (!stillExists) {
-                    // Actieve sessie is verwijderd in Robaws
-                    console.log('[Clock] Actieve sessie verwijderd in Robaws, sessie gereset');
-                    session.active = false;
-                    session.robawsId = null;
-                } else {
-                    // Actieve sessie bestaat nog — update met Robaws data (bijv. tijd aangepast)
-                    const robawsStart = new Date(stillExists.startDate).toTimeString().slice(0, 5);
-                    const robawsType = stillExists.type || 'Op tijd';
-                    if (session.startTime !== robawsStart || session.registrationType !== robawsType) {
-                        console.log('[Clock] Actieve sessie bijgewerkt vanuit Robaws:', session.startTime, '->', robawsStart, session.registrationType, '->', robawsType);
-                        session.startTime = robawsStart;
-                        session.startISO = stillExists.startDate;
-                        session.registrationType = robawsType;
-                    }
-                }
-            }
-
-            // Herbouw completedSessions op basis van Robaws data
+            // 1. Herbouw completedSessions (afgesloten registraties)
             const completedFromRobaws = robawsRegs
-                .filter(r => r.endDate) // alleen afgesloten registraties
+                .filter(r => r.endDate)
                 .map(r => ({
                     startTime: new Date(r.startDate).toTimeString().slice(0, 5),
                     endTime: new Date(r.endDate).toTimeString().slice(0, 5),
@@ -810,43 +791,49 @@ window.QEClock = {
                     tagName: (r.remarks || '').split(' — ')[0] || '',
                     hours: r.hours || this._calcHours(r.startDate, r.endDate),
                 }));
-
             session.completedSessions = completedFromRobaws;
 
-            // Als er geen actieve sessie is, bepaal registrationType op basis van eerste registratie
-            if (!session.active) {
+            // 2. Open registratie (zonder endDate) = actieve sessie
+            const openReg = robawsRegs.find(r => !r.endDate);
+            if (openReg) {
+                const robawsStart = new Date(openReg.startDate).toTimeString().slice(0, 5);
+                const robawsType = openReg.type || 'Op tijd';
+                const robawsId = String(openReg.id);
+                // ALTIJD updaten vanuit Robaws — ook als de sessie al actief was
+                if (session.startTime !== robawsStart || session.registrationType !== robawsType || String(session.robawsId) !== robawsId) {
+                    console.log('[Clock] Sessie bijgewerkt vanuit Robaws:', session.startTime, '->', robawsStart, session.registrationType, '->', robawsType);
+                }
+                session.active = true;
+                session.robawsId = robawsId;
+                session.startTime = robawsStart;
+                session.startISO = openReg.startDate;
+                session.registrationType = robawsType;
+                // tagName alleen updaten als er remarks zijn (anders behouden we lokale waarde)
+                if (openReg.remarks) {
+                    session.tagName = (openReg.remarks).split(' — ')[0] || session.tagName;
+                }
+            } else {
+                // Geen open registratie meer → sessie niet actief
+                session.active = false;
+                session.robawsId = null;
+                // Starttime en type bepalen op basis van eerste registratie
                 const firstReg = robawsRegs.find(r => r.type === 'Op tijd' || r.type === 'Te laat');
                 if (firstReg) {
                     session.registrationType = firstReg.type;
                 } else if (completedFromRobaws.length > 0) {
                     session.registrationType = completedFromRobaws[0].type;
                 }
-                // Starttime van eerste registratie
                 const earliest = robawsRegs.reduce((a, b) => a.startDate < b.startDate ? a : b);
                 session.startTime = new Date(earliest.startDate).toTimeString().slice(0, 5);
             }
 
-            // Check of er een open registratie is (zonder endDate)
-            const openReg = robawsRegs.find(r => !r.endDate);
-            if (openReg && !session.active) {
-                session.active = true;
-                session.robawsId = String(openReg.id);
-                session.startTime = new Date(openReg.startDate).toTimeString().slice(0, 5);
-                session.startISO = openReg.startDate;
-                session.registrationType = openReg.type || 'Op tijd';
-                session.tagName = (openReg.remarks || '').split(' — ')[0] || '';
-            } else if (openReg && session.active) {
-                // Sessie is al actief — update ook hier met Robaws data
-                const robawsStart = new Date(openReg.startDate).toTimeString().slice(0, 5);
-                const robawsType = openReg.type || 'Op tijd';
-                session.startTime = robawsStart;
-                session.startISO = openReg.startDate;
-                session.registrationType = robawsType;
-                session.robawsId = String(openReg.id);
-            }
-
             this._saveSession(session);
-            console.log('[Clock] Lokale sessie gesynchroniseerd met Robaws');
+            console.log('[Clock] Lokale sessie gesynchroniseerd met Robaws:', JSON.stringify({
+                active: session.active,
+                startTime: session.startTime,
+                type: session.registrationType,
+                robawsId: session.robawsId
+            }));
         } catch (e) {
             console.warn('[Clock] Robaws sync mislukt:', e.message);
             // Bij fout: gewoon doorgaan met lokale data
