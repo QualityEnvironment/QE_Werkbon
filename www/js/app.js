@@ -335,11 +335,15 @@ const app = {
         // Dark mode toggle synchroniseren
         const dmToggle = document.getElementById('darkModeToggle');
         if (dmToggle) dmToggle.checked = document.body.classList.contains('dark-mode');
-        // App versie tonen
+        // App versie tonen — haal uit version.json
         const versionEl = document.getElementById('appVersionInfo');
         if (versionEl) {
-            const v = (window.QEBridge && QEBridge.getAppVersion) ? QEBridge.getAppVersion() : 0;
-            versionEl.textContent = v > 0 ? `Huidige versie: ${v}` : 'Basisversie (geen updates)';
+            fetch('version.json?t=' + Date.now()).then(r => r.json()).then(d => {
+                versionEl.textContent = `Versie: ${d.version}`;
+            }).catch(() => {
+                const v = (window.QEBridge && QEBridge.getAppVersion) ? QEBridge.getAppVersion() : 0;
+                versionEl.textContent = v > 0 ? `Versie: ${v}` : 'Versie onbekend';
+            });
         }
         const updateStatus = document.getElementById('updateStatus');
         if (updateStatus) updateStatus.style.display = 'none';

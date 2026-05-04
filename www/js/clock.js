@@ -33,12 +33,8 @@ window.QEClock = {
     // CONFIGURATIE
     // =============================================
 
-    /** Fallback starttijden per rol (als Robaws veld leeg is) */
-    FALLBACK_START_TIMES: {
-        monteur:    '06:45',
-        technieker: '07:30',
-        kantoor:    '08:00',
-    },
+    /** Fallback starttijd als er ECHT niets te vinden is in Robaws */
+    DEFAULT_START_TIME: '07:00',
 
     // =============================================
     // HELPERS
@@ -74,11 +70,14 @@ window.QEClock = {
         try {
             const config = await RobawsAPI.getNfcTagConfig();
             this._tagConfig = config;
-            // Persoonlijk startuur apart opslaan (niet afhankelijk van tag config)
-            if (config.startuur) {
+            // Persoonlijk startuur apart opslaan PER USER
+            const currentUser = RobawsAPI.getLoggedInUser();
+            const currentUserId = currentUser ? String(currentUser.robawsEmployeeId) : null;
+            if (config.startuur && currentUserId) {
                 this._personalStartuur = config.startuur;
-                localStorage.setItem('qe_personal_startuur', config.startuur);
-                console.log('[Clock] Persoonlijk startuur:', config.startuur);
+                this._startuurLoadedForUser = currentUserId;
+                localStorage.setItem(`qe_startuur_${currentUserId}`, config.startuur);
+                console.log('[Clock] Persoonlijk startuur voor', currentUser.name, ':', config.startuur);
             }
             localStorage.setItem('qe_nfc_tags', JSON.stringify(config));
             console.log('[Clock] NFC tags geladen:', JSON.stringify(config));
@@ -101,10 +100,6 @@ window.QEClock = {
         const cached = localStorage.getItem('qe_nfc_tags');
         if (cached) {
             this._tagConfig = JSON.parse(cached);
-            // Herstel persoonlijk startuur uit cache
-            if (!this._personalStartuur) {
-                this._personalStartuur = localStorage.getItem('qe_personal_startuur') || null;
-            }
             return this._tagConfig;
         }
         return null;
@@ -138,17 +133,32 @@ window.QEClock = {
         return null; // Onbekende tag
     },
 
-    /** Persoonlijk startuur van de ingelogde werknemer (apart van tag config) */
+    /** Persoonlijk startuur van de ingelogde werknemer */
     _personalStartuur: null,
+    _startuurLoadedForUser: null, // bijhouden voor WELKE user het geladen is
 
     /** Haal verwachte starttijd op voor de ingelogde gebruiker */
     getExpectedStartTime() {
-        // Persoonlijk startuur heeft altijd prioriteit
-        if (this._personalStartuur) return this._personalStartuur;
-        // Fallback op basis van rol
         const user = RobawsAPI.getLoggedInUser();
-        if (user) return this.FALLBACK_START_TIMES[user.role] || '07:30';
-        return '07:30';
+        const userId = user ? String(user.robawsEmployeeId) : null;
+
+        // Alleen gebruiken als het voor de HUIDIGE user geladen is
+        if (this._personalStartuur && this._startuurLoadedForUser === userId) {
+            return this._personalStartuur;
+        }
+
+        // Probeer uit localStorage voor deze specifieke user
+        if (userId) {
+            const cached = localStorage.getItem(`qe_startuur_${userId}`);
+            if (cached) {
+                this._personalStartuur = cached;
+                this._startuurLoadedForUser = userId;
+                return cached;
+            }
+        }
+
+        // Fallback — dit zou eigenlijk nooit bereikt moeten worden
+        return this.DEFAULT_START_TIME;
     },
 
     // =============================================
@@ -313,23 +323,23 @@ window.QEClock = {
         if (!isFirstOfDay) {
             type = 'Extra uren';
         } else {
-            // Zorg dat het persoonlijk startuur geladen is VOOR de vergelijking
-            if (!this._personalStartuur) {
+            // ALTIJD startuur ophalen van Robaws voor de huidige user bij eerste scan van de dag
+            const clockUser = RobawsAPI.getLoggedInUser();
+            const clockUserId = clockUser ? String(clockUser.robawsEmployeeId) : null;
+            if (clockUserId && this._startuurLoadedForUser !== clockUserId) {
                 try {
-                    const user = RobawsAPI.getLoggedInUser();
-                    if (user && user.robawsEmployeeId) {
-                        const myRes = await RobawsAPI.get(`employees/${user.robawsEmployeeId}`);
-                        if (myRes.code === 200 && myRes.data && myRes.data.extraFields) {
-                            for (const [name, data] of Object.entries(myRes.data.extraFields)) {
-                                if (name.toLowerCase().includes('startuur')) {
-                                    const val = data ? String(data.stringValue ?? data.value ?? '') : '';
-                                    if (val) {
-                                        this._personalStartuur = val;
-                                        localStorage.setItem('qe_personal_startuur', val);
-                                        console.log('[Clock] Startuur opgehaald bij inclocken:', val);
-                                    }
-                                    break;
+                    const myRes = await RobawsAPI.get(`employees/${clockUserId}`);
+                    if (myRes.code === 200 && myRes.data && myRes.data.extraFields) {
+                        for (const [name, data] of Object.entries(myRes.data.extraFields)) {
+                            if (name.toLowerCase().includes('startuur')) {
+                                const val = data ? String(data.stringValue ?? data.value ?? '') : '';
+                                if (val) {
+                                    this._personalStartuur = val;
+                                    this._startuurLoadedForUser = clockUserId;
+                                    localStorage.setItem(`qe_startuur_${clockUserId}`, val);
+                                    console.log('[Clock] Startuur opgehaald voor', clockUser.name, ':', val);
                                 }
+                                break;
                             }
                         }
                     }
