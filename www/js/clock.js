@@ -313,8 +313,33 @@ window.QEClock = {
         if (!isFirstOfDay) {
             type = 'Extra uren';
         } else {
+            // Zorg dat het persoonlijk startuur geladen is VOOR de vergelijking
+            if (!this._personalStartuur) {
+                try {
+                    const user = RobawsAPI.getLoggedInUser();
+                    if (user && user.robawsEmployeeId) {
+                        const myRes = await RobawsAPI.get(`employees/${user.robawsEmployeeId}`);
+                        if (myRes.code === 200 && myRes.data && myRes.data.extraFields) {
+                            for (const [name, data] of Object.entries(myRes.data.extraFields)) {
+                                if (name.toLowerCase().includes('startuur')) {
+                                    const val = data ? String(data.stringValue ?? data.value ?? '') : '';
+                                    if (val) {
+                                        this._personalStartuur = val;
+                                        localStorage.setItem('qe_personal_startuur', val);
+                                        console.log('[Clock] Startuur opgehaald bij inclocken:', val);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch(e) {
+                    console.warn('[Clock] Kon startuur niet ophalen:', e.message);
+                }
+            }
             const expectedStart = this.getExpectedStartTime();
-            type = time <= expectedStart ? 'Op tijd' : 'Te laat';
+            console.log('[Clock] Startuur check:', time, 'vs verwacht:', expectedStart, '→', time > expectedStart ? 'TE LAAT' : 'OP TIJD');
+            type = time > expectedStart ? 'Te laat' : 'Op tijd';
         }
 
         // GPS ophalen
