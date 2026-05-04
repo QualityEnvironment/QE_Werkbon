@@ -23,8 +23,8 @@
  *   5. Volgende scans → "Extra uren" registratie
  *   6. L&L tag → "Laden & Lossen" registratie
  *
- * Verwachte starttijd: per werknemer via extra veld "Startuur werknemer"
- * Fallback: monteur 06:45, technieker 07:30, kantoor 08:00
+ * Verwachte starttijd: ALTIJD per werknemer via extra veld "Startuur werknemer"
+ * Fallback alleen als veld niet ingevuld: 07:00
  */
 
 window.QEClock = {

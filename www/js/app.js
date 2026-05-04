@@ -622,8 +622,14 @@ const app = {
     async loadPlanning() {
         // Clock status bar updaten (direct met lokale data)
         this.updateClockUI();
-        // Sync met Robaws en update statusbar opnieuw
+        // Startuur ophalen van Robaws als dat nog niet gebeurd is voor deze user
         if (window.QEClock) {
+            const user = RobawsAPI.getLoggedInUser();
+            const userId = user ? String(user.robawsEmployeeId) : null;
+            if (userId && QEClock._startuurLoadedForUser !== userId) {
+                QEClock.loadTagConfig().then(() => this.updateClockUI())
+                    .catch(e => console.warn('[Clock] Tag config error:', e));
+            }
             QEClock.syncWithRobaws().then(() => this.updateClockUI())
                 .catch(e => console.warn('[Clock] Sync error:', e));
         }
