@@ -786,6 +786,16 @@ window.QEClock = {
                     console.log('[Clock] Actieve sessie verwijderd in Robaws, sessie gereset');
                     session.active = false;
                     session.robawsId = null;
+                } else {
+                    // Actieve sessie bestaat nog — update met Robaws data (bijv. tijd aangepast)
+                    const robawsStart = new Date(stillExists.startDate).toTimeString().slice(0, 5);
+                    const robawsType = stillExists.type || 'Op tijd';
+                    if (session.startTime !== robawsStart || session.registrationType !== robawsType) {
+                        console.log('[Clock] Actieve sessie bijgewerkt vanuit Robaws:', session.startTime, '->', robawsStart, session.registrationType, '->', robawsType);
+                        session.startTime = robawsStart;
+                        session.startISO = stillExists.startDate;
+                        session.registrationType = robawsType;
+                    }
                 }
             }
 
@@ -825,6 +835,14 @@ window.QEClock = {
                 session.startISO = openReg.startDate;
                 session.registrationType = openReg.type || 'Op tijd';
                 session.tagName = (openReg.remarks || '').split(' — ')[0] || '';
+            } else if (openReg && session.active) {
+                // Sessie is al actief — update ook hier met Robaws data
+                const robawsStart = new Date(openReg.startDate).toTimeString().slice(0, 5);
+                const robawsType = openReg.type || 'Op tijd';
+                session.startTime = robawsStart;
+                session.startISO = openReg.startDate;
+                session.registrationType = robawsType;
+                session.robawsId = String(openReg.id);
             }
 
             this._saveSession(session);
