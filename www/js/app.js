@@ -266,8 +266,10 @@ const app = {
 
         // Achtergrond: sync artikelen als nodig + verwerk offline wachtrij
         this.backgroundSync();
-        // Kloksysteem: tags laden + pending sync
+        // Kloksysteem: internet-tijd laden + tags laden + pending sync
         if (typeof QEClock !== 'undefined') {
+            // Laad internet-tijd offset (Brussel) zodat toesteltijd niet gemanipuleerd kan worden
+            if (QEClock._loadServerTimeOffset) QEClock._loadServerTimeOffset().catch(e => console.warn('[App] Internet-tijd laden fout:', e));
             if (QEClock.loadTagConfig) QEClock.loadTagConfig().catch(e => console.warn('[App] NFC tags laden fout:', e));
             if (QEClock.syncPending) QEClock.syncPending().catch(e => console.warn('[App] Klok sync fout:', e));
         }
@@ -1483,13 +1485,27 @@ const app = {
         if (!employeeIds || employeeIds.length === 0) return [];
         const employees = [];
         for (const empId of employeeIds) {
-            try {
-                const res = await RobawsAPI.get(`employees/${empId}`);
-                if (res.code === 200 && res.data) {
-                    const name = [res.data.firstName, res.data.lastName].filter(Boolean).join(' ') || `Werknemer ${empId}`;
-                    employees.push({ id: empId, name });
+            // Probeer eerst uit EMPLOYEES (snel, geen API call nodig)
+            let name = null;
+            const knownUsers = RobawsAPI.EMPLOYEES || {};
+            for (const [email, userData] of Object.entries(knownUsers)) {
+                if (String(userData.employeeId) === String(empId)) {
+                    name = userData.name;
+                    break;
                 }
-            } catch(e) { employees.push({ id: empId, name: `Werknemer ${empId}` }); }
+            }
+            // Fallback: ophalen via API als niet in KNOWN_USERS
+            if (!name) {
+                try {
+                    const res = await RobawsAPI.get(`employees/${empId}`);
+                    if (res.code === 200 && res.data) {
+                        name = [res.data.firstName, res.data.lastName].filter(Boolean).join(' ');
+                    }
+                } catch(e) {
+                    console.warn('[App] Kon werknemer', empId, 'niet ophalen:', e.message);
+                }
+            }
+            employees.push({ id: empId, name: name || `Werknemer ${empId}` });
         }
         return employees;
     },

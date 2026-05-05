@@ -36,19 +36,115 @@ window.QEClock = {
     /** Fallback starttijd als er ECHT niets te vinden is in Robaws */
     DEFAULT_START_TIME: '07:00',
 
+    /**
+     * Verschil (in ms) tussen internet-tijd en lokale klok.
+     * _serverOffset = serverTime - localTime
+     * Dus gecorrigeerde tijd = new Date(Date.now() + _serverOffset)
+     */
+    _serverOffset: 0,
+    _serverOffsetLoaded: false,
+
     // =============================================
     // HELPERS
     // =============================================
 
+    /**
+     * Haal de echte Brussel-tijd op via internet.
+     * Gebruikt WorldTimeAPI als primaire bron, met fallback naar eigen Robaws API
+     * response headers. Slaat het verschil (offset) op t.o.v. de lokale klok.
+     * Moet minstens 1x aangeroepen worden bij app-start.
+     */
+    async _loadServerTimeOffset() {
+        try {
+            const localBefore = Date.now();
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 8000);
+
+            // Primaire bron: WorldTimeAPI (geeft Brussel-tijd direct)
+            const res = await fetch('https://worldtimeapi.org/api/timezone/Europe/Brussels', {
+                signal: controller.signal,
+                cache: 'no-store',
+            });
+            clearTimeout(timeout);
+            const localAfter = Date.now();
+            const localMid = (localBefore + localAfter) / 2; // corrigeer voor latency
+
+            if (res.ok) {
+                const data = await res.json();
+                // data.datetime = "2026-05-05T08:07:00.123456+02:00"
+                const serverTime = new Date(data.datetime).getTime();
+                this._serverOffset = serverTime - localMid;
+                this._serverOffsetLoaded = true;
+                console.log('[Clock] Internet-tijd geladen (WorldTimeAPI). Offset:', this._serverOffset, 'ms',
+                    '(' + (this._serverOffset > 0 ? '+' : '') + Math.round(this._serverOffset / 1000) + 's)');
+                return;
+            }
+        } catch (e) {
+            console.warn('[Clock] WorldTimeAPI niet bereikbaar:', e.message);
+        }
+
+        // Fallback: gebruik Robaws API response Date header
+        try {
+            const localBefore = Date.now();
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 8000);
+            const res = await fetch('https://app.robaws.com/api/v2/', {
+                method: 'HEAD',
+                signal: controller.signal,
+                cache: 'no-store',
+                headers: RobawsAPI.getHeaders(),
+            });
+            clearTimeout(timeout);
+            const localAfter = Date.now();
+            const localMid = (localBefore + localAfter) / 2;
+
+            const dateHeader = res.headers.get('Date');
+            if (dateHeader) {
+                const serverTime = new Date(dateHeader).getTime();
+                this._serverOffset = serverTime - localMid;
+                this._serverOffsetLoaded = true;
+                console.log('[Clock] Internet-tijd geladen (Robaws header). Offset:', this._serverOffset, 'ms',
+                    '(' + (this._serverOffset > 0 ? '+' : '') + Math.round(this._serverOffset / 1000) + 's)');
+                return;
+            }
+        } catch (e) {
+            console.warn('[Clock] Robaws Date header niet bereikbaar:', e.message);
+        }
+
+        // Geen internet? Offset blijft 0 (= lokale klok)
+        console.warn('[Clock] ⚠️ Kon geen internet-tijd ophalen — lokale klok wordt gebruikt');
+        this._serverOffsetLoaded = false; // Probeer opnieuw bij volgende scan
+    },
+
+    /**
+     * Geeft de huidige Brussel-tijd als Date object.
+     * Gecorrigeerd met de internet-offset zodat aanpassingen aan de
+     * telefoonklok geen effect hebben.
+     */
+    _now() {
+        return new Date(Date.now() + this._serverOffset);
+    },
+
+    /**
+     * Geeft de huidige Brussel-tijd als Date object (async versie).
+     * Laadt eerst de offset als die nog niet geladen is.
+     */
+    async _getNow() {
+        if (!this._serverOffsetLoaded) {
+            await this._loadServerTimeOffset();
+        }
+        return this._now();
+    },
+
     /** Lokale datum als YYYY-MM-DD */
     _localDate(d) {
-        const dt = d || new Date();
+        const dt = d || this._now();
         return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
     },
 
     /** Lokale tijd als HH:MM */
     _localTime(d) {
-        const dt = d || new Date();
+        const dt = d || this._now();
         return dt.toTimeString().slice(0, 5);
     },
 
@@ -322,7 +418,7 @@ window.QEClock = {
     // =============================================
 
     async _clockIn(session, tag) {
-        const now = new Date();
+        const now = await this._getNow();
         const time = this._localTime(now);
         const isFirstOfDay = (session.completedSessions || []).length === 0;
 
@@ -428,7 +524,7 @@ window.QEClock = {
     // =============================================
 
     async _clockOut(session, tag) {
-        const now = new Date();
+        const now = await this._getNow();
         const endTime = this._localTime(now);
         const endISO = now.toISOString();
         const rawHours = this._calcHours(session.startISO, endISO);
@@ -512,7 +608,7 @@ window.QEClock = {
         }
 
         // Start nieuwe L&L sessie
-        const now = new Date();
+        const now = await this._getNow();
         const time = this._localTime(now);
 
         // GPS
@@ -691,7 +787,7 @@ window.QEClock = {
 
     _addPendingSync(item) {
         const pending = JSON.parse(localStorage.getItem('qe_clock_pending') || '[]');
-        pending.push({ ...item, timestamp: new Date().toISOString() });
+        pending.push({ ...item, timestamp: this._now().toISOString() });
         localStorage.setItem('qe_clock_pending', JSON.stringify(pending));
     },
 
@@ -749,7 +845,7 @@ window.QEClock = {
             if (res.code !== 200 || !res.data || !res.data.items) return [];
 
             // Filter op laatste X dagen + dubbele check employeeId
-            const cutoff = new Date();
+            const cutoff = this._now();
             cutoff.setDate(cutoff.getDate() - days);
             const cutoffStr = cutoff.toISOString();
             const empId = String(user.robawsEmployeeId);
