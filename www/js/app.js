@@ -928,9 +928,12 @@ const app = {
         document.getElementById('workNotes').value = data.notes || '';
         const notesUren = document.getElementById('workNotesUren');
         if (notesUren) notesUren.value = data.notes || '';
-        // Herstel pauze waarde
-        const pauzeEntry = data.hours.find(h => h.type === 'pauze');
-        document.getElementById('pauzeMinuten').value = pauzeEntry ? pauzeEntry.duration : 0;
+        // Herstel pauze waarde (oud veld, nu per uurblok)
+        const pauzeEl = document.getElementById('pauzeMinuten');
+        if (pauzeEl) {
+            const pauzeEntry = data.hours.find(h => h.type === 'pauze');
+            pauzeEl.value = pauzeEntry ? pauzeEntry.duration : 0;
+        }
         this.renderHoursList();
         this._restoreOnderhoud();
         this.renderMaterials();
@@ -1655,6 +1658,7 @@ const app = {
 
     adjustPauze(delta) {
         const input = document.getElementById('pauzeMinuten');
+        if (!input) return;
         let val = parseInt(input.value) || 0;
         val = Math.max(0, val + delta);
         input.value = val;
