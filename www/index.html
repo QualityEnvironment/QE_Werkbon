@@ -236,7 +236,8 @@
                 <button class="btn btn-success btn-round" id="btnTimerStart" onclick="app.toggleTimer('klant')" title="Werkuren starten">
                     🔧
                 </button>
-                <button class="btn btn-outline btn-round" id="btnTimerVerplaatsing" onclick="app.toggleTimer('verplaatsing')" title="Verplaatsing starten" style="font-size:16px">
+                <!-- Verplaatsing gedeactiveerd (badgesysteem vervangt dit) -->
+                <button class="btn btn-outline btn-round" id="btnTimerVerplaatsing" onclick="app.toggleTimer('verplaatsing')" title="Verplaatsing starten" style="font-size:16px;display:none">
                     🚗
                 </button>
                 <button class="btn btn-secondary btn-round" id="btnTimerPause" onclick="app.toggleTimer('pauze')" style="display:none">
@@ -250,23 +251,9 @@
 
         <!-- Handmatige uren invoer -->
         <div style="display:flex;gap:6px;margin-bottom:12px">
-            <button class="btn btn-outline btn-sm" style="flex:1" onclick="app.addManualHours('klant')">+ Werkuren</button>
-            <button class="btn btn-outline btn-sm" style="flex:1" onclick="app.addManualHours('verplaatsing')">+ Verplaatsing</button>
-            <button class="btn btn-outline btn-sm" style="flex:1" onclick="app.addQuickMinutes()">+ Minuten</button>
-        </div>
-
-        <!-- Pauze invoer -->
-        <div class="card mb-16" style="display:flex;align-items:center;gap:12px;padding:12px 16px">
-            <span style="font-size:16px">☕</span>
-            <span style="font-size:14px;font-weight:500;flex:1">Pauze</span>
-            <div style="display:flex;align-items:center;gap:6px">
-                <button class="qty-btn" onclick="app.adjustPauze(-5)">−</button>
-                <input type="number" class="form-input" id="pauzeMinuten" value="0" min="0" step="5"
-                       style="width:60px;text-align:center;padding:6px 4px;font-size:15px;font-weight:500"
-                       onchange="app.setPauze(this.value)">
-                <button class="qty-btn" onclick="app.adjustPauze(5)">+</button>
-                <span style="font-size:13px;color:var(--qe-grey);margin-left:2px">min</span>
-            </div>
+            <button class="btn btn-primary btn-sm" style="flex:1" onclick="app.addManualHours('klant')">+ Uren toevoegen</button>
+            <!-- Verplaatsing gedeactiveerd (badgesysteem) — knop bewaard voor reactivatie -->
+            <button class="btn btn-outline btn-sm" style="flex:1;display:none" id="btnAddVerplaatsing" onclick="app.addManualHours('verplaatsing')">+ Verplaatsing</button>
         </div>
 
         <!-- Opmerkingen (wat heb je gedaan?) -->
@@ -288,10 +275,11 @@
         <div class="day-hours-summary mt-16" id="dayHoursSummary" style="display:none">
             <div style="font-size:14px;font-weight:500;margin-bottom:8px">Dagoverzicht</div>
             <div class="day-hours-row">
-                <span>Uren bij klant</span>
+                <span>Werkuren</span>
                 <span id="totalKlantUren">0:00</span>
             </div>
-            <div class="day-hours-row">
+            <!-- Verplaatsing verborgen (gedeactiveerd) -->
+            <div class="day-hours-row" id="rowVerplaatsing" style="display:none">
                 <span>Verplaatsing</span>
                 <span id="totalVerplaatsing">0:00</span>
             </div>
@@ -300,7 +288,7 @@
                 <span id="totalPauze">0:00</span>
             </div>
             <div class="day-hours-row total">
-                <span>Totaal gewerkt</span>
+                <span>Totaal gewerkt (excl. pauze)</span>
                 <span id="totalGewerkt">0:00</span>
             </div>
         </div>

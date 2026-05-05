@@ -1180,8 +1180,10 @@ const RobawsAPI = {
             const code = isVerplaatsing ? verplaatsingCode : uurcode;
             const hrs = Math.round((h.duration || 0) / 60 * 100) / 100;
             const isKlant = (h.type || 'klant') === 'klant';
+            // Gebruik employeeId per uur-entry als die is ingevuld (multi-werknemer)
+            const entryEmployeeId = h.employeeId ? toStr(h.employeeId) : toStr(employeeId);
             const te = {
-                employeeId: toStr(employeeId),
+                employeeId: entryEmployeeId,
                 hours: hrs,
                 billableHours: (onderhoud && isKlant) ? 0 : this._roundUpHalfHour(hrs),
             };

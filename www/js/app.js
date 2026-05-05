@@ -1452,46 +1452,33 @@ const app = {
         this.toast('Tekst toegevoegd');
     },
 
+    // addQuickMinutes — gedeactiveerd, vervangen door addManualHours met pauze
     addQuickMinutes() {
-        document.getElementById('modalContent').innerHTML = `
-            <h3>Minuten invoeren</h3>
-            <div class="form-group" style="margin-bottom:12px">
-                <label>Type</label>
-                <select class="form-input" id="quickMinType">
-                    <option value="klant">🔧 Werkuren</option>
-                    <option value="verplaatsing">🚗 Verplaatsing</option>
-                </select>
-            </div>
-            <div class="form-group" style="margin-bottom:12px">
-                <label>Aantal minuten</label>
-                <input type="number" class="form-input" id="quickMinValue" min="1" max="600" placeholder="bv. 30"
-                       style="font-size:20px;text-align:center;font-weight:600" inputmode="numeric">
-            </div>
-            <button class="btn btn-primary btn-full" onclick="app.saveQuickMinutes()">Opslaan</button>
-            <button class="btn btn-outline btn-full" style="margin-top:8px" onclick="app.closeModal()">Annuleren</button>
-        `;
-        this.openModal();
-        setTimeout(() => document.getElementById('quickMinValue')?.focus(), 300);
+        this.addManualHours('klant');
     },
 
     saveQuickMinutes() {
-        const type = document.getElementById('quickMinType').value;
-        const mins = parseInt(document.getElementById('quickMinValue').value);
-        if (!mins || mins <= 0) { this.toast('Vul een geldig aantal minuten in'); return; }
-        if (this.currentWO) {
-            this.woData[this.currentWO.id].hours.push({
-                id: Date.now(), type,
-                startTime: '--:--', endTime: '--:--',
-                duration: mins,
-            });
-            this.renderHoursList();
-        }
-        this.closeModal();
-        this.toast(`${mins} min ${type === 'klant' ? 'werkuren' : 'verplaatsing'} toegevoegd`);
+        // Legacy — niet meer gebruikt
     },
 
-    addManualHours(type) {
-        const label = type === 'klant' ? 'Werkuren' : 'Verplaatsingstijd';
+    /** Haal werknemersnamen op voor de employeeIds van de dagplanning */
+    async _getEmployeeNames(employeeIds) {
+        if (!employeeIds || employeeIds.length === 0) return [];
+        const employees = [];
+        for (const empId of employeeIds) {
+            try {
+                const res = await RobawsAPI.get(`employees/${empId}`);
+                if (res.code === 200 && res.data) {
+                    const name = [res.data.firstName, res.data.lastName].filter(Boolean).join(' ') || `Werknemer ${empId}`;
+                    employees.push({ id: empId, name });
+                }
+            } catch(e) { employees.push({ id: empId, name: `Werknemer ${empId}` }); }
+        }
+        return employees;
+    },
+
+    async addManualHours(type) {
+        const label = type === 'klant' ? 'Uren toevoegen' : 'Verplaatsingstijd toevoegen';
         const now = new Date();
         const nowH = now.getHours();
         const nowM = now.getMinutes();
@@ -1502,9 +1489,35 @@ const app = {
         const minOpts = (sel) => Array.from({length: 60}, (_, m) =>
             `<option value="${m}" ${m === sel ? 'selected' : ''}>${String(m).padStart(2,'0')}</option>`).join('');
 
+        // Pauze opties per 15 min
+        const pauzeOpts = [0, 15, 30, 45, 60].map(m =>
+            `<option value="${m}" ${m === 30 ? 'selected' : ''}>${m} min</option>`).join('');
+
+        // Werknemers van dagplanning ophalen
+        const empIds = this.currentWO ? (this.currentWO.employeeIds || []) : [];
+        let employeeSelect = '';
+        if (empIds.length > 0) {
+            // Toon loading eerst
+            document.getElementById('modalContent').innerHTML = `<h3>${label}</h3><div class="spinner" style="margin:20px auto"></div>`;
+            this.openModal();
+            const employees = await this._getEmployeeNames(empIds);
+            // Huidige user als default selectie
+            const currentEmpId = this.currentUser ? String(this.currentUser.robawsEmployeeId) : '';
+            employeeSelect = `
+                <div class="form-group" style="margin-bottom:12px">
+                    <label>👷 Werknemer</label>
+                    <select class="form-input" id="hourEmployee">
+                        ${employees.map(e => `<option value="${e.id}" ${String(e.id) === currentEmpId ? 'selected' : ''}>${e.name}</option>`).join('')}
+                    </select>
+                </div>`;
+        } else {
+            this.openModal();
+        }
+
         document.getElementById('modalContent').innerHTML = `
-            <h3>${label} toevoegen</h3>
-            <div class="form-group">
+            <h3>${label}</h3>
+            ${employeeSelect}
+            <div class="form-group" style="margin-bottom:12px">
                 <label>Van</label>
                 <div style="display:flex;gap:8px;align-items:center">
                     <select class="form-input" id="fromH" style="flex:1">${hourOpts(nowH)}</select>
@@ -1512,7 +1525,7 @@ const app = {
                     <select class="form-input" id="fromM" style="flex:1">${minOpts(nowM)}</select>
                 </div>
             </div>
-            <div class="form-group">
+            <div class="form-group" style="margin-bottom:12px">
                 <label>Tot</label>
                 <div style="display:flex;gap:8px;align-items:center">
                     <select class="form-input" id="toH" style="flex:1">${hourOpts((nowH + 1) % 24)}</select>
@@ -1520,10 +1533,13 @@ const app = {
                     <select class="form-input" id="toM" style="flex:1">${minOpts(nowM)}</select>
                 </div>
             </div>
+            <div class="form-group" style="margin-bottom:12px">
+                <label>☕ Pauze</label>
+                <select class="form-input" id="hourPauze">${pauzeOpts}</select>
+            </div>
             <button class="btn btn-primary btn-full mt-16" onclick="app.saveManualHours('${type}')">Opslaan</button>
             <button class="btn btn-outline btn-full" style="margin-top:8px" onclick="app.closeModal()">Annuleren</button>
         `;
-        this.openModal();
     },
 
     saveManualHours(type) {
@@ -1533,18 +1549,27 @@ const app = {
         const tm = parseInt(document.getElementById('toM').value);
         const from = String(fh).padStart(2,'0') + ':' + String(fm).padStart(2,'0');
         const to = String(th).padStart(2,'0') + ':' + String(tm).padStart(2,'0');
+        const pauze = parseInt(document.getElementById('hourPauze')?.value || 0);
 
-        const duration = (th * 60 + tm) - (fh * 60 + fm);
-        if (duration <= 0) { this.toast('Eindtijd moet na starttijd zijn'); return; }
+        const totalDuration = (th * 60 + tm) - (fh * 60 + fm);
+        if (totalDuration <= 0) { this.toast('Eindtijd moet na starttijd zijn'); return; }
+        const duration = Math.max(0, totalDuration - pauze); // Pauze aftrekken
+
+        // Werknemer ophalen (als beschikbaar)
+        const empSelect = document.getElementById('hourEmployee');
+        const employeeId = empSelect ? empSelect.value : (this.currentUser ? String(this.currentUser.robawsEmployeeId) : null);
+        const employeeName = empSelect ? empSelect.options[empSelect.selectedIndex].text : (this.currentUser ? this.currentUser.name : '');
 
         if (this.currentWO) {
             this.woData[this.currentWO.id].hours.push({
-                id: Date.now(), type, startTime: from, endTime: to, duration,
+                id: Date.now(), type, startTime: from, endTime: to,
+                duration, pauze,
+                employeeId, employeeName,
             });
             this.renderHoursList();
         }
         this.closeModal();
-        this.toast('Uren opgeslagen');
+        this.toast(`Uren opgeslagen voor ${employeeName}${pauze > 0 ? ` (${pauze} min pauze)` : ''}`);
     },
 
     renderHoursList() {
@@ -1560,26 +1585,39 @@ const app = {
         }
 
         const icons = { klant: '🔧', verplaatsing: '🚗', pauze: '☕' };
-        const labels = { klant: 'Bij klant', verplaatsing: 'Verplaatsing', pauze: 'Pauze' };
+        const labels = { klant: 'Werkuren', verplaatsing: 'Verplaatsing', pauze: 'Pauze' };
 
-        container.innerHTML = data.hours.map(h => `
+        container.innerHTML = data.hours.map(h => {
+            const empLabel = h.employeeName ? `<div style="font-size:11px;color:var(--qe-purple);font-weight:500">👷 ${this.escapeHtml(h.employeeName)}</div>` : '';
+            const pauzeLabel = h.pauze && h.pauze > 0 ? `<span style="font-size:11px;color:var(--qe-grey);margin-left:4px">(☕${h.pauze}m)</span>` : '';
+            return `
             <div class="hour-entry">
                 <div class="he-type ${h.type}">${icons[h.type] || '🔧'}</div>
                 <div class="he-info">
-                    <div class="he-label">${labels[h.type] || h.type}</div>
+                    ${empLabel}
+                    <div class="he-label">${labels[h.type] || h.type}${pauzeLabel}</div>
                     <div class="he-time">${h.startTime} - ${h.endTime}</div>
                 </div>
                 <div class="he-duration">${this.formatMinutes(h.duration)}</div>
                 <button class="mat-remove" onclick="app.removeHour(${h.id})">✕</button>
-            </div>
-        `).join('');
+            </div>`;
+        }).join('');
 
         const totals = { klant: 0, verplaatsing: 0, pauze: 0 };
-        data.hours.forEach(h => { totals[h.type] = (totals[h.type] || 0) + h.duration; });
+        let totalPauzeMin = 0;
+        data.hours.forEach(h => {
+            totals[h.type] = (totals[h.type] || 0) + h.duration;
+            if (h.pauze) totalPauzeMin += h.pauze;
+        });
+        // Oude losse pauze entries ook meetellen
+        totals.pauze = totals.pauze + totalPauzeMin;
 
         document.getElementById('totalKlantUren').textContent = this.formatMinutes(totals.klant);
-        document.getElementById('totalVerplaatsing').textContent = this.formatMinutes(totals.verplaatsing);
-        document.getElementById('totalPauze').textContent = this.formatMinutes(totals.pauze);
+        const verplEl = document.getElementById('totalVerplaatsing');
+        if (verplEl) verplEl.textContent = this.formatMinutes(totals.verplaatsing);
+        const verplRow = document.getElementById('rowVerplaatsing');
+        if (verplRow) verplRow.style.display = totals.verplaatsing > 0 ? '' : 'none';
+        document.getElementById('totalPauze').textContent = this.formatMinutes(totalPauzeMin > 0 ? totalPauzeMin : totals.pauze);
         document.getElementById('totalGewerkt').textContent = this.formatMinutes(totals.klant + totals.verplaatsing);
         summary.style.display = 'block';
         this._saveWoData();
@@ -2883,15 +2921,31 @@ const app = {
         if (data.hours.length === 0) {
             hoursContent.innerHTML = '<p class="text-grey text-sm">Geen uren geregistreerd</p>';
         } else {
-            const totals = { klant: 0, verplaatsing: 0, pauze: 0 };
-            data.hours.forEach(h => { totals[h.type] = (totals[h.type] || 0) + h.duration; });
+            const totals = { klant: 0, verplaatsing: 0 };
+            let totalPauze = 0;
+            data.hours.forEach(h => {
+                totals[h.type] = (totals[h.type] || 0) + h.duration;
+                if (h.pauze) totalPauze += h.pauze;
+            });
             const urcodeLabel = this.selectedUurcode ? this.selectedUurcode.name : 'Geen uurcode';
+
+            // Groepeer uren per werknemer voor overzicht
+            const byEmployee = {};
+            data.hours.filter(h => h.type === 'klant').forEach(h => {
+                const name = h.employeeName || this.currentUser?.name || 'Onbekend';
+                if (!byEmployee[name]) byEmployee[name] = { duration: 0, pauze: 0 };
+                byEmployee[name].duration += h.duration;
+                byEmployee[name].pauze += (h.pauze || 0);
+            });
+            const empRows = Object.entries(byEmployee).map(([name, d]) =>
+                `<div class="day-hours-row"><span>👷 ${this.escapeHtml(name)}</span><span style="font-weight:500">${this.formatMinutes(d.duration)}${d.pauze > 0 ? ` <span style="font-size:11px;color:var(--qe-grey)">(☕${d.pauze}m)</span>` : ''}</span></div>`
+            ).join('');
+
             hoursContent.innerHTML = `
                 ${this.selectedUurcode ? `<div style="font-size:12px;color:var(--qe-purple);margin-bottom:8px">Uurcode: ${this.escapeHtml(urcodeLabel)}</div>` : ''}
-                <div class="day-hours-row"><span>Uren bij klant</span><span style="font-weight:500">${this.formatMinutes(totals.klant)}</span></div>
-                <div class="day-hours-row"><span>Verplaatsing <span style="font-size:11px;color:var(--qe-grey)">(niet factureren)</span></span><span style="font-weight:500">${this.formatMinutes(totals.verplaatsing)}</span></div>
-                ${totals.pauze > 0 ? `<div class="day-hours-row"><span>Pauze</span><span style="font-weight:500">${this.formatMinutes(totals.pauze)}</span></div>` : ''}
-                <div class="day-hours-row total"><span>Totaal gewerkt</span><span>${this.formatMinutes(totals.klant + totals.verplaatsing)}</span></div>
+                ${empRows}
+                ${totals.verplaatsing > 0 ? `<div class="day-hours-row"><span>Verplaatsing</span><span style="font-weight:500">${this.formatMinutes(totals.verplaatsing)}</span></div>` : ''}
+                <div class="day-hours-row total"><span>Totaal werkuren</span><span>${this.formatMinutes(totals.klant)}</span></div>
             `;
         }
 
