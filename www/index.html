@@ -778,7 +778,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between">
             <div>
                 <div style="font-size:14px;font-weight:600">🔄 App bijwerken</div>
-                <div style="font-size:12px;color:var(--qe-grey)" id="appVersionInfo">Versie laden...</div>
+                <div style="font-size:12px;color:var(--qe-grey)" id="appVersionInfo" onclick="window._toggleDebug && _toggleDebug()">Versie laden...</div>
             </div>
             <button class="btn btn-primary btn-sm" id="btnCheckUpdate" onclick="app.checkForUpdate()">Controleren</button>
         </div>
@@ -905,6 +905,51 @@
 
 <!-- ========== TOAST ========== -->
 <div class="toast" id="toast"></div>
+
+<!-- ========== DEBUG CONSOLE (tik 5x op versienr) ========== -->
+<div id="debugConsole" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;background:rgba(0,0,0,0.95);color:#0f0;font-family:monospace;font-size:11px;overflow-y:auto;padding:12px;padding-top:40px">
+    <button onclick="document.getElementById('debugConsole').style.display='none'" style="position:fixed;top:8px;right:12px;background:#f33;color:#fff;border:none;border-radius:4px;padding:6px 14px;font-size:14px;z-index:100000">✕ Sluiten</button>
+    <button onclick="document.getElementById('debugLog').textContent=''" style="position:fixed;top:8px;right:100px;background:#555;color:#fff;border:none;border-radius:4px;padding:6px 14px;font-size:14px;z-index:100000">Wissen</button>
+    <pre id="debugLog" style="white-space:pre-wrap;word-break:break-all"></pre>
+</div>
+<script>
+(function() {
+    // Override console.log/warn/error om naar debug console te schrijven
+    var origLog = console.log, origWarn = console.warn, origError = console.error;
+    var _write = function(prefix, color, args) {
+        try {
+            var el = document.getElementById('debugLog');
+            if (!el) return;
+            var time = new Date().toTimeString().slice(0,8);
+            var parts = [];
+            for (var i = 0; i < args.length; i++) {
+                try {
+                    parts.push(typeof args[i] === 'object' && args[i] !== null ? JSON.stringify(args[i]).slice(0, 500) : String(args[i]));
+                } catch(e) { parts.push('[Object]'); }
+            }
+            el.textContent += '[' + time + '] ' + prefix + ' ' + parts.join(' ') + '\n';
+            el.scrollTop = el.scrollHeight;
+        } catch(e) { /* debug console mag nooit de app breken */ }
+    };
+    console.log = function() { origLog.apply(console, arguments); _write('LOG', '#0f0', arguments); };
+    console.warn = function() { origWarn.apply(console, arguments); _write('WRN', '#ff0', arguments); };
+    console.error = function() { origError.apply(console, arguments); _write('ERR', '#f44', arguments); };
+    window.addEventListener('error', function(e) { _write('ERR', '#f44', [e.message + ' (' + e.filename + ':' + e.lineno + ')']); });
+    window.addEventListener('unhandledrejection', function(e) { _write('ERR', '#f44', ['Promise: ' + e.reason]); });
+
+    // Open debug console door 5x op versienummer te tikken
+    var _debugTaps = 0, _debugTimer = null;
+    window._toggleDebug = function() {
+        _debugTaps++;
+        clearTimeout(_debugTimer);
+        _debugTimer = setTimeout(function() { _debugTaps = 0; }, 2000);
+        if (_debugTaps >= 5) {
+            document.getElementById('debugConsole').style.display = 'block';
+            _debugTaps = 0;
+        }
+    };
+})();
+</script>
 
 <!-- API modules (moeten VOOR app.js geladen worden) -->
 <script src="js/robaws-api.js"></script>

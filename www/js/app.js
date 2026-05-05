@@ -955,20 +955,8 @@ const app = {
         select.innerHTML = '<option value="">Laden...</option>';
 
         try {
-            // Timeout van 15 seconden om hanging te voorkomen
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 15000);
-            const res = await fetch('api/hour-types.php', { signal: controller.signal });
-            clearTimeout(timeout);
-
+            const res = await fetch('api/hour-types.php');
             const data = await res.json();
-
-            if (data.error) {
-                console.error('[App] Uurcode API fout:', data.error);
-                select.innerHTML = '<option value="">Fout bij laden uurcodes</option>';
-                return;
-            }
-
             const allItems = data.items || [];
 
             // Scheid verplaatsing uurcode van werkuur uurcodes
@@ -996,12 +984,8 @@ const app = {
             }
             info.textContent = infoText;
         } catch (err) {
-            console.error('[App] Uurcodes laden mislukt:', err.message);
-            if (err.name === 'AbortError') {
-                select.innerHTML = '<option value="">Timeout — probeer opnieuw</option>';
-            } else {
-                select.innerHTML = '<option value="">Fout bij laden uurcodes</option>';
-            }
+            console.error('[App] Uurcodes laden mislukt:', err);
+            select.innerHTML = '<option value="">Fout bij laden uurcodes</option>';
         }
     },
 

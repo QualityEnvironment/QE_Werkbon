@@ -65,28 +65,16 @@ const RobawsAPI = {
     },
 
     // === BASIS API CALLS ===
-    async get(endpoint, timeoutMs = 15000) {
+    async get(endpoint) {
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        const res = await fetch(url, { headers: this.getHeaders() });
+        if (res.status === 204) return { code: 204, data: null };
+        const txt = await res.text();
+        if (!txt) return { code: res.status, data: null };
         try {
-            const res = await fetch(url, { headers: this.getHeaders(), signal: controller.signal });
-            clearTimeout(timeout);
-            if (res.status === 204) return { code: 204, data: null };
-            const txt = await res.text();
-            if (!txt) return { code: res.status, data: null };
-            try {
-                return { code: res.status, data: JSON.parse(txt) };
-            } catch (e) {
-                return { code: res.status, data: { raw: txt } };
-            }
+            return { code: res.status, data: JSON.parse(txt) };
         } catch (e) {
-            clearTimeout(timeout);
-            if (e.name === 'AbortError') {
-                console.error('[RobawsAPI] Timeout bij GET', endpoint);
-                return { code: 408, data: null };
-            }
-            throw e;
+            return { code: res.status, data: { raw: txt } };
         }
     },
 
@@ -987,7 +975,7 @@ const RobawsAPI = {
         // Stap 1: Employee → employeeRoleId
         const empResult = await this.get(`employees/${employeeId}`);
         console.log('[RobawsAPI] Employee result:', empResult.code);
-        if (empResult.code !== 200 || !empResult.data) throw new Error('Kon employee niet ophalen (code: ' + empResult.code + ')');
+        if (empResult.code !== 200) throw new Error('Kon employee niet ophalen');
 
         const employeeRoleId = empResult.data.employeeRoleId;
         console.log('[RobawsAPI] employeeRoleId:', employeeRoleId);
@@ -996,17 +984,18 @@ const RobawsAPI = {
         // Stap 2: Role → timeOperationIds
         const roleResult = await this.get(`employee-roles/${employeeRoleId}`);
         console.log('[RobawsAPI] Role result:', roleResult.code);
-        if (roleResult.code !== 200 || !roleResult.data) throw new Error('Kon werknemersrol niet ophalen (code: ' + roleResult.code + ')');
+        if (roleResult.code !== 200) throw new Error('Kon werknemersrol niet ophalen');
 
         const roleName = roleResult.data.name || '?';
         const timeOperationIds = roleResult.data.timeOperationIds || [];
-        console.log('[RobawsAPI] timeOperationIds:', timeOperationIds.length, 'items:', timeOperationIds);
+        console.log('[RobawsAPI] timeOperationIds:', timeOperationIds.length, 'items');
 
-        // Stap 3: Haal elk artikel op (parallel voor snelheid)
+        // Stap 3: Haal elk artikel op
         const uurcodes = [];
-        const articlePromises = timeOperationIds.map(articleId =>
-            this.get(`articles/${articleId}`).then(artResult => {
-                if (artResult.code === 200 && artResult.data) {
+        for (const articleId of timeOperationIds) {
+            try {
+                const artResult = await this.get(`articles/${articleId}`);
+                if (artResult.code === 200) {
                     const art = artResult.data;
                     const name = art.name || `Uurcode ${articleId}`;
                     uurcodes.push({
@@ -1018,11 +1007,10 @@ const RobawsAPI = {
                         isVerplaatsing: name.toLowerCase().includes('verplaatsing'),
                     });
                 }
-            }).catch(e => {
-                console.warn('[RobawsAPI] Artikel', articleId, 'niet gevonden:', e.message);
-            })
-        );
-        await Promise.all(articlePromises);
+            } catch (e) {
+                console.warn('[RobawsAPI] Artikel', articleId, 'fout:', e.message);
+            }
+        }
 
         console.log('[RobawsAPI] Uurcodes geladen:', uurcodes.length, 'items');
         return { items: uurcodes, roleName, employeeRoleId };
