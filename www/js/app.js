@@ -953,8 +953,20 @@ const app = {
         select.innerHTML = '<option value="">Laden...</option>';
 
         try {
-            const res = await fetch('api/hour-types.php');
+            // Timeout van 15 seconden om hanging te voorkomen
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            const res = await fetch('api/hour-types.php', { signal: controller.signal });
+            clearTimeout(timeout);
+
             const data = await res.json();
+
+            if (data.error) {
+                console.error('[App] Uurcode API fout:', data.error);
+                select.innerHTML = '<option value="">Fout bij laden uurcodes</option>';
+                return;
+            }
+
             const allItems = data.items || [];
 
             // Scheid verplaatsing uurcode van werkuur uurcodes
@@ -982,7 +994,12 @@ const app = {
             }
             info.textContent = infoText;
         } catch (err) {
-            select.innerHTML = '<option value="">Fout bij laden uurcodes</option>';
+            console.error('[App] Uurcodes laden mislukt:', err.message);
+            if (err.name === 'AbortError') {
+                select.innerHTML = '<option value="">Timeout — probeer opnieuw</option>';
+            } else {
+                select.innerHTML = '<option value="">Fout bij laden uurcodes</option>';
+            }
         }
     },
 
@@ -1483,6 +1500,10 @@ const app = {
         const nowH = now.getHours();
         const nowM = now.getMinutes();
 
+        // Toon loading eerst
+        document.getElementById('modalContent').innerHTML = `<h3>${label}</h3><div class="spinner" style="margin:20px auto"></div>`;
+        this.openModal();
+
         // Genereer hour-options (00-23) en minute-options (00-59)
         const hourOpts = (sel) => Array.from({length: 24}, (_, i) =>
             `<option value="${i}" ${i === sel ? 'selected' : ''}>${String(i).padStart(2,'0')}</option>`).join('');
@@ -1491,28 +1512,31 @@ const app = {
 
         // Pauze opties per 15 min
         const pauzeOpts = [0, 15, 30, 45, 60].map(m =>
-            `<option value="${m}" ${m === 30 ? 'selected' : ''}>${m} min</option>`).join('');
+            `<option value="${m}" ${m === 0 ? 'selected' : ''}>${m} min</option>`).join('');
 
-        // Werknemers van dagplanning ophalen
+        // Werknemers ophalen: dagplanning employeeIds, of fallback naar ingelogde user
         const empIds = this.currentWO ? (this.currentWO.employeeIds || []) : [];
-        let employeeSelect = '';
+        let employees = [];
         if (empIds.length > 0) {
-            // Toon loading eerst
-            document.getElementById('modalContent').innerHTML = `<h3>${label}</h3><div class="spinner" style="margin:20px auto"></div>`;
-            this.openModal();
-            const employees = await this._getEmployeeNames(empIds);
-            // Huidige user als default selectie
-            const currentEmpId = this.currentUser ? String(this.currentUser.robawsEmployeeId) : '';
-            employeeSelect = `
-                <div class="form-group" style="margin-bottom:12px">
-                    <label>👷 Werknemer</label>
-                    <select class="form-input" id="hourEmployee">
-                        ${employees.map(e => `<option value="${e.id}" ${String(e.id) === currentEmpId ? 'selected' : ''}>${e.name}</option>`).join('')}
-                    </select>
-                </div>`;
-        } else {
-            this.openModal();
+            try {
+                employees = await this._getEmployeeNames(empIds);
+            } catch(e) {
+                console.warn('[App] Fout bij ophalen werknemers:', e);
+            }
         }
+        // Fallback: als geen werknemers van dagplanning, gebruik ingelogde user
+        if (employees.length === 0 && this.currentUser) {
+            employees = [{ id: String(this.currentUser.robawsEmployeeId), name: this.currentUser.name || 'Ik' }];
+        }
+
+        const currentEmpId = this.currentUser ? String(this.currentUser.robawsEmployeeId) : '';
+        const employeeSelect = employees.length > 0 ? `
+            <div class="form-group" style="margin-bottom:12px">
+                <label>👷 Werknemer</label>
+                <select class="form-input" id="hourEmployee">
+                    ${employees.map(e => `<option value="${e.id}" ${String(e.id) === currentEmpId ? 'selected' : ''}>${e.name}</option>`).join('')}
+                </select>
+            </div>` : '';
 
         document.getElementById('modalContent').innerHTML = `
             <h3>${label}</h3>

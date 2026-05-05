@@ -301,6 +301,14 @@ window.QEClock = {
 
         // ── ACTIEVE SESSIE → UITCLOCKEN ──
         if (session.active) {
+            // Bevestiging vragen om fouten te voorkomen (bijv. verkeerde user ingelogd)
+            const userName = user.name || user.email;
+            const startTime = session.startTime || '?';
+            const confirmed = confirm(`${userName} uitklokken?\n\nIngeklokt om ${startTime}\nWil je nu uitklokken?`);
+            if (!confirmed) {
+                console.log('[Clock] Uitklokken geannuleerd door gebruiker');
+                return;
+            }
             await this._clockOut(session, tag);
             return;
         }
