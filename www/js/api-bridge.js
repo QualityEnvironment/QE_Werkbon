@@ -165,7 +165,18 @@ const APIBridge = {
 
         if (action === 'check') {
             const user = RobawsAPI.getLoggedInUser();
-            if (user) return this.jsonResponse({ loggedIn: true, user });
+            if (user) {
+                // Als robawsUserId nog ontbreekt (oude sessies of login waarbij
+                // /users niet bereikbaar was), probeer hem alsnog op te halen
+                // zodat werkbonnen niet zonder verantwoordelijke ingediend worden.
+                if (!user.robawsUserId && user.robawsEmployeeId) {
+                    try {
+                        const resolved = await RobawsAPI.ensureUserId();
+                        if (resolved) user.robawsUserId = resolved;
+                    } catch(e) { /* offline → laat null staan, submit-tijd doet retry */ }
+                }
+                return this.jsonResponse({ loggedIn: true, user });
+            }
             return this.jsonResponse({ loggedIn: false });
         }
 
@@ -299,7 +310,7 @@ const APIBridge = {
         const user = RobawsAPI.getLoggedInUser();
         if (!user) return this.jsonResponse({ error: 'Niet ingelogd' }, 401);
 
-        const date = params.date || new Date().toISOString().split('T')[0];
+        const date = params.date || RobawsAPI._localDateStr();
         const result = await RobawsAPI.getPlanning(user.robawsEmployeeId, date, user.robawsUserId);
         return this.jsonResponse(result);
     },
