@@ -175,6 +175,12 @@ window.QEClock = {
                 localStorage.setItem(`qe_startuur_${currentUserId}`, config.startuur);
                 console.log('[Clock] Persoonlijk startuur voor', currentUser.name, ':', config.startuur);
             }
+            // Persoonlijke pauze (minuten) opslaan
+            if (config.pauze && currentUserId) {
+                this._personalPauze = parseInt(config.pauze, 10) || 0;
+                localStorage.setItem(`qe_pauze_${currentUserId}`, String(this._personalPauze));
+                console.log('[Clock] Persoonlijke pauze voor', currentUser.name, ':', this._personalPauze, 'min');
+            }
             localStorage.setItem('qe_nfc_tags', JSON.stringify(config));
             console.log('[Clock] NFC tags geladen:', JSON.stringify(config));
             return config;
@@ -232,6 +238,9 @@ window.QEClock = {
     /** Persoonlijk startuur van de ingelogde werknemer */
     _personalStartuur: null,
     _startuurLoadedForUser: null, // bijhouden voor WELKE user het geladen is
+
+    /** Persoonlijke pauze in minuten (uit Robaws extra veld "Pauze") */
+    _personalPauze: null,
 
     /** Haal verwachte starttijd op voor de ingelogde gebruiker */
     getExpectedStartTime() {
@@ -529,14 +538,24 @@ window.QEClock = {
         const endISO = now.toISOString();
         const rawHours = this._calcHours(session.startISO, endISO);
 
-        // Pauze aftrekken: bureel = 1u, monteur/technieker = 0.75u (45min)
+        // Pauze aftrekken: dynamisch uit Robaws extra veld "Pauze" (in minuten)
         // Alleen bij normale registraties (niet bij Laden & Lossen of Extra uren)
         let pauseHours = 0;
         const isNormalShift = session.registrationType === 'Op tijd' || session.registrationType === 'Te laat';
         if (isNormalShift) {
-            const user = RobawsAPI.getLoggedInUser();
-            const role = user ? user.role : 'technieker';
-            pauseHours = (role === 'bureel') ? 1 : 0.75;
+            // Haal pauze op: eerst uit geladen config, dan localStorage cache
+            let pauseMinutes = this._personalPauze;
+            if (!pauseMinutes && pauseMinutes !== 0) {
+                const user = RobawsAPI.getLoggedInUser();
+                const userId = user ? String(user.robawsEmployeeId) : null;
+                if (userId) {
+                    const cached = localStorage.getItem(`qe_pauze_${userId}`);
+                    if (cached) pauseMinutes = parseInt(cached, 10);
+                }
+            }
+            // Fallback: 45 minuten als er geen waarde is
+            if (!pauseMinutes && pauseMinutes !== 0) pauseMinutes = 45;
+            pauseHours = pauseMinutes / 60;
         }
         const hours = Math.max(0, Math.round((rawHours - pauseHours) * 100) / 100);
         console.log('[Clock] Uren berekend:', rawHours, '- pauze', pauseHours, '=', hours);
@@ -555,13 +574,16 @@ window.QEClock = {
         session.completedSessions.push(completedEntry);
         this._saveSession(session);
 
-        // Update in Robaws (endDate + hours toevoegen)
+        // Update in Robaws (endDate + hours + breakDuration toevoegen)
+        const breakMinutes = Math.round(pauseHours * 60);
         if (session.robawsId) {
             try {
-                await RobawsAPI.updateTimeRegistration(session.robawsId, {
+                const updateData = {
                     endDate: endISO,
                     hours: hours,
-                });
+                };
+                if (breakMinutes > 0) updateData.breakDuration = breakMinutes;
+                await RobawsAPI.updateTimeRegistration(session.robawsId, updateData);
                 console.log('[Clock] Registratie afgesloten in Robaws:', session.robawsId);
             } catch (e) {
                 console.warn('[Clock] Robaws update mislukt:', e.message);
@@ -571,6 +593,7 @@ window.QEClock = {
                     id: session.robawsId,
                     endDate: endISO,
                     hours: hours,
+                    breakDuration: breakMinutes,
                 });
             }
         } else {
@@ -587,7 +610,8 @@ window.QEClock = {
         }
 
         // UI feedback
-        const pauseText = pauseHours > 0 ? ` (${pauseHours}u pauze afgetrokken)` : '';
+        const pauseMin = Math.round(pauseHours * 60);
+        const pauseText = pauseMin > 0 ? ` (${pauseMin}min pauze afgetrokken)` : '';
         if (window.app) {
             app.toast(`🏁 Uitgeklokt om ${endTime} — ${hours} uur gewerkt${pauseText}`);
             app.updateClockUI();

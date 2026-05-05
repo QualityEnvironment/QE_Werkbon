@@ -5233,7 +5233,7 @@ const app = {
                                     <div style="font-size:15px;font-weight:500">${this.escapeHtml(p.clientName || 'Onbekend')}${corrBadge}</div>
                                     ${p.clientAddress ? `<div style="font-size:12px;color:var(--qe-grey);margin-top:2px">📍 ${this.escapeHtml(p.clientAddress)}</div>` : ''}
                                     <div style="font-size:12px;color:var(--qe-grey);margin-top:4px">
-                                        ⏱ ${totH.toFixed(2)}u · 📦 ${matCount} item${matCount !== 1 ? 's' : ''}
+                                        ⏱ ${this.formatDecimalHours(totH)} · 📦 ${matCount} item${matCount !== 1 ? 's' : ''}
                                     </div>
                                 </div>
                                 <div style="text-align:right">
@@ -5682,6 +5682,13 @@ const app = {
     formatMinutes(mins) {
         if (!mins || mins <= 0) return '0:00';
         return `${Math.floor(mins / 60)}:${(mins % 60).toString().padStart(2, '0')}`;
+    },
+    /** Formatteer decimale uren (bijv. 1.75) als "1u 45m" */
+    formatDecimalHours(decHours) {
+        if (!decHours || decHours <= 0) return '0u 00m';
+        const h = Math.floor(decHours);
+        const m = Math.round((decHours - h) * 60);
+        return `${h}u ${String(m).padStart(2, '0')}m`;
     },
     escapeHtml(str) {
         if (!str) return '';

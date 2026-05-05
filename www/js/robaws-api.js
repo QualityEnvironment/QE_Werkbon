@@ -629,9 +629,23 @@ const RobawsAPI = {
                     const val = startField ? String(startField.stringValue ?? startField.value ?? '') : '';
                     console.log('[RobawsAPI] Startuur waarde voor', user.name, ':', val || 'NIET GEVONDEN');
                     if (val) config.startuur = val;
+
+                    // Pauze veld ophalen (minuten)
+                    let pauzeField = myRes.data.extraFields['Pauze'];
+                    if (!pauzeField) {
+                        for (const [name, data] of Object.entries(myRes.data.extraFields)) {
+                            if (name.toLowerCase() === 'pauze') {
+                                pauzeField = data;
+                                break;
+                            }
+                        }
+                    }
+                    const pauzeVal = pauzeField ? String(pauzeField.stringValue ?? pauzeField.value ?? '') : '';
+                    console.log('[RobawsAPI] Pauze waarde voor', user.name, ':', pauzeVal || 'NIET GEVONDEN');
+                    if (pauzeVal) config.pauze = pauzeVal;
                 }
             } catch(e) {
-                console.warn('[RobawsAPI] Kon startuur niet ophalen voor werknemer:', e.message);
+                console.warn('[RobawsAPI] Kon startuur/pauze niet ophalen voor werknemer:', e.message);
             }
         }
 
@@ -1197,6 +1211,10 @@ const RobawsAPI = {
                 billableHours: (onderhoud && isKlant) ? 0 : this._roundUpHalfHour(hrs),
             };
             if (code && code.id) te.articleId = toStr(code.id);
+            // Pauze in minuten meesturen (Robaws veld "breakDuration")
+            if (h.pauze && h.pauze > 0) {
+                te.breakDuration = h.pauze;
+            }
             // Bij onderhoud: werkuren met verkoopprijs 0 en kostprijs 57.50
             if (onderhoud && isKlant) {
                 te.unitPrice = 0;
