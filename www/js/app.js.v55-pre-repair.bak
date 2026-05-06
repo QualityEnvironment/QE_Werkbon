@@ -6251,40 +6251,4 @@ const app = {
         section.style.display = '';
     },
 
-    toggleChecklistItem(checklistKey, itemId, checked) {
-        if (!this.currentWO) return;
-        const woId = this.currentWO.id;
-        if (!this.woData[woId].checklist) this.woData[woId].checklist = {};
-        this.woData[woId].checklist[itemId] = checked;
-
-        // Update voortgang
-        const checklist = ONDERHOUD_DATA.CHECKLISTS[checklistKey];
-        if (checklist) {
-            const saved = this.woData[woId].checklist;
-            const doneCount = Object.values(saved).filter(v => v).length;
-            const pct = Math.round(doneCount / checklist.items.length * 100);
-            const bar = document.getElementById('checklistProgress');
-            const label = document.getElementById('checklistPct');
-            if (bar) bar.style.width = pct + '%';
-            if (label) label.textContent = pct + '%';
-        }
-
-        // Doorhalen van afgevinkte items
-        const span = document.getElementById(`clItem_${itemId}`);
-        if (span) span.style.textDecoration = checked ? 'line-through' : 'none';
-
-        this._saveWoData();
-    },
-
-    // ========================================
-    // DARK MODE
-    // ========================================
-    toggleDarkMode(enabled) {
-        document.body.classList.toggle('dark-mode', enabled);
-        localStorage.setItem('qe_dark_mode', enabled ? '1' : '0');
-    },
-};
-
-// Zet app expliciet op window zodat screen-guards in clock.js werken (v53)
-window.app = app;
-document.addEventListener('DOMContentLoaded', () => app.init());
+    toggleC
