@@ -1001,17 +1001,35 @@ const RobawsAPI = {
         if (empRes.code !== 200 || !empRes.data) throw new Error('Kon werknemer niet ophalen');
         const config = this._parseNfcTags(empRes.data.extraFields || {});
 
-        // Startuur ophalen van de INGELOGDE werknemer (persoonlijk)
+        // Startuur + Pauze ophalen van de INGELOGDE werknemer (persoonlijk)
+        // BUG-fix v56: ook voor werknemer 1, en lees alle mogelijke value-types
+        // (intValue/numberValue/...) — Robaws levert numerieke extra-velden niet
+        // altijd als stringValue.
         const user = this.getLoggedInUser();
-        if (user && user.robawsEmployeeId && String(user.robawsEmployeeId) !== '1') {
+        if (user && user.robawsEmployeeId) {
             try {
                 const myRes = await this.get(`employees/${user.robawsEmployeeId}`);
                 if (myRes.code === 200 && myRes.data && myRes.data.extraFields) {
                     console.log('[RobawsAPI] Extra velden werknemer:', JSON.stringify(Object.keys(myRes.data.extraFields)));
+
+                    // Helper: lees een waarde uit alle gangbare value-keys
+                    const extractVal = (field) => {
+                        if (!field) return '';
+                        const raw = field.stringValue
+                            ?? field.intValue
+                            ?? field.integerValue
+                            ?? field.numberValue
+                            ?? field.decimalValue
+                            ?? field.doubleValue
+                            ?? field.longValue
+                            ?? field.value
+                            ?? '';
+                        return raw === null || raw === undefined ? '' : String(raw).trim();
+                    };
+
                     // Zoek startuur veld (kan "Startuur werknemer" of "Startuur" heten)
                     let startField = myRes.data.extraFields['Startuur werknemer'];
                     if (!startField) startField = myRes.data.extraFields['Startuur'];
-                    // Zoek in alle velden naar een veld dat "startuur" bevat
                     if (!startField) {
                         for (const [name, data] of Object.entries(myRes.data.extraFields)) {
                             if (name.toLowerCase().includes('startuur')) {
@@ -1021,22 +1039,29 @@ const RobawsAPI = {
                             }
                         }
                     }
-                    const val = startField ? String(startField.stringValue ?? startField.value ?? '') : '';
+                    const val = extractVal(startField);
                     console.log('[RobawsAPI] Startuur waarde voor', user.name, ':', val || 'NIET GEVONDEN');
                     if (val) config.startuur = val;
 
-                    // Pauze veld ophalen (minuten)
+                    // Pauze veld ophalen (in minuten)
                     let pauzeField = myRes.data.extraFields['Pauze'];
+                    let pauzeFieldName = pauzeField ? 'Pauze' : null;
                     if (!pauzeField) {
                         for (const [name, data] of Object.entries(myRes.data.extraFields)) {
-                            if (name.toLowerCase() === 'pauze') {
+                            if (name.toLowerCase().includes('pauze')) {
                                 pauzeField = data;
+                                pauzeFieldName = name;
                                 break;
                             }
                         }
                     }
-                    const pauzeVal = pauzeField ? String(pauzeField.stringValue ?? pauzeField.value ?? '') : '';
-                    console.log('[RobawsAPI] Pauze waarde voor', user.name, ':', pauzeVal || 'NIET GEVONDEN');
+                    let pauzeVal = extractVal(pauzeField);
+                    // Strip eventuele tekst (bv. "60 min" -> "60")
+                    const numMatch = pauzeVal.match(/\d+/);
+                    if (numMatch) pauzeVal = numMatch[0];
+                    console.log('[RobawsAPI] Pauze waarde voor', user.name,
+                        '(veld:', pauzeFieldName || 'GEEN', '):',
+                        pauzeVal || 'NIET GEVONDEN');
                     if (pauzeVal) config.pauze = pauzeVal;
                 }
             } catch(e) {
@@ -1135,7 +1160,7 @@ const RobawsAPI = {
         let allItems = [];
         const seenIds = new Set();
         let page = 0;
-        const maxPages = 10;
+        const maxPages = 20; // v57: opgekrikt van 10 -> 20 voor actieve users
         while (page < maxPages) {
             const res = await this.get(`time-registrations?employeeId=${employeeId}&limit=100&page=${page}&sort=id:desc`);
             if (res.code !== 200) {
@@ -1156,15 +1181,28 @@ const RobawsAPI = {
             if (res.data.totalPages && page >= res.data.totalPages) break;
         }
 
-        return allItems
+        // v57: filter versoepeld - server query is al ?employeeId=X, dus
+        // items zonder expliciete empId-veld vertrouwen we (Robaws levert het
+        // veld soms niet terug, vroeger dropten we die zichtbaarheid weg).
+        // Items MET een ander empId blijven uitgesloten.
+        const beforeFilter = allItems.length;
+        const filtered = allItems
             .filter(item => {
                 if (!(item.startDate >= cutoffStr)) return false;
-                // SECURITY-fix: strikt employeeId match (zie getTimeRegistrations)
                 const itemEmpId = item.employeeId || (item.employee && item.employee.id);
-                if (!itemEmpId) return false;
-                return String(itemEmpId) === String(employeeId);
+                // Als empId expliciet anders is, droppen (cross-employee bescherming)
+                if (itemEmpId && String(itemEmpId) !== String(employeeId)) {
+                    console.warn('[RobawsAPI] history: item id=' + item.id +
+                        ' had empId=' + itemEmpId + ' (verwacht ' + employeeId + ') - skip');
+                    return false;
+                }
+                // empId leeg/niet meegegeven: server-side ?employeeId=X filter vertrouwen
+                return true;
             })
             .sort((a, b) => b.startDate.localeCompare(a.startDate));
+        console.log('[RobawsAPI] history fetch: ' + beforeFilter + ' fetched, ' +
+            filtered.length + ' na filter (cutoff=' + cutoffStr + ', empId=' + employeeId + ')');
+        return filtered;
     },
 
     /**
@@ -1172,7 +1210,32 @@ const RobawsAPI = {
      * @param {string} timeRegId - ID van de tijdsregistratie
      * @param {Object} data - { title, description, assignedUserId }
      */
-    async createTaskForTimeRegistration(timeRegId, data) {
+    /**
+     * v64: Maak een taak aan gerelateerd aan een werkbon (Tijdsregistratie).
+     * Gebruikt voor "aanpassing aanvragen" — wordt toegewezen aan Vince (userId 5).
+     */
+    async createTaskForWorkOrder(workOrderId, data) {
+        const user = this.getLoggedInUser();
+        const body = {
+            title: data.title || 'Aanpassing aangevraagd',
+            description: data.description || '',
+            relatedResource: `/work-orders/${workOrderId}`,
+            status: 'Te doen',
+            reportingUserId: user ? String(user.robawsUserId) : null,
+        };
+        if (data.assignedUserId) {
+            body.assignedUserId = String(data.assignedUserId);
+        }
+        console.log('[RobawsAPI] Taak aanmaken bij werkbon:', workOrderId, JSON.stringify(body));
+        const res = await this.post('tasks', body);
+        if (res.code !== 201 && res.code !== 200) {
+            throw new Error('Taak aanmaken mislukt: ' + res.code + ' ' +
+                JSON.stringify(res.data).slice(0, 200));
+        }
+        return res;
+    },
+
+        async createTaskForTimeRegistration(timeRegId, data) {
         const user = this.getLoggedInUser();
         const body = {
             title: data.title || 'Aanpassing aangevraagd',
@@ -2889,4 +2952,270 @@ const RobawsAPI = {
         // enkel nog zodat de app-flow kan doorgaan na een geslaagde terminal-betaling.
         return { success: true, code: 200, skipped: true };
     },
+    // =============================================
+    // TIJDSREGISTRATIE VIA WERKBONNEN (v58+)
+    // =============================================
+
+    /** Article-IDs voor uurcodes in Robaws (zie screenshot uurcodes-lijst). */
+    WERKUUR_ARTICLE_IDS: {
+        monteurProject: 185,    // "Werkuur monteur - Project" - €65 verkoop
+        ladenLossen: 19786,     // "Werkuur laden & lossen"     - €0 verkoop
+    },
+
+    /** YYYY-MM-DD -> DD/MM/YYYY voor titel */
+    _formatDateLabel(dateStr) {
+        if (!dateStr) return '';
+        const m = String(dateStr).substring(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!m) return dateStr;
+        return `${m[3]}/${m[2]}/${m[1]}`;
+    },
+
+    /** Rond een HH:MM string af op de dichtsbijzeijnde 5 min. */
+    _roundTimeToNearest5(hhmm) {
+        if (!hhmm) return hhmm;
+        const m = String(hhmm).match(/^(\d{1,2}):(\d{1,2})/);
+        if (!m) return hhmm;
+        const h = parseInt(m[1], 10) || 0;
+        const min = parseInt(m[2], 10) || 0;
+        const total = h * 60 + min;
+        const rounded = Math.round(total / 5) * 5;
+        const rh = Math.floor(rounded / 60) % 24;
+        const rm = rounded % 60;
+        return `${String(rh).padStart(2,'0')}:${String(rm).padStart(2,'0')}`;
+    },
+
+    /** Lees een extraField waarde uit alle gangbare value-keys */
+    _extractFieldVal(field) {
+        if (!field) return '';
+        const raw = field.stringValue
+            ?? field.intValue
+            ?? field.integerValue
+            ?? field.numberValue
+            ?? field.decimalValue
+            ?? field.doubleValue
+            ?? field.longValue
+            ?? field.value
+            ?? '';
+        return raw === null || raw === undefined ? '' : String(raw).trim();
+    },
+
+    /**
+     * Maak een nieuwe Tijdsregistratie-werkbon aan voor de gescande werknemer.
+     * Returns { workOrderId, raw }.
+     * v59: GET-then-PUT i.p.v. partial PUT — voorkomt dat Robaws het body-format
+     * stilzwijgend afwijst en een lege werkbon achterlaat. Uitgebreide
+     * logging naar localStorage zodat we exact kunnen zien wat er gebeurt.
+     */
+    async createTimeRegistrationWorkOrder(opts) {
+        const { employeeId, employeeName, userId, dateStr, ingeklokt, tijdLabel, opmerking } = opts;
+
+        // Stap 1: lege werkbon aanmaken
+        const woRes = await this.post('work-orders', {});
+        try { localStorage.setItem('qe_last_tr_post_res', JSON.stringify({code: woRes.code, data: woRes.data})); } catch(_) {}
+        if (woRes.code !== 200 && woRes.code !== 201) {
+            throw new Error('POST /work-orders faalde (' + woRes.code + '): ' +
+                JSON.stringify(woRes.data).slice(0, 200));
+        }
+        const workOrderId = woRes.data && woRes.data.id;
+        if (!workOrderId) {
+            throw new Error('POST /work-orders gaf geen id terug: ' + JSON.stringify(woRes.data).slice(0,200));
+        }
+
+        // Stap 2: GET de werkbon zodat we het volledige object kunnen mergen
+        let woFull;
+        try {
+            const getRes = await this.get(`work-orders/${workOrderId}`);
+            if (getRes.code === 200 && getRes.data) {
+                woFull = getRes.data;
+            }
+        } catch(e) {
+            console.warn('[RobawsAPI] GET werkbon na POST faalde:', e.message);
+        }
+        if (!woFull) {
+            // Fallback: alleen het id bekend
+            woFull = { id: workOrderId };
+        }
+
+        // Stap 3: bouw merged body — bestaande velden behouden, onze velden toevoegen
+        const dateLabel = this._formatDateLabel(dateStr);
+        woFull.title = `Tijdsregistratie ${employeeName || ''} - ${dateLabel}`.trim();
+        woFull.date = dateStr;
+        woFull.status = 'Tijdsregistratie';
+        woFull.timeAndMaterial = false;
+        woFull.remark = opmerking || '';
+        if (userId) woFull.assignedUserId = String(userId);
+
+        // v60: Variant A format — bevestigd werkend via PHP probe.
+        // GEEN type/group meegeven; Robaws gebruikt zijn eigen schema.
+        woFull.extraFields = woFull.extraFields || {};
+        woFull.extraFields['Tijd']       = { stringValue: tijdLabel || 'Op tijd' };
+        woFull.extraFields['Ingeklokt']  = { stringValue: ingeklokt || '' };
+        woFull.extraFields['Uitgeklokt'] = { stringValue: '' };
+
+        try { localStorage.setItem('qe_last_tr_put_req', JSON.stringify(woFull)); } catch(_) {}
+
+        const putRes = await this.put(`work-orders/${workOrderId}`, woFull);
+        try { localStorage.setItem('qe_last_tr_put_res', JSON.stringify({code: putRes.code, data: putRes.data})); } catch(_) {}
+
+        if (putRes.code !== 200 && putRes.code !== 201 && putRes.code !== 204) {
+            throw new Error('PUT /work-orders/' + workOrderId + ' faalde (' + putRes.code +
+                '): ' + JSON.stringify(putRes.data).slice(0, 300));
+        }
+
+        return { workOrderId, raw: putRes.data || woFull };
+    },
+
+    /** Update Uitgeklokt-tijd op een tijdsregistratie-werkbon. v59: GET-then-PUT. */
+    async setTimeRegistrationUitgeklokt(workOrderId, uitgeklokt) {
+        const getRes = await this.get(`work-orders/${workOrderId}`);
+        if (getRes.code !== 200 || !getRes.data) {
+            throw new Error('GET /work-orders/' + workOrderId + ' faalde (' + getRes.code + ')');
+        }
+        const wo = getRes.data;
+        wo.extraFields = wo.extraFields || {};
+        // v60: Variant A — geen type/group, partial PUT zou andere velden wissen
+        wo.extraFields['Uitgeklokt'] = { stringValue: uitgeklokt || '' };
+        try { localStorage.setItem('qe_last_uitg_put_req', JSON.stringify(wo)); } catch(_) {}
+        const putRes = await this.put(`work-orders/${workOrderId}`, wo);
+        try { localStorage.setItem('qe_last_uitg_put_res', JSON.stringify({code: putRes.code, data: putRes.data})); } catch(_) {}
+        return putRes;
+    },
+
+    /** Update Tijd-keuze (bv. naar "Ziek"). v59: GET-then-PUT. */
+    async setTimeRegistrationTijd(workOrderId, tijdLabel) {
+        const getRes = await this.get(`work-orders/${workOrderId}`);
+        if (getRes.code !== 200 || !getRes.data) {
+            throw new Error('GET /work-orders/' + workOrderId + ' faalde (' + getRes.code + ')');
+        }
+        const wo = getRes.data;
+        wo.extraFields = wo.extraFields || {};
+        // v60: Variant A — geen type/group
+        wo.extraFields['Tijd'] = { stringValue: tijdLabel || 'Op tijd' };
+        return await this.put(`work-orders/${workOrderId}`, wo);
+    },
+
+    /**
+     * Voeg een werknemer-uren regel toe aan een tijdsregistratie-werkbon.
+     * @param {Object} opts
+     * @param {string|number} opts.workOrderId
+     * @param {string|number} opts.employeeId
+     * @param {string} opts.startTime       HH:MM
+     * @param {string} opts.endTime         HH:MM
+     * @param {number} [opts.breakMinutes]  Pauze in minuten
+     * @param {string|number} opts.articleId  Uurcode-id (185 of 19786)
+     */
+    async addWorkHoursTimeEntry(opts) {
+        const { workOrderId, employeeId, startTime, endTime, breakMinutes, articleId } = opts;
+        const te = {
+            employeeId: String(employeeId),
+            articleId: String(articleId),
+        };
+        if (startTime) {
+            const [sh, sm] = startTime.split(':').map(Number);
+            te.startTime = { hour: sh || 0, minute: sm || 0 };
+        }
+        if (endTime) {
+            const [eh, em] = endTime.split(':').map(Number);
+            te.endTime = { hour: eh || 0, minute: em || 0 };
+        }
+        // v63: Robaws v2 wil 'breakMinutes' (we stuurden breakDuration en kreeg breakMinutes:0 terug)
+        if (breakMinutes && breakMinutes > 0) te.breakMinutes = parseInt(breakMinutes, 10);
+        // Bereken hours uit start/end - pauze
+        if (startTime && endTime) {
+            const [sh, sm] = startTime.split(':').map(Number);
+            const [eh, em] = endTime.split(':').map(Number);
+            const minutes = ((eh || 0) * 60 + (em || 0)) - ((sh || 0) * 60 + (sm || 0)) - (parseInt(breakMinutes, 10) || 0);
+            const hrs = Math.max(0, Math.round(minutes / 60 * 100) / 100);
+            te.hours = hrs;
+            te.billableHours = this._roundUpHalfHour(hrs);
+        }
+        return await this.post(`work-orders/${workOrderId}/time-entries`, te);
+    },
+
+    /**
+     * Haal Tijdsregistratie-werkbonnen op voor de huidige user, voor een
+     * bepaalde maand (YYYY-MM). Filter op assignedUserId zodat techniekers
+     * enkel hun eigen kaarten zien.
+     */
+    async getMyTimeRegistrationWorkOrders(userId, monthPrefix) {
+        // v66: maxPages drastisch verlaagd naar 8 + smart break om rate-limit
+        // (HTTP 429) te vermijden. Sort=id:desc behouden — onze recente
+        // werkbonnen staan vooraan; 800 werkbonnen is ruim genoeg.
+        // Smart break: stop zodra 2 opeenvolgende pages 0 nieuwe Tijdsregistratie
+        // werkbonnen voor monthPrefix opleveren.
+        let allItems = [];
+        const seenIds = new Set();
+        let page = 0;
+        const maxPages = 8;
+        let emptyPagesInRow = 0;
+        while (page < maxPages) {
+            const res = await this.get(`work-orders?limit=100&page=${page}&sort=id:desc`);
+            if (res.code !== 200) {
+                throw new Error(`Tijdsregistratie-werkbonnen fetch faalde (${res.code})`);
+            }
+            if (!res.data || !res.data.items || res.data.items.length === 0) break;
+            let foundOnPage = 0;
+            for (const it of res.data.items) {
+                if (it.id == null || seenIds.has(String(it.id))) continue;
+                seenIds.add(String(it.id));
+                allItems.push(it);
+                // Tel matching items (status + datum) op voor smart break
+                const status = String(it.status || '').toLowerCase();
+                const dateMonth = (it.date || '').substring(0, 7);
+                if (status.includes('tijdsregistratie') && dateMonth === monthPrefix) {
+                    foundOnPage++;
+                }
+            }
+            if (foundOnPage === 0) emptyPagesInRow++;
+            else emptyPagesInRow = 0;
+            if (emptyPagesInRow >= 2) break;
+            page++;
+            if (res.data.totalPages && page >= res.data.totalPages) break;
+        }
+        // Filter: status=Tijdsregistratie EN assignedUser=ingelogde user EN maand klopt
+        const filtered = allItems.filter(item => {
+            const status = String(item.status || '').toLowerCase();
+            if (!status.includes('tijdsregistratie')) return false;
+            const dateMonth = (item.date || '').substring(0, 7);
+            if (dateMonth !== monthPrefix) return false;
+            const itemUserId = item.assignedUserId
+                || (item.assignedUser && item.assignedUser.id);
+            if (itemUserId && String(itemUserId) !== String(userId)) return false;
+            return true;
+        });
+        console.log('[RobawsAPI] Tijdsregistratie-werkbonnen: ' + allItems.length +
+            ' fetched, ' + filtered.length + ' voor user ' + userId + ' in ' + monthPrefix);
+        return filtered;
+    },
+
+    /**
+     * v62: zoek de OPEN tijdsregistratie-werkbon van vandaag voor een user.
+     * Robaws is hier leidend — er hoort er maar 1 te zijn per dag per user
+     * (status="Tijdsregistratie" + assignedUserId=user + date=today).
+     * Returns null als er geen is.
+     */
+    async getTodaysOpenTimeRegistrationWorkOrder(userId) {
+        if (!userId) return null;
+        const today = this._localDateStr();
+        // Korte fetch — eerste pagina is meestal genoeg
+        const res = await this.get('work-orders?limit=100&sort=date:desc');
+        if (res.code !== 200 || !res.data || !res.data.items) return null;
+        const items = res.data.items.filter(wo => {
+            const status = String(wo.status || '').toLowerCase();
+            if (!status.includes('tijdsregistratie')) return false;
+            if ((wo.date || '').substring(0, 10) !== today) return false;
+            const itemUserId = wo.assignedUserId
+                || (wo.assignedUser && wo.assignedUser.id);
+            return itemUserId && String(itemUserId) === String(userId);
+        });
+        if (items.length === 0) return null;
+        if (items.length > 1) {
+            console.warn('[RobawsAPI] Meer dan 1 tijdsregistratie-werkbon vandaag voor user',
+                userId, '- nieuwste eerste; ID:', items.map(i => i.id).join(','));
+        }
+        // Sorteer op id desc — nieuwste werkbon eerst (mocht er per ongeluk dubbel zijn)
+        items.sort((a, b) => String(b.id).localeCompare(String(a.id)));
+        return items[0];
+    },
+
 };
