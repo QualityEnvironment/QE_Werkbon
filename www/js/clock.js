@@ -173,10 +173,20 @@ window.QEClock = {
     /** Gecachte tag configuratie */
     _tagConfig: null,
 
+    /** v72: TTL voor tag-config cache (5 min) — voorkomt dat we per scan
+     * dubbele /employees calls doen. Reset bij login of expliciet herladen.
+     */
+    _tagConfigLoadedAt: 0,
+
     /** Haal NFC tags op van Robaws en cache lokaal */
-    async loadTagConfig() {
+    async loadTagConfig(force) {
+        // v72: skip als cache nog vers is (5 min TTL)
+        if (!force && this._tagConfig && (Date.now() - this._tagConfigLoadedAt) < 5 * 60 * 1000) {
+            return this._tagConfig;
+        }
         try {
             const config = await RobawsAPI.getNfcTagConfig();
+            this._tagConfigLoadedAt = Date.now();
             this._tagConfig = config;
             // Persoonlijk startuur apart opslaan PER USER
             const currentUser = RobawsAPI.getLoggedInUser();
@@ -522,7 +532,14 @@ window.QEClock = {
                 if (session.active) {
                     const userName = user.name || user.email;
                     const startTime = session.startTime || '?';
-                    const confirmed = confirm(`${userName} uitklokken?\n\nIngeklokt om ${startTime}\nWil je nu uitklokken?`);
+                    // v72: vervang native confirm() door custom modal — confirm()
+                    // blokkeert de UI thread inclusief de _scanLock (8s timeout).
+                    const confirmed = await this._showConfirmModal(
+                        `${userName} uitklokken?`,
+                        `Ingeklokt om ${startTime}. Wil je nu uitklokken?`,
+                        'Uitklokken',
+                        'Annuleren'
+                    );
                     if (!confirmed) {
                         console.log('[Clock] Uitklokken geannuleerd door gebruiker');
                         return;
@@ -562,14 +579,26 @@ window.QEClock = {
 
         // v62: Robaws is leidend. Check eerst of er VANDAAG al een werkbon
         // bestaat voor deze user. Zo ja, hergebruik die ID. Zo nee, maak nieuwe.
+        // v71: race-mitigation — als de eerste check NIETS oplevert, doe een
+        // willekeurige korte delay (50-400ms) en check opnieuw, om te voorkomen
+        // dat 2 toestellen tegelijk een werkbon aanmaken.
         const _user = RobawsAPI.getLoggedInUser();
         const _userId = _user ? (_user.robawsUserId || _user.userId) : null;
         if (!session.workOrderId && _userId) {
             try {
-                const existing = await RobawsAPI.getTodaysOpenTimeRegistrationWorkOrder(_userId);
+                let existing = await RobawsAPI.getTodaysOpenTimeRegistrationWorkOrder(_userId);
                 if (existing && existing.id) {
                     session.workOrderId = existing.id;
                     console.log('[Clock] Bestaande werkbon van vandaag gevonden:', existing.id);
+                } else {
+                    // v71: jitter + double-check tegen race condition
+                    const jitter = 50 + Math.floor(Math.random() * 350);
+                    await new Promise(r => setTimeout(r, jitter));
+                    existing = await RobawsAPI.getTodaysOpenTimeRegistrationWorkOrder(_userId);
+                    if (existing && existing.id) {
+                        session.workOrderId = existing.id;
+                        console.log('[Clock] Werkbon gevonden in 2e check (race-fix):', existing.id);
+                    }
                 }
             } catch(e) {
                 console.warn('[Clock] Kon Robaws niet checken voor bestaande werkbon:', e.message);
@@ -766,14 +795,21 @@ window.QEClock = {
             '-> entry ' + entryStart + ' -> ' + entryEnd,
             '(pauze ' + pauseMinutes + 'min, bron ' + pauseSource + ')');
 
-        // v70: bij clock-out ook een 2e regel "klok-uit: ..." aan de werkbon-remark
-        // toevoegen, met huidige GPS + tijd. Krijg GPS van de uit-scan zelf.
+        // v70/v72: bij clock-out 2e regel toevoegen met GPS+tijd.
+        // v72: GPS-fetch met short timeout + cached fallback. Op slechte ontvangst
+        // wachten we maximaal 3 sec; daarna gebruiken we de in-scan GPS uit de sessie
+        // zodat de uit-scan niet 10s+ blokkeert.
         let outGpsText = '';
         try {
-            const pos2 = await this._getGPS();
+            const pos2 = await this._getGPS({ timeoutMs: 3000, maximumAge: 60000 });
             outGpsText = `https://maps.google.com/?q=${pos2.latitude.toFixed(6)},${pos2.longitude.toFixed(6)}`;
         } catch(_) {
-            outGpsText = 'GPS niet beschikbaar';
+            // Fallback: gebruik de GPS van de in-scan (zit nog in session)
+            if (session.gpsLat != null && session.gpsLng != null) {
+                outGpsText = `https://maps.google.com/?q=${session.gpsLat.toFixed(6)},${session.gpsLng.toFixed(6)}`;
+            } else {
+                outGpsText = 'GPS niet beschikbaar';
+            }
         }
         const klokUitLine = `klok-uit: ${tag.name} \u2014 ${outGpsText} \u2014 ${endTimeRaw}`;
 
@@ -967,7 +1003,9 @@ window.QEClock = {
     // GPS
     // =============================================
 
-    _getGPS() {
+    _getGPS(opts) {
+        const timeout = (opts && opts.timeoutMs) || 10000;
+        const maxAge = (opts && opts.maximumAge) || 0;
         return new Promise((resolve, reject) => {
             if (!navigator.geolocation) {
                 reject(new Error('Geolocation niet beschikbaar'));
@@ -1278,9 +1316,12 @@ window.QEClock = {
         session.registrationType = tijdLabel;  // compat met oude UI
         session.startTime        = ingeklokt || session.startTime;
         session.active           = isActive;
-        // v68: gebruik em-dash separator (' \u2014 ') zoals _clockIn schrijft.
-        // Voorheen split op ' - ' (hyphen) gaf hele remark incl. GPS in tagName.
-        session.tagName          = (wo.remark || '').split(' \u2014 ')[0].trim() || session.tagName || 'Bureau';
+        // v71: strip klok-in:/klok-uit: prefix EN GPS-deel om enkel tag-naam te krijgen.
+        // Sinds v70 begint elke regel met "klok-in: <tag> — <gps> — <tijd>".
+        // We pakken regel 1, strippen prefix, en splitsen op em-dash.
+        const _firstLine = String(wo.remark || '').split(/\r?\n/)[0] || '';
+        const _stripped  = _firstLine.replace(/^\s*klok-(in|uit):\s*/i, '');
+        session.tagName          = _stripped.split(' \u2014 ')[0].trim() || session.tagName || 'Bureau';
         if (uitgeklokt) {
             session.endTime = uitgeklokt;
         }
@@ -1441,4 +1482,51 @@ window.QEClock = {
         if (!session || !session.active) return null;
         return session.tagName;
     },
+    /**
+     * v71 shim: getAllAttendanceToday is bewust verwijderd in v62 (samen met
+     * de time-registrations endpoint). De admin-sectie van het Klok-scherm
+     * roept hem nog aan. Voor nu return een lege array zodat het scherm niet
+     * crasht. Een toekomstige versie kan dit herimplementeren via
+     * getMyTimeRegistrationWorkOrders voor alle users (vereist admin-rechten
+     * en respect voor rate-limit).
+     */
+    async getAllAttendanceToday() {
+        console.warn('[Clock] getAllAttendanceToday: niet geïmplementeerd in werkbon-flow — return []');
+        return [];
+    },
+
+
+    /** v72: custom confirm modal — blokkeert UI niet zoals native confirm().
+     *  Returns Promise<boolean>. Auto-cancel na 30s als gebruiker niet reageert.
+     */
+    _showConfirmModal(title, message, okLabel, cancelLabel) {
+        return new Promise((resolve) => {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);' +
+                'display:flex;align-items:center;justify-content:center;z-index:99999;padding:20px';
+            overlay.innerHTML = `
+                <div style="background:#fff;border-radius:12px;padding:20px;max-width:420px;width:100%;
+                    box-shadow:0 8px 24px rgba(0,0,0,0.2)">
+                    <h3 style="margin:0 0 8px;font-size:17px;color:#001E45">${title}</h3>
+                    <p style="margin:0 0 18px;font-size:14px;color:#444">${message}</p>
+                    <div style="display:flex;gap:10px;justify-content:flex-end">
+                        <button id="qeModalCancel" style="padding:10px 18px;font-size:14px;border:1px solid #ccc;
+                            background:#f5f5f5;border-radius:8px;cursor:pointer">${cancelLabel || 'Annuleren'}</button>
+                        <button id="qeModalOk" style="padding:10px 18px;font-size:14px;border:none;
+                            background:#001E45;color:#fff;border-radius:8px;cursor:pointer;font-weight:600">${okLabel || 'OK'}</button>
+                    </div>
+                </div>`;
+            document.body.appendChild(overlay);
+            const cleanup = (val) => {
+                clearTimeout(autoCancelTimer);
+                try { document.body.removeChild(overlay); } catch(_) {}
+                resolve(val);
+            };
+            overlay.querySelector('#qeModalOk').onclick = () => cleanup(true);
+            overlay.querySelector('#qeModalCancel').onclick = () => cleanup(false);
+            overlay.onclick = (e) => { if (e.target === overlay) cleanup(false); };
+            const autoCancelTimer = setTimeout(() => cleanup(false), 30000);
+        });
+    },
+
 };

@@ -340,6 +340,8 @@ const app = {
                 'qe_submitted_wos',
                 'qe_timer_state',
                 'qe_timer_correction',
+            
+                'qe_clock_pending_',       // v72: per-user pending sync queue (prefix-match)
             ];
             const planItemPrefix = 'planItem_';
             const clockSessionPrefix = 'qe_clock_v2_';
@@ -4480,7 +4482,11 @@ const app = {
         }
 
         // ── Pending sync count ──
-        const pendingCount = JSON.parse(localStorage.getItem('qe_clock_pending') || '[]').length;
+        // v71: pending queue is per user (qe_clock_pending_<email>), niet global
+        const _pcUser = RobawsAPI.getLoggedInUser();
+        const _pcKey = _pcUser ? `qe_clock_pending_${_pcUser.email}` : null;
+        let pendingCount = 0;
+        try { pendingCount = _pcKey ? (JSON.parse(localStorage.getItem(_pcKey) || '[]').length) : 0; } catch(_) {}
         const pendingEl = document.getElementById('clockPendingCount');
         if (pendingEl) {
             pendingEl.textContent = pendingCount > 0
@@ -5410,14 +5416,47 @@ const app = {
                 const inS = ef.Ingeklokt && ef.Ingeklokt.stringValue;
                 const outS = ef.Uitgeklokt && ef.Uitgeklokt.stringValue;
                 if (!inS || !outS) return 0;
-                const inMin = m(inS);
-                const outMin = round5m(m(outS));
-                const startMin = inMin <= userStartuurMin ? userStartuurMin : round5m(inMin);
-                const mins = outMin - startMin - userPauze;
-                if (mins <= 0) return 0;
-                // v69: rond af naar 0.5 (billableHours-stijl) zodat dit overeenkomt
-                // met wat in het aanpassing-scherm uit te.hours wordt getoond.
-                const rawHours = mins / 60;
+
+                // v71: parse de werkbon-remark voor multiple klok-in/klok-uit cycli.
+                // Format: "klok-in: tag — gps — HH:MM\nklok-uit: ... — HH:MM" repeating.
+                // Voorbeeld dag met pauze tussen 12:00-13:00:
+                //   klok-in 06:45, klok-uit 12:00, klok-in 13:00, klok-uit 17:00 = 9.25u
+                // i.p.v. naïef 17:00 - 06:45 = 10.25u (- 60 pauze = 9.25 — toevallig OK,
+                // maar bij langere gaps gaat het mis).
+                let totalMins = 0;
+                const lines = String(wo.remark || '').split(/\r?\n/);
+                const cycles = [];
+                let pendingIn = null;
+                for (const line of lines) {
+                    const inM = line.match(/klok-in:.*?\s\u2014\s(\d{1,2}:\d{2})\s*$/i);
+                    const outM = line.match(/klok-uit:.*?\s\u2014\s(\d{1,2}:\d{2})\s*$/i);
+                    if (inM) pendingIn = m(inM[1]);
+                    else if (outM && pendingIn !== null) {
+                        cycles.push([pendingIn, m(outM[1])]);
+                        pendingIn = null;
+                    }
+                }
+                if (cycles.length > 0) {
+                    // Toepassen: alleen op eerste cyclus startuur-correctie wanneer scan
+                    // voor startuur, voor andere cycli round5(actual). End altijd round5.
+                    let bureauApplied = false;  // alleen bij eerste cycle
+                    for (let i = 0; i < cycles.length; i++) {
+                        let [s, e] = cycles[i];
+                        const sMin = (i === 0 && s <= userStartuurMin) ? userStartuurMin : round5m(s);
+                        const eMin = round5m(e);
+                        if (eMin > sMin) totalMins += (eMin - sMin);
+                    }
+                    totalMins -= userPauze;
+                } else {
+                    // Geen cycli geparseerd (oudere werkbonnen) → fallback op Ingeklokt/Uitgeklokt
+                    const inMin = m(inS);
+                    const outMin = round5m(m(outS));
+                    const startMin = inMin <= userStartuurMin ? userStartuurMin : round5m(inMin);
+                    totalMins = outMin - startMin - userPauze;
+                }
+                if (totalMins <= 0) return 0;
+                // v69: ceil naar 0.5 (billableHours-stijl) voor consistency met aanpassing-scherm.
+                const rawHours = totalMins / 60;
                 return Math.ceil(rawHours * 2) / 2;
             };
             let totalHours = 0;
@@ -6366,21 +6405,34 @@ const app = {
         this._saveWoData();
     },
 
-    /** v69: knip GPS-URL en scan-tijd weg uit het remark-veld.
-     * Splits op ' — ' (em-dash) OF ' - ' (gewone hyphen met spaties).
-     * Tag-namen zonder spaties rond hyphens (bv. "1-XXD-141") blijven intact
-     * omdat de regex \s+ aan beide kanten verplicht maakt.
+    /** v72: multi-line aware. Voor Tijdsregistratie-werkbonnen kan de remark
+     * meerdere klok-in/klok-uit regels bevatten + eventueel mens-gerichte
+     * notities. Strategie:
+     *   1. Splits op nieuwe regels.
+     *   2. Voor elke regel: strip 'klok-(in|uit):\s*' prefix en knip vanaf
+     *      de eerste " — " of " - http" (whitespace verplicht).
+     *   3. Concatenate de schone delen, gescheiden door '\n'.
+     *   4. Lege regels worden weggegooid.
+     * Tag-namen zonder spaties rond interne hyphens (bv. "1-XXD-141") blijven
+     * intact omdat we \s+ aan beide kanten van de separator verplichten.
      */
     _publicRemark(remark) {
         if (!remark) return '';
-        const s = String(remark);
-        // Match " — " of " - " (whitespace verplicht aan beide kanten)
-        const m = s.match(/^(.*?)\s+[\u2014-]\s+/);
-        if (m) return m[1].trim();
-        // Geen separator gevonden — als hele string een URL bevat, knip vóór "http"
-        const httpIdx = s.indexOf('http');
-        if (httpIdx > 0) return s.substring(0, httpIdx).replace(/[\s\-—]+$/, '').trim();
-        return s.trim();
+        const cleanLine = (line) => {
+            let s = String(line || '').replace(/^\s*klok-(in|uit):\s*/i, '');
+            const m = s.match(/^(.*?)\s+[\u2014-]\s+/);
+            if (m) return m[1].trim();
+            const httpIdx = s.indexOf('http');
+            if (httpIdx > 0) return s.substring(0, httpIdx).replace(/[\s\-\u2014]+$/, '').trim();
+            return s.trim();
+        };
+        const lines = String(remark).split(/\r?\n/).map(cleanLine).filter(Boolean);
+        // Dedupliceer opeenvolgende identieke entries (bv. 2x "Bureau" voor in+uit)
+        const dedup = [];
+        for (const l of lines) {
+            if (dedup.length === 0 || dedup[dedup.length - 1] !== l) dedup.push(l);
+        }
+        return dedup.join('\n');
     },
 
     // ========================================
