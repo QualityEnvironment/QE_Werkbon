@@ -164,7 +164,31 @@ const app = {
             try { localStorage.removeItem('qe_pending_payments'); } catch (e) {}
             localStorage.setItem('qe_pending_cleanup_v2', '1');
         }
-        // Check of er al een sessie is
+        // v79: Force logout bij OTA update — versie-detectie in JS zelf.
+        // Dit werkt onafhankelijk van MainActivity.java (zodat ook v78-gebruikers
+        // die de OTA naar v79 ontvangen direct uitgelogd worden, zonder APK-rebuild).
+        // We vergelijken de huidige versie met de laatst gezien versie in localStorage.
+        // Mismatch → qe_user wissen vóór de auth-check, zodat showLogin() opkomt.
+        try {
+            const verRes = await fetch('version.json?_=' + Date.now());
+            const verJson = await verRes.json();
+            const currentVer = String(verJson.version || '');
+            const lastVer = localStorage.getItem('qe_last_seen_version');
+            const hasUser = !!localStorage.getItem('qe_user');
+            if (currentVer && hasUser && (lastVer == null || lastVer !== currentVer)) {
+                console.log('[App] OTA update gedetecteerd (v' + lastVer + ' → v' + currentVer + ') — forced logout');
+                try { localStorage.removeItem('qe_user'); } catch(_) {}
+            }
+            if (currentVer) {
+                try { localStorage.setItem('qe_last_seen_version', currentVer); } catch(_) {}
+            }
+        } catch(e) {
+            console.warn('[App] Versie-check faalde (geen OTA forced logout):', e && e.message);
+        }
+
+        // Check of er al een sessie is. De auth-check leest qe_user uit localStorage
+        // via api-bridge.js — als de OTA-detectie hierboven qe_user heeft gewist,
+        // valt deze automatisch terug op showLogin().
         try {
             const res = await fetch('api/auth.php?action=check');
             const data = await res.json();
@@ -175,7 +199,6 @@ const app = {
                 this.showLogin();
             }
         } catch (e) {
-            // Geen sessie of fout — toon login
             this.showLogin();
         }
 
@@ -4306,17 +4329,42 @@ const app = {
         const clockTime = QEClock.getClockTime();
         const isLate = QEClock.isLate();
 
-        if (isActive || clockTime) {
-            // Ingeklokt of al gescand vandaag
+        // v79: planning statusbar moet 4 staten kunnen tonen:
+        //   - Nog niet ingeklokt (NFC niet gescand vandaag)
+        //   - Ingeklokt (actief, hoofd-shift loopt)
+        //   - L&L actief (📦 prominent)
+        //   - Uitgeklokt (🏁 finish-vlag)
+        const llActive = session && session.llActive;
+        const llStartTxt = session && session.llStartTime ? session.llStartTime : '';
+        if (llActive) {
+            // L&L actief — krijgt voorrang in de statusbar
+            bar.style.cssText = 'display:block;padding:12px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer;' +
+                'background:linear-gradient(135deg,#e3f2fd,#bbdefb);border-left:4px solid #1565c0';
+            icon.textContent = '📦';
+            text.textContent = 'Bezig met Laden & Lossen';
+            text.style.color = '#0d47a1';
+            sub.textContent = llStartTxt ? ('Gestart om ' + llStartTxt) : 'Actief';
+            sub.style.color = '#1565c0';
+        } else if (isActive) {
+            // Ingeklokt (hoofd-shift)
             const lateClass = isLate ? 'background:linear-gradient(135deg,#fff3e0,#ffccbc)' : 'background:linear-gradient(135deg,#e8f5e9,#c8e6c9)';
             bar.style.cssText = `display:block;padding:12px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer;${lateClass}`;
             icon.textContent = isLate ? '⚠️' : '✅';
             const activeTag = QEClock.getActiveTagName();
             const cleanTag = this._publicRemark(activeTag);
-            text.textContent = isActive ? `Actief sinds ${session.startTime}` : `Ingeklokt om ${clockTime}`;
+            text.textContent = `Actief sinds ${session.startTime}`;
             text.style.color = isLate ? '#e65100' : '#2e7d32';
-            sub.textContent = isLate ? 'Te laat!' : (cleanTag || 'Uitgeklokt');
+            sub.textContent = isLate ? 'Te laat!' : (cleanTag || 'Ingeklokt');
             sub.style.color = isLate ? '#e65100' : '#2e7d32';
+        } else if (clockTime) {
+            // Uitgeklokt — 🏁 finish-vlag
+            bar.style.cssText = 'display:block;padding:12px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer;' +
+                'background:linear-gradient(135deg,#e8eaf6,#c5cae9);border-left:4px solid #001E45';
+            icon.textContent = '🏁';
+            text.textContent = `Uitgeklokt — ${clockTime}`;
+            text.style.color = '#001E45';
+            sub.textContent = 'Klaar voor vandaag';
+            sub.style.color = '#3f51b5';
         } else {
             // Nog niet ingeclockt
             const isLateNow = QEClock.isLate();
@@ -4383,6 +4431,16 @@ const app = {
         const bigText = document.getElementById('clockBigText');
         const bigTime = document.getElementById('clockBigTime');
 
+        // v78: L&L active block wordt onafhankelijk gerenderd, ook als main session inactief.
+        const llActiveHtml = session && session.llActive ? `
+            <div style="margin-top:10px;padding:14px 16px;background:#e3f2fd;border-left:4px solid #1565c0;border-radius:8px;display:flex;align-items:center;gap:12px">
+                <span style="font-size:28px">📦</span>
+                <div>
+                    <div style="font-size:15px;font-weight:700;color:#0d47a1">Bezig met Laden &amp; Lossen</div>
+                    <div style="font-size:12px;color:#1565c0;opacity:0.9;margin-top:2px">Gestart om ${session.llStartTime || '?'} — scan de L&amp;L tag opnieuw om te stoppen</div>
+                </div>
+            </div>` : '';
+
         if (isActive) {
             const isLate = session.registrationType === 'Te laat';
             const isLL = session.registrationType === 'Laden & Lossen';
@@ -4392,20 +4450,10 @@ const app = {
             const _cleanTag = this._publicRemark(session.tagName);
             bigTime.textContent = `${session.startTime} — ${_cleanTag}${isLate ? ' (te laat)' : ''}`;
 
-            // Verberg NFC instructie, toon actieve sessie
             document.getElementById('clockNfcCard').style.display = 'none';
             const activeEl = document.getElementById('clockActiveSession');
             if (activeEl) {
                 activeEl.style.display = 'block';
-                // v63: L&L actief indicator. session.llActive = lopende laden&lossen sub-sessie
-                const llActiveBlock = session.llActive ? `
-                    <div style="margin-top:10px;padding:10px 12px;background:#e3f2fd;border-left:3px solid #1565c0;border-radius:6px;display:flex;align-items:center;gap:10px">
-                        <span style="font-size:18px">📦</span>
-                        <div>
-                            <div style="font-size:13px;font-weight:600;color:#1565c0">Laden &amp; Lossen actief</div>
-                            <div style="font-size:11px;color:#1565c0;opacity:0.8">Gestart om ${session.llStartTime || '?'} — scan L&amp;L tag opnieuw om te stoppen</div>
-                        </div>
-                    </div>` : '';
                 document.getElementById('clockActiveContent').innerHTML = `
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
                         <h3 style="margin:0;font-size:16px;color:var(--qe-darkblue)">🔄 Actieve registratie</h3>
@@ -4416,7 +4464,7 @@ const app = {
                         <div><span style="font-size:12px;color:var(--qe-grey)">Locatie</span><br><span style="font-size:15px;font-weight:600">${this._publicRemark(session.tagName)}</span></div>
                     </div>
                     <p style="font-size:13px;color:var(--qe-grey);margin:0">Scan opnieuw een NFC tag om uit te clocken</p>
-                    ${llActiveBlock}
+                    ${llActiveHtml}
                 `;
             }
         } else {
@@ -4442,16 +4490,27 @@ const app = {
                         <div style="font-size:32px;margin-bottom:8px">📵</div>
                         <div style="font-size:15px;font-weight:600;margin-bottom:4px">NFC niet beschikbaar</div>
                         <div style="font-size:13px;color:var(--qe-grey)">Zet NFC aan in je telefoon-instellingen</div>
+                        ${llActiveHtml}
                     </div>`;
             } else {
                 nfcCard.innerHTML = `
                     <div style="font-size:32px;margin-bottom:8px">📱</div>
                     <div style="font-size:15px;font-weight:600;margin-bottom:4px">Houd je telefoon tegen de NFC tag</div>
-                    <div style="font-size:13px;color:var(--qe-grey)">Bureau, camionet of laden & lossen</div>`;
+                    <div style="font-size:13px;color:var(--qe-grey)">Bureau, camionet of laden & lossen</div>
+                    ${llActiveHtml}
+                `;
             }
-            // Verberg actieve sessie
+            // v78: actieve sessie card alleen tonen als L&L actief is (zonder main shift)
             const activeEl = document.getElementById('clockActiveSession');
-            if (activeEl) activeEl.style.display = 'none';
+            if (activeEl) {
+                if (session && session.llActive) {
+                    activeEl.style.display = 'block';
+                    document.getElementById('clockActiveContent').innerHTML = llActiveHtml ||
+                        '<p style="color:var(--qe-grey)">Geen actieve sessie</p>';
+                } else {
+                    activeEl.style.display = 'none';
+                }
+            }
         }
 
         // ── Voltooide sessies vandaag ──
@@ -5388,9 +5447,21 @@ const app = {
             // entry_start = max(Ingeklokt, startuur werknemer) afgerond op 5min als te laat.
             // entry_eind = Uitgeklokt afgerond op 5min. Pauze = werknemer-veld.
             // Geen per-werkbon time-entries fetch (zou rate-limit triggeren).
+            // v76: fetch time-entries per werkbon (max 31 dagen × ~1 werkbon = haalbaar
+            // binnen rate-limit). Resultaat cached in teByWoId. Toont L&L cycli + uren.
             const teByWoId = {};
+            for (const wo of workOrders) {
+                try {
+                    const teRes = await RobawsAPI.get(`work-orders/${wo.id}/time-entries?limit=100`);
+                    if (teRes.code === 200 && teRes.data && teRes.data.items) {
+                        teByWoId[wo.id] = teRes.data.items;
+                    }
+                } catch(_) { /* skip */ }
+            }
             const m = (s) => { const x = String(s||'').match(/^(\d{1,2}):(\d{1,2})/); return x ? (+x[1])*60 + (+x[2]) : 0; };
-            const round5m = (mins) => Math.round(mins / 5) * 5;
+            // v74: kwartier-afronding (in=up, uit=down)
+            const roundUp15 = (mins) => Math.ceil(mins / 15) * 15;
+            const roundDown15 = (mins) => Math.floor(mins / 15) * 15;
             // Haal pauze + startuur 1x van ingelogde user
             let userStartuurMin = 7 * 60;  // 07:00 default
             let userPauze = 60;
@@ -5417,12 +5488,8 @@ const app = {
                 const outS = ef.Uitgeklokt && ef.Uitgeklokt.stringValue;
                 if (!inS || !outS) return 0;
 
-                // v71: parse de werkbon-remark voor multiple klok-in/klok-uit cycli.
-                // Format: "klok-in: tag — gps — HH:MM\nklok-uit: ... — HH:MM" repeating.
-                // Voorbeeld dag met pauze tussen 12:00-13:00:
-                //   klok-in 06:45, klok-uit 12:00, klok-in 13:00, klok-uit 17:00 = 9.25u
-                // i.p.v. naïef 17:00 - 06:45 = 10.25u (- 60 pauze = 9.25 — toevallig OK,
-                // maar bij langere gaps gaat het mis).
+                // v74: kwartier-afronding. In = round UP 15min (Bureau: max met startuur).
+                //       Uit = round DOWN 15min. Geldig voor multi-cycle dagen ook.
                 let totalMins = 0;
                 const lines = String(wo.remark || '').split(/\r?\n/);
                 const cycles = [];
@@ -5437,21 +5504,21 @@ const app = {
                     }
                 }
                 if (cycles.length > 0) {
-                    // Toepassen: alleen op eerste cyclus startuur-correctie wanneer scan
-                    // voor startuur, voor andere cycli round5(actual). End altijd round5.
-                    let bureauApplied = false;  // alleen bij eerste cycle
                     for (let i = 0; i < cycles.length; i++) {
                         let [s, e] = cycles[i];
-                        const sMin = (i === 0 && s <= userStartuurMin) ? userStartuurMin : round5m(s);
-                        const eMin = round5m(e);
+                        // Eerste cycle: max(roundUp15, startuur). Andere: roundUp15.
+                        const sMin = (i === 0)
+                            ? Math.max(roundUp15(s), userStartuurMin)
+                            : roundUp15(s);
+                        const eMin = roundDown15(e);
                         if (eMin > sMin) totalMins += (eMin - sMin);
                     }
                     totalMins -= userPauze;
                 } else {
-                    // Geen cycli geparseerd (oudere werkbonnen) → fallback op Ingeklokt/Uitgeklokt
+                    // Fallback voor oudere werkbonnen (zonder klok-in/-uit regels)
                     const inMin = m(inS);
-                    const outMin = round5m(m(outS));
-                    const startMin = inMin <= userStartuurMin ? userStartuurMin : round5m(inMin);
+                    const outMin = roundDown15(m(outS));
+                    const startMin = Math.max(roundUp15(inMin), userStartuurMin);
                     totalMins = outMin - startMin - userPauze;
                 }
                 if (totalMins <= 0) return 0;
@@ -5525,16 +5592,23 @@ const app = {
                                 typeIcon = '✅'; typeBg = '#f1f8e9'; typeColor = '#2e7d32'; break;
                         }
 
-                        // L&L badge tonen als er een time-entry is met L&L articleId
+                        // v76: L&L badge + extra info — toont aantal L&L cycli en totale uren
                         const teList = teByWoId[wo.id] || [];
-                        const hasLL = teList.some(te => {
+                        const llArtId = String(RobawsAPI.WERKUUR_ARTICLE_IDS.ladenLossen);
+                        const llEntries = teList.filter(te => {
                             const aId = te.articleId || (te.article && te.article.id);
-                            return String(aId) === String(RobawsAPI.WERKUUR_ARTICLE_IDS.ladenLossen);
+                            return String(aId) === llArtId;
                         });
+                        const hasLL = llEntries.length > 0;
+                        let llHours = 0;
+                        for (const te of llEntries) llHours += parseFloat(te.hours || 0);
 
                         // v67: GPS-link verbergen voor werknemer (zit alleen in werkbon-remark voor kantoor)
                         const gpsLink = '';
-                        const llBadge = hasLL ? '<span style="font-size:10px;background:#e3f2fd;color:#1565c0;padding:2px 6px;border-radius:8px;margin-left:6px">📦 L&amp;L</span>' : '';
+                        const llBadge = hasLL
+                            ? '<span style="font-size:10px;background:#e3f2fd;color:#1565c0;padding:2px 6px;border-radius:8px;margin-left:6px">📦 ' +
+                              llEntries.length + '× L&amp;L · ' + llHours.toFixed(2) + 'u</span>'
+                            : '';
 
                         // v64: kaartje opent het aanpassing-aanvraag scherm
                         html += `<div class="card" style="padding:12px 14px;margin-bottom:6px;background:${typeBg};cursor:pointer" onclick="app.openAanpassing('${wo.id}')">

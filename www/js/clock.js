@@ -770,26 +770,24 @@ window.QEClock = {
 
         const actualStartMin = toMinutes(session.startTime);
         const expectedStartMin = toMinutes(expectedStart);
-        let entryStartMin;
-        // v70: startuur-correctie ALLEEN bij Bureau-scan. Bij camionet/L&L
-        // scan wordt entry_start gewoon afgerond op 5min (de werknemer is
-        // dan al onderweg/aan het werk, niet meer afhankelijk van startuur).
+        // v74: kwartier-afronding voor werknemer-uren.
+        //  - Clock-in: round UP naar volgend kwartier (6:02 → 6:15, 6:31 → 6:45)
+        //  - Bureau-scan: max(round_up_15(actual), startuur werknemer) — kan nooit voor startuur
+        //  - Camionet-scan: gewoon round_up_15(actual)
+        const roundUp15 = (mins) => Math.ceil(mins / 15) * 15;
+        const roundDown15 = (mins) => Math.floor(mins / 15) * 15;
         const useStartuurCorrection = (session.tagType === 'bureau');
-        if (useStartuurCorrection && actualStartMin <= expectedStartMin) {
-            // Vroeg ingeklokt op kantoor -> startuur werknemer gebruiken
-            entryStartMin = expectedStartMin;
-        } else if (useStartuurCorrection) {
-            // Te laat op kantoor -> afgerond op 5 min
-            entryStartMin = round5(actualStartMin);
+        let entryStartMin;
+        if (useStartuurCorrection) {
+            entryStartMin = Math.max(roundUp15(actualStartMin), expectedStartMin);
         } else {
-            // Camionet of L&L -> altijd actual start, afgerond op 5 min
-            entryStartMin = round5(actualStartMin);
+            entryStartMin = roundUp15(actualStartMin);
         }
-        const entryEndMin = round5(toMinutes(endTimeRaw));
+        const entryEndMin = roundDown15(toMinutes(endTimeRaw));  // v74: round DOWN naar kwartier
         const entryStart = fromMinutes(entryStartMin);
         const entryEnd = fromMinutes(entryEndMin);
 
-        console.log('[Clock] time-entry tijden:',
+        console.log('[Clock] time-entry tijden (v74 kwartier-afronding):',
             'startuur=' + expectedStart,
             'actual=' + session.startTime + '/' + endTimeRaw,
             '-> entry ' + entryStart + ' -> ' + entryEnd,
@@ -813,9 +811,12 @@ window.QEClock = {
         }
         const klokUitLine = `klok-uit: ${tag.name} \u2014 ${outGpsText} \u2014 ${endTimeRaw}`;
 
-        // 1. Update Uitgeklokt op werkbon (afgerond eind) + remark-append
+        // v77: Uitgeklokt-veld krijgt EXACTE klok-tijd (endTimeRaw), niet de
+        // afgeronde tijd. De afgeronde tijd zit in de werknemer-uren rij
+        // (time-entry endTime). Zo zie je in de werkbon zowel de werkelijke
+        // scan-tijd als de betaalde uren.
         try {
-            await RobawsAPI.setTimeRegistrationUitgeklokt(session.workOrderId, entryEnd, klokUitLine);
+            await RobawsAPI.setTimeRegistrationUitgeklokt(session.workOrderId, endTimeRaw, klokUitLine);
         } catch(e) {
             console.warn('[Clock] Uitgeklokt update faalde:', e.message);
         }
@@ -881,60 +882,82 @@ window.QEClock = {
     },
 
     // =============================================
-    // LADEN & LOSSEN (v58: aparte time-entry op vandaag's werkbon)
+    // LADEN & LOSSEN (v73: time-entry direct posten bij start)
     // =============================================
 
     async _handleLadenLossen(session, tag) {
         const now = await this._getNow();
         const time = this._localTime(now);
 
-        // Geval 1: er is al een lopende L&L sub-sessie -> stop hem en post time-entry
+        const round5 = (mins) => Math.round(mins / 5) * 5;
+        const toMinutes = (hhmm) => {
+            const m = String(hhmm || '').match(/^(\d{1,2}):(\d{1,2})/);
+            if (!m) return 0;
+            return (parseInt(m[1], 10) || 0) * 60 + (parseInt(m[2], 10) || 0);
+        };
+        const fromMinutes = (mins) => {
+            const h = Math.floor(mins / 60) % 24;
+            const m = mins % 60;
+            return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+        };
+
+        // Geval 1: lopende L&L → afsluiten via PUT op de open time-entry.
         if (session.llActive) {
             const llStart = session.llStartTime;
-            // Eind: afgerond op 5 min
-            const round5 = (mins) => Math.round(mins / 5) * 5;
-            const toMinutes = (hhmm) => {
-                const m = String(hhmm || '').match(/^(\d{1,2}):(\d{1,2})/);
-                if (!m) return 0;
-                return (parseInt(m[1], 10) || 0) * 60 + (parseInt(m[2], 10) || 0);
-            };
-            const fromMinutes = (mins) => {
-                const h = Math.floor(mins / 60) % 24;
-                const m = mins % 60;
-                return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
-            };
-            const llEnd = fromMinutes(round5(toMinutes(time)));
-            // Start van L&L gebruiken we letterlijk (nooit voor verwacht startuur,
-            // want L&L is ad-hoc tijdens werkdag). Indien fractie van 5min, ook ronden.
-            const llStartRounded = fromMinutes(round5(toMinutes(llStart)));
-
+            // v76: L&L duur altijd naar BOVEN afgerond op kwartier, minimum 15 min.
+            // Werknemer krijgt voor 7 min laden toch een volle kwartier.
+            const startMinRaw = toMinutes(llStart);
+            const endMinRaw = toMinutes(time);
+            const actualDuration = Math.max(0, endMinRaw - startMinRaw);
+            const billableDuration = Math.max(15, Math.ceil(actualDuration / 15) * 15);
+            // Start blijft op 5 min afgerond (dichtbij de werkelijkheid).
+            // End = start + billable_duration (zo blijft het kwartier-veelvoud).
+            const startMinForDisplay = round5(startMinRaw);
+            const endMinForDisplay = startMinForDisplay + billableDuration;
+            const llEnd = fromMinutes(endMinForDisplay);
+            const llStartRounded = fromMinutes(startMinForDisplay);
             try {
-                const r = await RobawsAPI.addWorkHoursTimeEntry({
-                    workOrderId: session.workOrderId,
-                    employeeId: session.employeeId,
-                    startTime: llStartRounded,
-                    endTime: llEnd,
-                    breakMinutes: 0,
-                    articleId: RobawsAPI.WERKUUR_ARTICLE_IDS.ladenLossen,
-                });
-                if (r.code !== 200 && r.code !== 201) {
-                    console.warn('[Clock] L&L time-entry POST faalde:', r.code, r.data);
-                    return {
-                        ok: false,
-                        message: 'L&L registreren mislukt (' + r.code + ')',
-                        refresh: true,
-                    };
+                if (session.llActiveTeId) {
+                    // v73: PUT update met endTime
+                    const r = await RobawsAPI.closeOpenLLTimeEntry(
+                        session.workOrderId, session.llActiveTeId,
+                        { startTime: llStartRounded, endTime: llEnd }
+                    );
+                    if (r.code !== 200 && r.code !== 201 && r.code !== 204) {
+                        console.warn('[Clock] L&L PUT faalde:', r.code, r.data,
+                            '— fallback POST nieuwe time-entry');
+                        // Fallback: post een nieuwe complete entry
+                        await RobawsAPI.addWorkHoursTimeEntry({
+                            workOrderId: session.workOrderId,
+                            employeeId: session.employeeId,
+                            startTime: llStartRounded,
+                            endTime: llEnd,
+                            breakMinutes: 0,
+                            articleId: RobawsAPI.WERKUUR_ARTICLE_IDS.ladenLossen,
+                        });
+                    }
+                } else {
+                    // Geen teId bekend (vroeger gestart vóór v73) → post een nieuwe
+                    await RobawsAPI.addWorkHoursTimeEntry({
+                        workOrderId: session.workOrderId,
+                        employeeId: session.employeeId,
+                        startTime: llStartRounded,
+                        endTime: llEnd,
+                        breakMinutes: 0,
+                        articleId: RobawsAPI.WERKUUR_ARTICLE_IDS.ladenLossen,
+                    });
                 }
             } catch(e) {
-                console.error('[Clock] L&L POST exception:', e.message);
+                console.error('[Clock] L&L close exception:', e.message);
                 return {
                     ok: false,
-                    message: 'L&L mislukt:\n' + e.message,
+                    message: 'L&L afsluiten mislukt:\n' + e.message,
                     refresh: false,
                 };
             }
 
             session.llActive = false;
+            session.llActiveTeId = null;
             session.llEntries = session.llEntries || [];
             session.llEntries.push({ startTime: llStartRounded, endTime: llEnd });
             session.llStartTime = null;
@@ -948,8 +971,8 @@ window.QEClock = {
             };
         }
 
-        // Geval 2: nieuwe L&L sub-sessie starten. Vereist een werkbon — als er
-        // nog geen is voor vandaag (eerste scan v.d. dag is L&L) maken we hem aan.
+        // Geval 2: nieuwe L&L sub-sessie starten.
+        // Eerst zorgen dat er een werkbon van vandaag is.
         if (!session.workOrderId) {
             const currentUser = RobawsAPI.getLoggedInUser();
             const empId = currentUser ? String(currentUser.robawsEmployeeId) : session.employeeId;
@@ -957,7 +980,7 @@ window.QEClock = {
             const userId = currentUser ? currentUser.robawsUserId : null;
             let gpsText = '';
             try {
-                const pos = await this._getGPS();
+                const pos = await this._getGPS({ timeoutMs: 3000, maximumAge: 60000 });
                 gpsText = `https://maps.google.com/?q=${pos.latitude.toFixed(6)},${pos.longitude.toFixed(6)}`;
             } catch(_) { gpsText = 'GPS niet beschikbaar'; }
             try {
@@ -968,7 +991,7 @@ window.QEClock = {
                     dateStr: this._localDate(),
                     ingeklokt: time,
                     tijdLabel: 'Op tijd',
-                    opmerking: `Laden & Lossen - ${gpsText}`,
+                    opmerking: `klok-in: Laden & Lossen \u2014 ${gpsText} \u2014 ${time}`,
                 });
                 session.workOrderId = wo.workOrderId;
                 session.employeeId = empId;
@@ -977,6 +1000,7 @@ window.QEClock = {
                 session.tagType = 'laden_lossen';
                 session.tagName = 'Laden & Lossen';
                 session.onTimeLabel = 'Op tijd';
+                session.registrationType = 'Op tijd';
             } catch(e) {
                 return {
                     ok: false,
@@ -986,14 +1010,42 @@ window.QEClock = {
             }
         }
 
+        // v73: POST direct een open L&L time-entry met afgeronde startTime
+        const llStartRounded = fromMinutes(round5(toMinutes(time)));
+        let teId = null;
+        try {
+            teId = await RobawsAPI.postOpenLLTimeEntry({
+                workOrderId: session.workOrderId,
+                employeeId: session.employeeId,
+                startTime: llStartRounded,
+            });
+        } catch(e) {
+            console.error('[Clock] L&L start POST exception:', e.message);
+            return {
+                ok: false,
+                message: 'L&L starten mislukt:\n' + e.message,
+                refresh: false,
+            };
+        }
+
+        // v73: zet session.active = true zodat UI in actief-branch komt en
+        // het L&L-actief blok zichtbaar wordt. Hoofd-werkdag-state blijft
+        // intact als die al actief was.
+        if (!session.active) {
+            session.active = true;
+            session.startTime = session.startTime || llStartRounded;
+            session.startISO = session.startISO || now.toISOString();
+        }
+
         session.llActive = true;
-        session.llStartTime = time;
+        session.llActiveTeId = teId;
+        session.llStartTime = llStartRounded;
         session.llStartISO = now.toISOString();
         this._saveSession(session);
 
         return {
             ok: true,
-            message: 'Laden & Lossen gestart om ' + time,
+            message: 'Laden & Lossen gestart om ' + llStartRounded,
             refresh: true,
         };
     },
@@ -1343,9 +1395,50 @@ window.QEClock = {
             }];
         }
 
+        // v77: detecteer open L&L time-entry. Een entry is "open" als:
+        //   (a) endTime is null/ontbreekt, OF
+        //   (b) endTime is {hour:0, minute:0} EN hours is 0
+        // Dit voorkomt dat een midnight-entry of een net-aangemaakte open entry
+        // ten onrechte als afgesloten wordt beschouwd.
+        try {
+            const teRes = await RobawsAPI.get(`work-orders/${wo.id}/time-entries?limit=100`);
+            if (teRes.code === 200 && teRes.data && teRes.data.items) {
+                const llArt = String(RobawsAPI.WERKUUR_ARTICLE_IDS.ladenLossen);
+                const llItems = teRes.data.items.filter(te => {
+                    const aId = te.articleId || (te.article && te.article.id);
+                    return String(aId) === llArt;
+                });
+                console.log('[Clock] L&L detect: found', llItems.length, 'L&L entries op werkbon', wo.id);
+                const openLL = llItems.find(te => {
+                    const ee = te.endTime;
+                    const eeIsNull = !ee || (ee.hour == null && ee.minute == null);
+                    const eeIsZero = ee && ee.hour === 0 && ee.minute === 0;
+                    const hoursZero = !te.hours || parseFloat(te.hours) === 0;
+                    return eeIsNull || (eeIsZero && hoursZero);
+                });
+                if (openLL) {
+                    session.llActive = true;
+                    session.llActiveTeId = openLL.id;
+                    if (openLL.startTime && (openLL.startTime.hour != null)) {
+                        session.llStartTime = String(openLL.startTime.hour).padStart(2,'0') +
+                            ':' + String(openLL.startTime.minute || 0).padStart(2,'0');
+                    }
+                    console.log('[Clock] L&L ACTIEF gedetecteerd: te#' + openLL.id +
+                        ' start=' + session.llStartTime);
+                } else {
+                    session.llActive = false;
+                    session.llActiveTeId = null;
+                    session.llStartTime = null;
+                }
+            }
+        } catch(e) {
+            console.warn('[Clock] L&L detectie mislukt:', e.message);
+        }
+
         this._saveSession(session);
         console.log('[Clock] Sessie gesynced vanuit Robaws-werkbon', wo.id,
-            '— actief:', isActive, ', start:', ingeklokt, ', eind:', uitgeklokt);
+            '— actief:', isActive, ', start:', ingeklokt, ', eind:', uitgeklokt,
+            ', L&L actief:', !!session.llActive);
     },
 
     // =============================================
