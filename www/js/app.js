@@ -821,24 +821,42 @@ const app = {
     },
 
     // ========================================
-    // DATE STRIP — alleen vandaag en morgen
+    // DATE STRIP — vandaag en volgende werkdag (weekend skippen)
     // ========================================
     buildDateStrip() {
         const strip = document.getElementById('dateStrip');
         const today = new Date();
-        const tomorrow = new Date(today);
-        tomorrow.setDate(today.getDate() + 1);
+
+        // v92+: skip weekend voor "volgende werkdag"
+        //   - vrijdag → maandag (3 dagen verder)
+        //   - zaterdag → maandag (2 dagen verder)
+        //   - zondag → maandag (1 dag verder)
+        //   - andere dagen → +1 dag
+        const next = new Date(today);
+        next.setDate(today.getDate() + 1);
+        while (next.getDay() === 0 || next.getDay() === 6) {
+            next.setDate(next.getDate() + 1);
+        }
 
         const days = ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'];
         const months = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
 
-        const dates = [today, tomorrow];
+        const dates = [today, next];
+
+        // Bepaal het label voor de "volgende werkdag" — afhankelijk van of het morgen
+        // letterlijk is, of een andere weekdag (bv. ma als het vandaag vr is)
+        const tomorrowReal = new Date(today);
+        tomorrowReal.setDate(today.getDate() + 1);
+        const nextIsRealTomorrow = next.toDateString() === tomorrowReal.toDateString();
+        const dayNames = ['Zondag', 'Maandag', 'Dinsdag', 'Woensdag', 'Donderdag', 'Vrijdag', 'Zaterdag'];
 
         strip.innerHTML = dates.map(d => {
             const dateStr = this._localDateStr(d);
             const isToday = d.toDateString() === today.toDateString();
             const isActive = d.toDateString() === this.currentDate.toDateString();
-            const label = isToday ? 'Vandaag' : 'Morgen';
+            const label = isToday
+                ? 'Vandaag'
+                : (nextIsRealTomorrow ? 'Morgen' : dayNames[d.getDay()]);
 
             return `
                 <div class="date-chip ${isActive ? 'active' : ''} ${isToday ? 'today' : ''}"
@@ -2066,8 +2084,93 @@ const app = {
         document.getElementById('materialSearchResults').style.display = 'none';
         this.renderMaterials();
         this.toast(`${article.name} toegevoegd`);
-        // Bijhouden voor veelgebruikte materialen
-        this._trackFavoriteMaterial(article);
+        // Bijhouden voor veelgebruikte materialen (custom-artikels niet)
+        if (!article.isCustom) this._trackFavoriteMaterial(article);
+    },
+
+    /**
+     * v93: Open modal om een EENMALIG artikel toe te voegen aan de werkbon.
+     * Het artikel bestaat (nog) niet in Robaws — bij submit wordt automatisch
+     * een taak voor Felicity (userId 6) aangemaakt met de details.
+     */
+    openCustomArticleModal() {
+        if (!this.currentWO) { this.toast('Geen werkbon actief'); return; }
+
+        let m = document.getElementById('customArticleModal');
+        if (m) m.remove();
+        m = document.createElement('div');
+        m.id = 'customArticleModal';
+        m.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:99998;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
+
+        const card = document.createElement('div');
+        card.style.cssText = 'background:#fff;border-radius:16px;max-width:420px;width:100%;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.3);box-sizing:border-box';
+
+        card.innerHTML =
+            '<div style="font-size:18px;font-weight:700;color:#1A237E;margin-bottom:6px">✏️ Eenmalig artikel</div>' +
+            '<div style="font-size:12px;color:#666;margin-bottom:16px">Voor artikels die nog niet in Robaws staan. Felicity krijgt een taakje om het artikel aan te maken.</div>' +
+            '<div style="margin-bottom:12px">' +
+                '<label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Omschrijving</label>' +
+                '<input id="caDesc" type="text" placeholder="Bijv. Speciale flens 50mm" autocomplete="off" ' +
+                'style="width:100%;padding:12px;font-size:15px;border:2px solid #cfd8dc;border-radius:10px;box-sizing:border-box">' +
+            '</div>' +
+            '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">' +
+                '<div>' +
+                    '<label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Verkoopprijs (€)</label>' +
+                    '<input id="caPrice" type="number" step="0.01" min="0" value="0" ' +
+                    'style="width:100%;padding:12px;font-size:15px;border:2px solid #cfd8dc;border-radius:10px;box-sizing:border-box;text-align:center">' +
+                '</div>' +
+                '<div>' +
+                    '<label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Aantal</label>' +
+                    '<input id="caQty" type="number" step="0.01" min="0.01" value="1" ' +
+                    'style="width:100%;padding:12px;font-size:15px;border:2px solid #cfd8dc;border-radius:10px;box-sizing:border-box;text-align:center">' +
+                '</div>' +
+            '</div>' +
+            '<div id="caError" style="font-size:12px;color:#c62828;margin-bottom:8px;display:none"></div>' +
+            '<button id="caSubmit" style="width:100%;padding:14px;background:#E65100;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;margin-bottom:8px">' +
+                'Toevoegen' +
+            '</button>' +
+            '<button id="caCancel" style="width:100%;padding:12px;background:#f5f5f5;color:#444;border:none;border-radius:10px;font-size:14px;cursor:pointer">Annuleren</button>';
+
+        m.appendChild(card);
+        document.body.appendChild(m);
+
+        const descEl = document.getElementById('caDesc');
+        const priceEl = document.getElementById('caPrice');
+        const qtyEl = document.getElementById('caQty');
+        const errEl = document.getElementById('caError');
+
+        setTimeout(() => { try { descEl.focus(); } catch(_) {} }, 100);
+
+        document.getElementById('caSubmit').addEventListener('click', () => {
+            const desc = (descEl.value || '').trim();
+            const price = parseFloat(priceEl.value) || 0;
+            const qty = parseFloat(qtyEl.value) || 1;
+            if (!desc) {
+                errEl.textContent = 'Omschrijving is verplicht';
+                errEl.style.display = 'block';
+                return;
+            }
+            if (price <= 0) {
+                errEl.textContent = 'Verkoopprijs moet groter dan 0 zijn';
+                errEl.style.display = 'block';
+                return;
+            }
+            const data = this.woData[this.currentWO.id];
+            data.materials = data.materials || [];
+            data.materials.push({
+                id: '__custom_' + Date.now() + '_' + Math.floor(Math.random() * 1000),
+                name: desc,
+                salePrice: price,
+                unitPrice: price,
+                quantity: qty,
+                unit: 'stuk',
+                isCustom: true,
+            });
+            m.remove();
+            this.renderMaterials();
+            this.toast('✏️ Eenmalig artikel toegevoegd — Felicity krijgt taak bij verzenden');
+        });
+        document.getElementById('caCancel').addEventListener('click', () => m.remove());
     },
 
     // Veelgebruikte materialen bijhouden in localStorage
@@ -3770,7 +3873,9 @@ const app = {
             date: this._localDateStr(this.currentDate),
             // Regie-vinkje overnemen van de sales order (niet hardcoded true)
             timeAndMaterial: this.currentWO.timeAndMaterial ?? false,
-            materials: data.materials.map(m => ({
+            // v93: filter eenmalige artikels uit — die hebben geen Robaws articleId.
+            // Felicity krijgt taakje om die zelf toe te voegen.
+            materials: data.materials.filter(m => !m.isCustom).map(m => ({
                 articleId: m.id,
                 name: m.name,
                 quantity: m.quantity,
@@ -3889,6 +3994,49 @@ const app = {
 
             const workOrderId = werkbonResult.workOrderId;
 
+            // v93/v94: Eenmalige artikels → toevoegen als line-item op WERKBON (zonder articleId)
+            // + taak voor Felicity (userId 6) zodat zij het echte artikel in Robaws aanmaakt.
+            const customArticles = (data.materials || []).filter(m => m.isCustom);
+            if (customArticles.length > 0 && workOrderId) {
+                for (const m of customArticles) {
+                    try {
+                        const li = {
+                            type: 'LINE',
+                            description: m.name || 'Eenmalig artikel',
+                            quantity: parseFloat(m.quantity || 1),
+                            price: parseFloat(m.salePrice || m.unitPrice || 0),
+                        };
+                        const r = await RobawsAPI.post(`work-orders/${workOrderId}/line-items`, li);
+                        if (r.code !== 200 && r.code !== 201) {
+                            console.warn('[App] custom article werkbon line-item POST faalde:', r.code, r.data);
+                        } else {
+                            console.log('[App] custom article toegevoegd aan werkbon:', m.name);
+                        }
+                    } catch (e) {
+                        console.warn('[App] custom article werkbon line-item exception:', e && e.message);
+                    }
+                }
+                // Felicity-taak
+                try {
+                    const lines = customArticles.map(m => {
+                        const price = parseFloat(m.salePrice || m.unitPrice || 0).toFixed(2);
+                        const qty = parseFloat(m.quantity || 1);
+                        return `• ${m.name} — ${qty}× à €${price}`;
+                    });
+                    const desc = 'Eenmalige artikels op deze werkbon — gelieve het echte artikel ' +
+                        'in Robaws aan te maken en de line-item op werkbon + factuur te corrigeren.' +
+                        '\n\n' + lines.join('\n');
+                    await RobawsAPI.createTaskForWorkOrder(workOrderId, {
+                        title: '✏️ Eenmalig artikel toevoegen aan Robaws',
+                        description: desc,
+                        assignedUserId: 6, // Felicity
+                    });
+                    console.log('[App] Felicity-taak aangemaakt voor', customArticles.length, 'eenmalige artikels');
+                } catch (e) {
+                    console.warn('[App] Felicity-taak aanmaken mislukt (niet kritiek):', e && e.message);
+                }
+            }
+
             // === STAP 2: Foto's + handtekening ===
             await this._uploadPhotosAndSignature(data, workOrderId, signatureName, signatureData);
 
@@ -3906,7 +4054,8 @@ const app = {
                 userId: this.currentUser.robawsUserId,
                 installationIds: this.currentWO.installationIds || [],
                 // Materialen direct meesturen (WO material-entries ≠ line-items in Robaws)
-                materials: data.materials.map(m => ({
+                // v93: filter custom-artikels uit — Felicity-taak handelt die af.
+                materials: data.materials.filter(m => !m.isCustom).map(m => ({
                     articleId: m.id,
                     name: m.name,
                     quantity: m.quantity || 1,
@@ -3945,6 +4094,34 @@ const app = {
             // Waarschuw als er line-item fouten waren
             if (invoiceResult.errors && invoiceResult.errors.length > 0) {
                 console.warn('[Factuur] Errors bij toevoegen lijnen:', invoiceResult.errors);
+            }
+
+            // v94: Eenmalige artikels ook toevoegen als line-item op de FACTUUR
+            // (zonder articleId — Felicity corrigeert later naar het echte artikel).
+            const customArticlesForInvoice = (data.materials || []).filter(m => m.isCustom);
+            const invoiceId = (invoiceResult && invoiceResult.invoice && invoiceResult.invoice.id) || null;
+            if (customArticlesForInvoice.length > 0 && invoiceId) {
+                const vatTariffId = this.currentWO.vatTariffId || '4';
+                for (const m of customArticlesForInvoice) {
+                    try {
+                        const li = {
+                            type: 'LINE',
+                            description: m.name || 'Eenmalig artikel',
+                            quantity: parseFloat(m.quantity || 1),
+                            price: parseFloat(m.salePrice || m.unitPrice || 0),
+                            vatTariffId: String(vatTariffId),
+                        };
+                        if (this.currentWO.salesOrderId) li.orderId = String(this.currentWO.salesOrderId);
+                        const r = await RobawsAPI.post(`sales-invoices/${invoiceId}/line-items`, li);
+                        if (r.code !== 200 && r.code !== 201) {
+                            console.warn('[App] custom article factuur line-item POST faalde:', r.code, r.data);
+                        } else {
+                            console.log('[App] custom article toegevoegd aan factuur:', m.name);
+                        }
+                    } catch (e) {
+                        console.warn('[App] custom article factuur line-item exception:', e && e.message);
+                    }
+                }
             }
 
             this._markWOSubmitted(data);
@@ -5648,8 +5825,20 @@ const app = {
             }
             const m = (s) => { const x = String(s||'').match(/^(\d{1,2}):(\d{1,2})/); return x ? (+x[1])*60 + (+x[2]) : 0; };
             // v74: kwartier-afronding (in=up, uit=down)
-            const roundUp15 = (mins) => Math.ceil(mins / 15) * 15;
-            const roundDown15 = (mins) => Math.floor(mins / 15) * 15;
+            // v94+: TOLERANTIE van 4 minuten — moet identiek zijn aan clock.js zodat
+            // de getoonde uren overeenkomen met wat naar Robaws gestuurd wordt.
+            const TOLERANCE = 4;
+            const roundUp15 = (mins) => {
+                const rem = mins % 15;
+                if (rem > 0 && rem <= TOLERANCE) return mins - rem;
+                return Math.ceil(mins / 15) * 15;
+            };
+            const roundDown15 = (mins) => {
+                const rem = mins % 15;
+                const distUpper = (15 - rem) % 15;
+                if (distUpper > 0 && distUpper <= TOLERANCE) return mins + distUpper;
+                return Math.floor(mins / 15) * 15;
+            };
             // Haal pauze + startuur 1x van ingelogde user
             let userStartuurMin = 7 * 60;  // 07:00 default
             let userPauze = 60;
@@ -6074,32 +6263,92 @@ const app = {
             const days = ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'];
             const months = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
 
-            // v88: Eén "Laatste betaling" knop bovenaan — klik opent modal met 4 betaalmethoden
-            // (zodat Olivier kan switchen na een Viva-fout).
+            // v88/v92: "Laatste betaling" knop bovenaan. v92 fetcht ALTIJD uit Robaws —
+            // de laatste factuur met status "Technieker" of "Gecontrolleerd" en
+            // assignedUser = ingelogde technieker. Onafhankelijk van localStorage.
             let paymentBtns = '';
             try {
-                const ctxRaw = localStorage.getItem('qe_last_payment_context');
-                if (ctxRaw) {
-                    const ctx = JSON.parse(ctxRaw);
-                    const inv = (ctx.invoiceResult && ctx.invoiceResult.invoice) || {};
+                const user = RobawsAPI.getLoggedInUser();
+                const userId = user && (user.robawsUserId || user.userId);
+                let inv = null;
+                if (userId) {
+                    inv = await RobawsAPI.getLatestInvoiceForUser(userId);
+                }
+                if (inv) {
+                    // Linked werkbon + order ophalen voor change-method flow
+                    const linked = await RobawsAPI.getInvoiceLinkedDocs(inv.id);
+                    const betField = (inv.extraFields && inv.extraFields.Betaling) || null;
+                    const method = (betField && betField.stringValue) || 'Onbekend';
                     const amount = parseFloat(inv.totalInclVat || 0).toFixed(2);
-                    const method = ctx.paymentMethod || '?';
+                    const logicId = inv.logicId || '';
+
+                    // qe_last_payment_context bijwerken zodat changeLastPaymentMethod het pakt
+                    try {
+                        const ctx = {
+                            workOrderId: linked.workOrderId,
+                            salesOrderId: linked.salesOrderId,
+                            invoiceId: String(inv.id),
+                            invoiceLogicId: logicId,
+                            paymentMethod: method,
+                            invoiceResult: {
+                                invoice: {
+                                    id: String(inv.id),
+                                    logicId: logicId,
+                                    totalInclVat: inv.totalInclVat,
+                                    paymentInstruction: inv.paymentInstruction,
+                                    formattedOgm: this._formatOgm(inv.paymentInstruction),
+                                },
+                                payment: {
+                                    amount: inv.totalInclVat,
+                                    ogm: inv.paymentInstruction,
+                                    formattedOgm: this._formatOgm(inv.paymentInstruction),
+                                },
+                            },
+                            timestamp: Date.now(),
+                        };
+                        localStorage.setItem('qe_last_payment_context', JSON.stringify(ctx));
+                    } catch(_) {}
+
                     const methodIcon = method === 'Viva wallet' ? '💳'
                         : method === 'Cash' ? '💵'
                         : method.startsWith('Overschrijving') ? '🏦'
-                        : '📋';
+                        : method === 'Via factuur' ? '📋'
+                        : '💼';
                     paymentBtns = `
                         <div class="card" style="margin-bottom:12px;background:linear-gradient(135deg, rgba(21,101,192,0.08), rgba(46,125,50,0.08));border-left:4px solid #1565C0;cursor:pointer" onclick="app.openChangePaymentMethodModal()">
                             <div style="display:flex;align-items:center;justify-content:space-between">
                                 <div style="flex:1">
                                     <div style="font-size:14px;font-weight:700;color:#1565C0">${methodIcon} Laatste betaling: ${method}</div>
-                                    <div style="font-size:12px;color:var(--qe-grey);margin-top:3px">Factuur ${ctx.invoiceLogicId || inv.logicId || ''} — € ${amount}</div>
+                                    <div style="font-size:12px;color:var(--qe-grey);margin-top:3px">Factuur ${logicId} — € ${amount}</div>
                                     <div style="font-size:11px;color:#1565C0;margin-top:4px;font-weight:600">Tik om te openen of betalingsmethode aan te passen →</div>
                                 </div>
                             </div>
                         </div>`;
+                } else {
+                    // Fallback: localStorage context tonen als Robaws-fetch faalt of geen match
+                    const ctxRaw = localStorage.getItem('qe_last_payment_context');
+                    if (ctxRaw) {
+                        const ctx = JSON.parse(ctxRaw);
+                        const cInv = (ctx.invoiceResult && ctx.invoiceResult.invoice) || {};
+                        const amount = parseFloat(cInv.totalInclVat || 0).toFixed(2);
+                        const method = ctx.paymentMethod || '?';
+                        const methodIcon = method === 'Viva wallet' ? '💳'
+                            : method === 'Cash' ? '💵'
+                            : method.startsWith('Overschrijving') ? '🏦'
+                            : '📋';
+                        paymentBtns = `
+                            <div class="card" style="margin-bottom:12px;background:linear-gradient(135deg, rgba(21,101,192,0.08), rgba(46,125,50,0.08));border-left:4px solid #1565C0;cursor:pointer" onclick="app.openChangePaymentMethodModal()">
+                                <div style="display:flex;align-items:center;justify-content:space-between">
+                                    <div style="flex:1">
+                                        <div style="font-size:14px;font-weight:700;color:#1565C0">${methodIcon} Laatste betaling: ${method}</div>
+                                        <div style="font-size:12px;color:var(--qe-grey);margin-top:3px">Factuur ${ctx.invoiceLogicId || cInv.logicId || ''} — € ${amount}</div>
+                                        <div style="font-size:11px;color:#1565C0;margin-top:4px;font-weight:600">Tik om te openen of betalingsmethode aan te passen →</div>
+                                    </div>
+                                </div>
+                            </div>`;
+                    }
                 }
-            } catch(e) {}
+            } catch(e) { console.warn('[App] Laatste betaling fetch fout:', e && e.message); }
 
             let html = paymentBtns + `
                 <div class="card" style="margin-bottom:12px;background:rgba(106,44,145,0.06);border-left:3px solid var(--qe-purple)">
@@ -6218,8 +6467,9 @@ const app = {
                 ${p.aantalWerkbonnen > 1 ? ` · <span style="color:var(--qe-orange)">${p.aantalWerkbonnen} werkbons (incl. ${p.aantalWerkbonnen - 1} correctie${p.aantalWerkbonnen > 2 ? 's' : ''})</span>` : ''}
             </div>`;
 
-        document.getElementById('correctieKlantMin').value = s.klantMin;
-        document.getElementById('correctieVerplMin').value = s.verplMin;
+        // v92+: tijd in uren (s.klantMin/verplMin blijft intern in min, UI toont uren met 2 decimalen)
+        document.getElementById('correctieKlantUur').value = (s.klantMin / 60).toFixed(2);
+        document.getElementById('correctieVerplUur').value = (s.verplMin / 60).toFixed(2);
 
         // Render materialen
         const matList = document.getElementById('correctieMaterialen');
@@ -6252,8 +6502,9 @@ const app = {
     updateCorrectieDelta() {
         const s = this.correctieState;
         if (!s) return;
-        const newKlant = (parseInt(document.getElementById('correctieKlantMin').value) || 0) / 60;
-        const newVerpl = (parseInt(document.getElementById('correctieVerplMin').value) || 0) / 60;
+        // v92+: input is uren (decimaal), state blijft min
+        const newKlant = parseFloat(document.getElementById('correctieKlantUur').value) || 0;
+        const newVerpl = parseFloat(document.getElementById('correctieVerplUur').value) || 0;
         const dKlant = Math.round((newKlant - s.origineel.klantUur) * 100) / 100;
         const dVerpl = Math.round((newVerpl - s.origineel.verplUur) * 100) / 100;
         const fmt = v => (v > 0 ? '+' : '') + v.toFixed(2) + 'u';
@@ -6277,6 +6528,22 @@ const app = {
     setCorrectieVerplMin(v) {
         if (this.correctieState) {
             this.correctieState.verplMin = parseInt(v) || 0;
+            this.updateCorrectieDelta();
+        }
+    },
+
+    /** v92+: input in uren (decimaal). Intern bewaren we minuten voor compatibiliteit. */
+    setCorrectieKlantUur(v) {
+        if (this.correctieState) {
+            const uur = parseFloat(v) || 0;
+            this.correctieState.klantMin = Math.round(uur * 60);
+            this.updateCorrectieDelta();
+        }
+    },
+    setCorrectieVerplUur(v) {
+        if (this.correctieState) {
+            const uur = parseFloat(v) || 0;
+            this.correctieState.verplMin = Math.round(uur * 60);
             this.updateCorrectieDelta();
         }
     },
@@ -6519,6 +6786,13 @@ const app = {
         setTimeout(() => el.classList.remove('show'), 2500);
     },
 
+    /** v92: format Robaws paymentInstruction (12-cijferige OGM) als +++123/4567/89012+++ */
+    _formatOgm(ogm) {
+        const s = String(ogm || '').replace(/[^0-9]/g, '');
+        if (s.length !== 12) return '';
+        return '+++' + s.substr(0, 3) + '/' + s.substr(3, 4) + '/' + s.substr(7, 5) + '+++';
+    },
+
     /**
      * v83: Vraag de monteur om kilometers heen/terug in te geven na uitklokken,
      * en post die als commute-entry op de werkbon. Modal — kan niet weggeklikt
@@ -6526,33 +6800,55 @@ const app = {
      */
     async promptKilometers(workOrderId, employeeId) {
         return new Promise((resolve) => {
-            // Bouw modal
+            // Bouw modal — v95: mobility-keuze + woonwerk-fiets checkbox
             let m = document.getElementById('kmPromptModal');
             if (m) m.remove();
             m = document.createElement('div');
             m.id = 'kmPromptModal';
             m.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;padding:16px';
             m.innerHTML = `
-                <div style="background:#fff;border-radius:16px;max-width:400px;width:100%;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,0.3)">
-                    <div style="font-size:20px;font-weight:700;color:var(--qe-darkblue);margin-bottom:8px;display:flex;align-items:center;gap:8px">
+                <div style="background:#fff;border-radius:16px;max-width:420px;width:100%;padding:22px;box-shadow:0 8px 32px rgba(0,0,0,0.3);max-height:92vh;overflow-y:auto">
+                    <div style="font-size:20px;font-weight:700;color:#1A237E;margin-bottom:6px;display:flex;align-items:center;gap:8px">
                         🚐 Kilometers vandaag
                     </div>
-                    <div style="font-size:13px;color:var(--qe-grey);margin-bottom:16px">
+                    <div style="font-size:13px;color:#666;margin-bottom:14px">
                         Hoeveel kilometers heb je heen en terug afgelegd?
                     </div>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
                         <div>
-                            <label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:4px">Heen (km)</label>
+                            <label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Heen (km)</label>
                             <input id="kmHeenInput" type="number" inputmode="numeric" min="0" step="1" value="0"
-                                style="width:100%;padding:14px;font-size:18px;border:2px solid #cfd8dc;border-radius:10px;text-align:center;font-weight:600">
+                                style="width:100%;padding:12px;font-size:17px;border:2px solid #cfd8dc;border-radius:10px;text-align:center;font-weight:600;box-sizing:border-box">
                         </div>
                         <div>
-                            <label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:4px">Terug (km)</label>
+                            <label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Terug (km)</label>
                             <input id="kmTerugInput" type="number" inputmode="numeric" min="0" step="1" value="0"
-                                style="width:100%;padding:14px;font-size:18px;border:2px solid #cfd8dc;border-radius:10px;text-align:center;font-weight:600">
+                                style="width:100%;padding:12px;font-size:17px;border:2px solid #cfd8dc;border-radius:10px;text-align:center;font-weight:600;box-sizing:border-box">
                         </div>
                     </div>
-                    <button id="kmPromptSubmit" style="width:100%;padding:14px;background:var(--qe-darkblue);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600">
+
+                    <label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Mobiliteit</label>
+                    <div id="kmMobilityRadio" style="display:grid;gap:6px;margin-bottom:14px">
+                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px">
+                            <input type="radio" name="kmMobility" value="-3" checked style="margin:0">
+                            <span>🚐 Chauffeur zonder passagiers</span>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px">
+                            <input type="radio" name="kmMobility" value="-1" style="margin:0">
+                            <span>🚐👥 Chauffeur (met passagiers)</span>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px">
+                            <input type="radio" name="kmMobility" value="-2" style="margin:0">
+                            <span>🧍 Passagier</span>
+                        </label>
+                    </div>
+
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:14px;background:#fff8e1">
+                        <input id="kmFietsInput" type="checkbox" style="margin:0;width:20px;height:20px;cursor:pointer">
+                        <span>🚲 Woonwerk-verkeer met de <strong>fiets</strong></span>
+                    </label>
+
+                    <button id="kmPromptSubmit" style="width:100%;padding:14px;background:#1A237E;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer">
                         Opslaan
                     </button>
                     <div id="kmPromptError" style="font-size:12px;color:#c62828;margin-top:8px;text-align:center;display:none"></div>
@@ -6561,6 +6857,7 @@ const app = {
 
             const heenEl = document.getElementById('kmHeenInput');
             const terugEl = document.getElementById('kmTerugInput');
+            const fietsEl = document.getElementById('kmFietsInput');
             const errEl = document.getElementById('kmPromptError');
             const btn = document.getElementById('kmPromptSubmit');
 
@@ -6570,23 +6867,52 @@ const app = {
             const submit = async () => {
                 const heen = Math.max(0, Math.round(parseFloat(heenEl.value) || 0));
                 const terug = Math.max(0, Math.round(parseFloat(terugEl.value) || 0));
+                const mobRadio = document.querySelector('input[name="kmMobility"]:checked');
+                const mobilityTypeId = mobRadio ? parseInt(mobRadio.value, 10) : -3;
+                const fiets = !!(fietsEl && fietsEl.checked);
+
                 btn.disabled = true;
                 btn.textContent = 'Opslaan...';
                 errEl.style.display = 'none';
 
                 try {
+                    // Stap 1: commute-entry voor de auto-km
                     const r = await RobawsAPI.addCommuteEntry({
                         workOrderId,
                         employeeId,
                         distance: heen,
                         returnDistance: terug,
+                        mobilityTypeId: mobilityTypeId,
                     });
                     if (r.code !== 200 && r.code !== 201) {
                         throw new Error('Robaws (' + r.code + ')');
                     }
+
+                    // Stap 2: als woonwerk-fiets aangevinkt → set extraField op werkbon
+                    // (kantoor kan filteren voor fietsvergoeding HR/fiscaal)
+                    if (fiets) {
+                        try {
+                            const woFull = await RobawsAPI.get(`work-orders/${workOrderId}`);
+                            if (woFull.code === 200 && woFull.data) {
+                                woFull.data.extraFields = woFull.data.extraFields || {};
+                                woFull.data.extraFields['Woonwerk fiets'] = {
+                                    type: 'CHECKBOX',
+                                    group: null,
+                                    booleanValue: true,
+                                };
+                                await RobawsAPI.put(`work-orders/${workOrderId}`, woFull.data);
+                                console.log('[App] Woonwerk-fiets gemarkeerd op werkbon', workOrderId);
+                            }
+                        } catch (eFiets) {
+                            console.warn('[App] Woonwerk-fiets veld update faalde (niet kritiek):',
+                                eFiets && eFiets.message);
+                        }
+                    }
+
                     // Succes → modal weg
                     m.remove();
-                    this.toast('Kilometers opgeslagen: ' + (heen + terug) + ' km');
+                    const fietsTxt = fiets ? ' · 🚲 fiets gemarkeerd' : '';
+                    this.toast('Kilometers opgeslagen: ' + (heen + terug) + ' km' + fietsTxt);
                     resolve(true);
                 } catch (e) {
                     console.warn('[App] km POST faalde:', e && e.message);

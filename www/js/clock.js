@@ -784,8 +784,26 @@ window.QEClock = {
         //  - Clock-in: round UP naar volgend kwartier (6:02 → 6:15, 6:31 → 6:45)
         //  - Bureau-scan: max(round_up_15(actual), startuur werknemer) — kan nooit voor startuur
         //  - Camionet-scan: gewoon round_up_15(actual)
-        const roundUp15 = (mins) => Math.ceil(mins / 15) * 15;
-        const roundDown15 = (mins) => Math.floor(mins / 15) * 15;
+        // v94+: TOLERANTIE van 4 minuten — als je binnen 4 min van een kwartier zit,
+        //  wordt afgerond naar dat kwartier (in beide richtingen). Voorbeeld:
+        //   - 6:48 → 6:45 (3 min over → naar dichtsbijzijnde kwartier omlaag)
+        //   - 6:50 → 7:00 (5 min over → normaal naar boven)
+        //   - 15:28 → 15:30 (2 min onder → naar dichtsbijzijnde kwartier omhoog)
+        //   - 15:25 → 15:15 (5 min onder → normaal naar beneden)
+        const TOLERANCE = 4;
+        const roundUp15 = (mins) => {
+            const rem = mins % 15;
+            // Binnen tolerantie van het lagere kwartier? → omlaag (gunstig voor werknemer bij in-klok)
+            if (rem > 0 && rem <= TOLERANCE) return mins - rem;
+            return Math.ceil(mins / 15) * 15;
+        };
+        const roundDown15 = (mins) => {
+            const rem = mins % 15;
+            const distUpper = (15 - rem) % 15;
+            // Binnen tolerantie van het hogere kwartier? → omhoog (gunstig voor werknemer bij uit-klok)
+            if (distUpper > 0 && distUpper <= TOLERANCE) return mins + distUpper;
+            return Math.floor(mins / 15) * 15;
+        };
         const useStartuurCorrection = (session.tagType === 'bureau');
         let entryStartMin;
         if (useStartuurCorrection) {
@@ -905,8 +923,12 @@ window.QEClock = {
                 }
                 console.log('[Clock] werkuren posted (klant ' + klantHours.toFixed(2) + 'u)');
 
-                // Compensatie als klant < 8u en er L&L op de werkbon staat
+                // v90+ (gebruikersvraag): ALS klant < 8u → ALTIJD compensatie:
+                //   - Phantom werkuren (no-times) = max(0, (8 - klant) - L&L_uren)
+                //   - Overuren-aftrek (no-times)  = -(8 - klant)
+                // Onafhankelijk van of er L&L op de werkbon staat.
                 if (klantHours < 8) {
+                    // L&L-uren ophalen om phantom-grootte te bepalen
                     let llHours = 0;
                     try {
                         const teRes = await RobawsAPI.get(`work-orders/${session.workOrderId}/time-entries?limit=100`);
@@ -919,24 +941,39 @@ window.QEClock = {
                                 }
                             }
                         }
-                    } catch(_) { /* skip — bij fetch fail geen compensatie */ }
+                    } catch(_) { /* skip — bij fetch fail gebruik llHours=0 */ }
 
-                    if (llHours > 0) {
-                        const shortage = 8 - klantHours;
-                        const compHours = -Math.min(shortage, llHours);
-                        const compRounded = Math.round(compHours * 100) / 100;
-                        console.log('[Clock] L&L compensatie: -' + Math.abs(compRounded) +
-                            'u overuren (klant ' + klantHours.toFixed(2) + 'u, L&L ' + llHours.toFixed(2) + 'u)');
-                        const rc = await RobawsAPI.addWorkHoursTimeEntry({
+                    const deficit = 8 - klantHours;
+
+                    // Phantom werkuren als L&L niet voldoende dekt
+                    const phantom = Math.max(0, deficit - llHours);
+                    const phantomRounded = Math.round(phantom * 100) / 100;
+                    if (phantomRounded > 0.005) {
+                        console.log('[Clock] phantom werkuren: +' + phantomRounded + 'u');
+                        const rp = await RobawsAPI.addWorkHoursTimeEntry({
                             workOrderId: session.workOrderId,
                             employeeId: session.employeeId,
                             articleId: ART_MONTEUR,
-                            hourTypeId: HT_OVERUREN,
-                            hoursOverride: compRounded,
+                            hourTypeId: HT_WERKUREN,
+                            hoursOverride: phantomRounded,
                         });
-                        if (rc.code !== 200 && rc.code !== 201) {
-                            console.warn('[Clock] L&L compensatie POST faalde (niet kritiek):', rc.code);
+                        if (rp.code !== 200 && rp.code !== 201) {
+                            console.warn('[Clock] phantom werkuren POST faalde (niet kritiek):', rp.code);
                         }
+                    }
+
+                    // Overuren-aftrek altijd
+                    const compRounded = Math.round(-1 * deficit * 100) / 100;
+                    console.log('[Clock] overuren-aftrek: ' + compRounded + 'u (klant ' + klantHours.toFixed(2) + 'u, L&L ' + llHours.toFixed(2) + 'u)');
+                    const rc = await RobawsAPI.addWorkHoursTimeEntry({
+                        workOrderId: session.workOrderId,
+                        employeeId: session.employeeId,
+                        articleId: ART_MONTEUR,
+                        hourTypeId: HT_OVERUREN,
+                        hoursOverride: compRounded,
+                    });
+                    if (rc.code !== 200 && rc.code !== 201) {
+                        console.warn('[Clock] overuren-aftrek POST faalde (niet kritiek):', rc.code);
                     }
                 }
             }
