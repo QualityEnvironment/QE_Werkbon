@@ -3949,15 +3949,32 @@ const app = {
 
             this._markWOSubmitted(data);
 
+            // v88: Sla "laatste betaling" context op zodat Olivier op de Uitgevoerd-tab
+            // de methode kan switchen als de Viva-terminal faalt.
+            try {
+                const ctx = {
+                    workOrderId: workOrderId,
+                    salesOrderId: this.currentWO.salesOrderId || null,
+                    invoiceId: (invoiceResult && invoiceResult.invoice && invoiceResult.invoice.id) || null,
+                    invoiceLogicId: (invoiceResult && invoiceResult.invoice && invoiceResult.invoice.logicId) || null,
+                    paymentMethod: paymentMethod,
+                    invoiceResult: invoiceResult,  // bewaard voor reopen Viva/Overschrijving betaalscherm
+                    timestamp: Date.now(),
+                };
+                localStorage.setItem('qe_last_payment_context', JSON.stringify(ctx));
+            } catch(e) { /* localStorage quota — niet kritiek */ }
+
             // === STAP 4: Betaalmethode-specifieke afhandeling ===
             if (paymentMethod === 'Viva wallet') {
                 // Viva Wallet → toon betaalscherm met terminal/QR
                 this.showPaymentScreen(invoiceResult);
-            } else if (paymentMethod === 'Overschrijving ter plaatse') {
+            } else if (paymentMethod === 'Overschrijving' || paymentMethod === 'Overschrijving ter plaatse') {
                 // Overschrijving ter plaatse → toon betaalscherm met QR code
+                // (legacy "Overschrijving ter plaatse" string ook ondersteund voor backward compat)
                 this.showOverschrijvingScreen(invoiceResult);
             } else {
-                // Cash of Niet Ontvangen → enkel factuur, klaar
+                // v85: Cash of Via factuur → factuur is aangemaakt, werkbon + order
+                // staan nu op 'gefactureerd' (zie robaws-api stap 6). Geen extra UI.
                 this.toast(`Werkbon verstuurd — betaling: ${paymentMethod} ✓`);
                 this.navigate('screenPlanning', false);
                 this.screenHistory = [];
@@ -4303,6 +4320,177 @@ const app = {
             }
         } catch (e) {
             this.toast('Kon betaalscherm niet openen');
+        }
+    },
+
+    /**
+     * v88: Open modal met de 4 betaalmethoden — gebruiker kan de methode van
+     * de laatste betaling aanpassen (bv. Viva-terminal faalde, klant geeft cash).
+     * Bij verandering: PUT updates Betaling-veld op werkbon + order + factuur,
+     * en opent eventueel het nieuwe betaalscherm.
+     */
+    /**
+     * v89-fix: betaalmethode-keuze NIET via overlay-modal maar via een NAVIGATE
+     * naar een dedicated screen. De overlay-modal renderde alleen de header in
+     * een aantal Android WebViews — vermoedelijk een interactie tussen de
+     * scan-result-overlay en deze modal. Een full-screen via this.navigate
+     * gebruikt het bestaande screen-systeem dat 100% betrouwbaar werkt.
+     */
+    openChangePaymentMethodModal() {
+        let ctx;
+        try {
+            const raw = localStorage.getItem('qe_last_payment_context');
+            if (!raw) { this.toast('Geen laatste betaling gevonden'); return; }
+            ctx = JSON.parse(raw);
+        } catch (e) {
+            this.toast('Kon betaling niet laden');
+            return;
+        }
+
+        const inv = (ctx.invoiceResult && ctx.invoiceResult.invoice) || {};
+        const amount = parseFloat(inv.totalInclVat || 0).toFixed(2);
+        const cur = ctx.paymentMethod || '';
+
+        // Zoek of maak het screen op-the-fly als het nog niet bestaat
+        let screen = document.getElementById('screenChangePm');
+        if (!screen) {
+            screen = document.createElement('div');
+            screen.id = 'screenChangePm';
+            screen.className = 'screen';
+            // App-content container vinden — gebruik de gangbare locatie
+            const appContent = document.querySelector('.app-content') || document.body;
+            appContent.appendChild(screen);
+            // Registreer ook in screen-titles zodat de header wordt geüpdate
+            try { this.screenTitles = this.screenTitles || {}; } catch(_) {}
+        }
+
+        const mkBtnHtml = (key, icon, label) => {
+            const isCurrent = (key === cur) || (key === 'Overschrijving' && cur === 'Overschrijving ter plaatse');
+            const bg = isCurrent ? '#e3f2fd' : '#ffffff';
+            const border = isCurrent ? '#1565C0' : '#cfd8dc';
+            const tag = isCurrent ? ' <span style="font-size:10px;background:#1565C0;color:#fff;padding:2px 6px;border-radius:8px;font-weight:600;margin-left:6px">HUIDIG</span>' : '';
+            return '<div onclick="app.changeLastPaymentMethod(\'' + key + '\')" ' +
+                'style="display:flex;align-items:center;gap:12px;padding:18px 16px;margin-bottom:10px;' +
+                'border:2px solid ' + border + ';border-radius:12px;background:' + bg + ';' +
+                'cursor:pointer;font-size:16px;color:#212121">' +
+                '<span style="font-size:24px">' + icon + '</span>' +
+                '<span style="flex:1;font-weight:500">' + label + tag + '</span>' +
+                '<span style="font-size:18px;color:#888">›</span>' +
+                '</div>';
+        };
+
+        screen.innerHTML =
+            '<div style="padding:16px;max-width:600px;margin:0 auto">' +
+                '<div style="font-size:22px;font-weight:700;color:#1A237E;margin-bottom:6px">Betaalmethode aanpassen</div>' +
+                '<div style="font-size:14px;color:#666;margin-bottom:6px">Factuur <strong>' + (ctx.invoiceLogicId || inv.logicId || '') + '</strong></div>' +
+                '<div style="font-size:18px;color:#1A237E;font-weight:700;margin-bottom:18px">€ ' + amount + '</div>' +
+                '<div style="font-size:13px;color:#666;margin-bottom:14px">Kies een methode hieronder:</div>' +
+                mkBtnHtml('Viva wallet',   '💳', 'Viva Wallet (terminal)') +
+                mkBtnHtml('Cash',          '💵', 'Cash') +
+                mkBtnHtml('Overschrijving','🏦', 'Overschrijving ter plaatse') +
+                mkBtnHtml('Via factuur',   '📋', 'Via factuur') +
+                '<div id="changePmStatus" style="font-size:13px;text-align:center;margin-top:12px;padding:10px;display:none;border-radius:8px"></div>' +
+                '<button onclick="app.goBack()" style="width:100%;padding:14px;margin-top:14px;background:#f5f5f5;color:#444;border:none;border-radius:10px;font-size:15px;cursor:pointer">Annuleren</button>' +
+            '</div>';
+
+        // Navigate naar het screen (gebruikt het bestaande systeem dat back-knop, history, etc. afhandelt)
+        try {
+            this.navigate('screenChangePm');
+        } catch (e) {
+            // Fallback: rauw zichtbaar maken als navigate faalt
+            document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+            screen.classList.add('active');
+            screen.style.display = 'block';
+        }
+    },
+
+    /**
+     * v88: Handelt de klik op een betaalmethode in de change-modal af.
+     *  - Zelfde methode als huidig → reopen het oude betaalscherm (Viva/Overschrijving)
+     *    of sluit modal (Cash/Via factuur).
+     *  - Andere methode → PUT Betaling-veld update op werkbon + order + factuur,
+     *    werk localStorage context bij, en open eventueel het nieuwe betaalscherm.
+     */
+    async changeLastPaymentMethod(newMethod) {
+        const statusEl = document.getElementById('changePmStatus');
+        let ctx;
+        try {
+            ctx = JSON.parse(localStorage.getItem('qe_last_payment_context') || '{}');
+        } catch (e) { ctx = {}; }
+        if (!ctx.workOrderId) {
+            this.toast('Geen laatste betaling gevonden');
+            this.goBack();
+            return;
+        }
+
+        const cur = ctx.paymentMethod || '';
+        const sameMethod = (newMethod === cur)
+            || (newMethod === 'Overschrijving' && cur === 'Overschrijving ter plaatse');
+
+        if (sameMethod) {
+            // Zelfde methode → gewoon het oude betaalscherm openen (als er één is)
+            if (newMethod === 'Viva wallet' && ctx.invoiceResult) {
+                this.showPaymentScreen(ctx.invoiceResult);
+            } else if (newMethod === 'Overschrijving' && ctx.invoiceResult) {
+                this.showOverschrijvingScreen(ctx.invoiceResult);
+            } else {
+                this.toast('Geen betaalscherm voor ' + newMethod);
+                this.goBack();
+            }
+            return;
+        }
+
+        // Andere methode → PUT updates op alle 3 docs
+        if (statusEl) {
+            statusEl.style.display = 'block';
+            statusEl.style.color = '#444';
+            statusEl.style.background = '#fff8e1';
+            statusEl.textContent = '⏳ Bijwerken in Robaws…';
+        }
+
+        try {
+            const res = await RobawsAPI.setBetalingOnAllDocs({
+                workOrderId: ctx.workOrderId,
+                salesOrderId: ctx.salesOrderId,
+                invoiceId: ctx.invoiceId,
+            }, newMethod);
+            if (!res.ok) {
+                console.warn('[App] Betaling update partial fail:', res.results);
+                if (statusEl) {
+                    statusEl.style.color = '#c62828';
+                    statusEl.style.background = '#ffebee';
+                    const failed = [];
+                    if (res.results.workOrder && !res.results.workOrder.ok) failed.push('werkbon');
+                    if (res.results.salesOrder && !res.results.salesOrder.ok) failed.push('order');
+                    if (res.results.invoice && !res.results.invoice.ok) failed.push('factuur');
+                    statusEl.textContent = '⚠️ Niet alles is bijgewerkt: ' + failed.join(', ');
+                }
+                return;
+            }
+            // Update lokale context
+            ctx.paymentMethod = newMethod;
+            ctx.timestamp = Date.now();
+            localStorage.setItem('qe_last_payment_context', JSON.stringify(ctx));
+
+            this.toast('Betaalmethode → ' + newMethod);
+
+            // Open nieuw betaalscherm waar relevant — anders terug naar Uitgevoerd
+            if (newMethod === 'Viva wallet' && ctx.invoiceResult) {
+                this.showPaymentScreen(ctx.invoiceResult);
+            } else if (newMethod === 'Overschrijving' && ctx.invoiceResult) {
+                this.showOverschrijvingScreen(ctx.invoiceResult);
+            } else {
+                // Cash / Via factuur — terug naar Uitgevoerd, knop-label is nu geüpdate
+                this.navigate('screenUitgevoerd');
+                this.loadUitgevoerd();
+            }
+        } catch (e) {
+            console.error('[App] changeLastPaymentMethod error:', e);
+            if (statusEl) {
+                statusEl.style.color = '#c62828';
+                statusEl.style.background = '#ffebee';
+                statusEl.textContent = 'Fout: ' + (e && e.message);
+            }
         }
     },
 
@@ -5526,27 +5714,55 @@ const app = {
                 const rawHours = totalMins / 60;
                 return Math.ceil(rawHours * 2) / 2;
             };
+            // v83: Bereken totalen op basis van TIME-ENTRIES (werkuren vs overuren split via hourTypeId).
+            //   - Totaal = som van alle entries (incl. negatieve compensatie-entries)
+            //   - Werkuren = som hourTypeId=1 entries
+            //   - Overuren = som hourTypeId=2 entries (incl. negatieve compensatie-entries)
+            const HT_WERKUREN = String(RobawsAPI.HOUR_TYPE_IDS.werkuren);
+            const HT_OVERUREN = String(RobawsAPI.HOUR_TYPE_IDS.overuren);
             let totalHours = 0;
-            for (const wo of workOrders) totalHours += computeHours(wo);
+            let werkurenTotal = 0;
+            let overurenTotal = 0;
+            for (const wo of workOrders) {
+                const teList = teByWoId[wo.id] || [];
+                for (const te of teList) {
+                    const h = parseFloat(te.hours || te.billableHours || 0) || 0;
+                    totalHours += h;
+                    const ht = String(te.hourTypeId || (te.hourType && te.hourType.id) || '');
+                    if (ht === HT_OVERUREN) overurenTotal += h;
+                    else werkurenTotal += h;  // default = werkuren (incl. legacy entries zonder hourTypeId)
+                }
+            }
+            // v87: 2 decimalen voor uren-stats (zoals Robaws ze toont)
+            const fmt1 = (n) => (Math.round(n * 100) / 100).toFixed(2);
+            const fmt2 = fmt1; // alias
 
             let html = '';
 
-            // Samenvatting kaart
+            // Samenvatting kaart — v83: Totaal, Werkuren, Overuren, Werkdagen, Te laat
             html += `
                 <div class="card" style="margin-bottom:16px;padding:20px;background:linear-gradient(135deg, var(--qe-darkblue), var(--qe-purple));color:#fff;border-radius:16px">
                     <div style="font-size:13px;opacity:0.8;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">${monthLabel}</div>
-                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px">
+                    <div style="display:grid;grid-template-columns:repeat(5, 1fr);gap:8px">
                         <div>
-                            <div style="font-size:28px;font-weight:700">${totalHours.toFixed(1)}</div>
-                            <div style="font-size:12px;opacity:0.8">Totaal uren</div>
+                            <div style="font-size:20px;font-weight:700">${fmt2(totalHours)}</div>
+                            <div style="font-size:10px;opacity:0.8">Totaal</div>
                         </div>
                         <div>
-                            <div style="font-size:28px;font-weight:700">${totalDays}</div>
-                            <div style="font-size:12px;opacity:0.8">Werkdagen</div>
+                            <div style="font-size:20px;font-weight:700">${fmt2(werkurenTotal)}</div>
+                            <div style="font-size:10px;opacity:0.8">Werkuren</div>
                         </div>
                         <div>
-                            <div style="font-size:28px;font-weight:700">${lateCount}</div>
-                            <div style="font-size:12px;opacity:0.8">Te laat</div>
+                            <div style="font-size:20px;font-weight:700">${fmt2(overurenTotal)}</div>
+                            <div style="font-size:10px;opacity:0.8">Overuren</div>
+                        </div>
+                        <div>
+                            <div style="font-size:20px;font-weight:700">${totalDays}</div>
+                            <div style="font-size:10px;opacity:0.8">Werkdagen</div>
+                        </div>
+                        <div>
+                            <div style="font-size:20px;font-weight:700">${lateCount}</div>
+                            <div style="font-size:10px;opacity:0.8">Te laat</div>
                         </div>
                     </div>
                 </div>`;
@@ -5568,61 +5784,110 @@ const app = {
                 const isWeekend = d.getDay() === 0 || d.getDay() === 6;
 
                 if (wos.length > 0) {
+                    // v83: dag-totaal = som van alle time-entries (incl. negatieve compensatie)
                     let dayTotal = 0;
                     for (const wo of wos) {
-                        dayTotal += computeHours(wo);
+                        const teList = teByWoId[wo.id] || [];
+                        for (const te of teList) {
+                            dayTotal += parseFloat(te.hours || te.billableHours || 0) || 0;
+                        }
                     }
                     html += `<div style="margin-bottom:4px;padding:8px 4px 4px;display:flex;align-items:center;justify-content:space-between">
                         <div style="font-size:13px;font-weight:600;color:var(--qe-darkblue)">${dayName} ${dateStr}</div>
-                        <div style="font-size:12px;color:var(--qe-grey)">${dayTotal.toFixed(1)} uur</div>
+                        <div style="font-size:12px;color:var(--qe-grey)">${fmt1(dayTotal)} uur</div>
                     </div>`;
+
+                    // v83: per werkbon — render individuele tijdsblokken (1 kaart per time-entry)
+                    //   Werkuren (hourTypeId=1, article 185)  → ✅ groen, klant-werk
+                    //   L&L (article 19786)                   → 📦 oranje box
+                    //   Overuren (hourTypeId=2, article 185)  → ⏰ oranje
+                    //   Compensatie (negatieve uren)          → ↩️ grijs/cursief
+                    const llArtId = String(RobawsAPI.WERKUUR_ARTICLE_IDS.ladenLossen);
 
                     for (const wo of wos) {
                         const tijd = getField(wo, 'Tijd') || 'Op tijd';
-                        const ingeklokt = getField(wo, 'Ingeklokt');
-                        const uitgeklokt = getField(wo, 'Uitgeklokt') || '...';
-
-                        let typeIcon, typeBg, typeColor;
-                        switch (tijd) {
-                            case 'Te laat':
-                                typeIcon = '⚠️'; typeBg = '#fff8e1'; typeColor = '#e65100'; break;
-                            case 'Ziek':
-                                typeIcon = '🤒'; typeBg = '#ffebee'; typeColor = '#b71c1c'; break;
-                            default:
-                                typeIcon = '✅'; typeBg = '#f1f8e9'; typeColor = '#2e7d32'; break;
-                        }
-
-                        // v76: L&L badge + extra info — toont aantal L&L cycli en totale uren
-                        const teList = teByWoId[wo.id] || [];
-                        const llArtId = String(RobawsAPI.WERKUUR_ARTICLE_IDS.ladenLossen);
-                        const llEntries = teList.filter(te => {
-                            const aId = te.articleId || (te.article && te.article.id);
-                            return String(aId) === llArtId;
-                        });
-                        const hasLL = llEntries.length > 0;
-                        let llHours = 0;
-                        for (const te of llEntries) llHours += parseFloat(te.hours || 0);
-
-                        // v67: GPS-link verbergen voor werknemer (zit alleen in werkbon-remark voor kantoor)
-                        const gpsLink = '';
-                        const llBadge = hasLL
-                            ? '<span style="font-size:10px;background:#e3f2fd;color:#1565c0;padding:2px 6px;border-radius:8px;margin-left:6px">📦 ' +
-                              llEntries.length + '× L&amp;L · ' + llHours.toFixed(2) + 'u</span>'
+                        const tijdColor = (tijd === 'Te laat') ? '#e65100'
+                            : (tijd === 'Ziek') ? '#b71c1c'
+                            : '#2e7d32';
+                        const tijdIcon = (tijd === 'Te laat') ? '⚠️'
+                            : (tijd === 'Ziek') ? '🤒'
                             : '';
+                        const teList = (teByWoId[wo.id] || []).slice().sort((a, b) => {
+                            // Sort: entries met startTime eerst (chronologisch), dan no-time entries
+                            const aMin = a.startTime ? (a.startTime.hour * 60 + a.startTime.minute) : 9999;
+                            const bMin = b.startTime ? (b.startTime.hour * 60 + b.startTime.minute) : 9999;
+                            return aMin - bMin;
+                        });
 
-                        // v64: kaartje opent het aanpassing-aanvraag scherm
-                        html += `<div class="card" style="padding:12px 14px;margin-bottom:6px;background:${typeBg};cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
-                            <div style="display:flex;align-items:center;justify-content:space-between">
+                        if (teList.length === 0) {
+                            // Open werkbon zonder entries (nog niet uitgeklokt)
+                            const ingeklokt = getField(wo, 'Ingeklokt') || '?';
+                            html += `<div class="card" style="padding:12px 14px;margin-bottom:6px;background:#f1f8e9;cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
                                 <div style="display:flex;align-items:center;gap:10px">
-                                    <span style="font-size:18px">${typeIcon}</span>
-                                    <div>
-                                        <div style="font-size:14px;font-weight:500">${ingeklokt || '?'} → ${uitgeklokt}${llBadge}</div>
-                                        <div style="font-size:11px;color:${typeColor}">${tijd} ${gpsLink}</div>
+                                    <span style="font-size:18px">⏱️</span>
+                                    <div style="flex:1">
+                                        <div style="font-size:14px;font-weight:500">${ingeklokt} → ...</div>
+                                        <div style="font-size:11px;color:${tijdColor}">${tijdIcon} ${tijd} — nog ingeklokt</div>
                                     </div>
                                 </div>
-                                <div style="font-size:18px;color:var(--qe-grey)">›</div>
-                            </div>
-                        </div>`;
+                            </div>`;
+                            continue;
+                        }
+
+                        for (const te of teList) {
+                            const aId = String(te.articleId || (te.article && te.article.id) || '');
+                            const ht = String(te.hourTypeId || (te.hourType && te.hourType.id) || '');
+                            const hours = parseFloat(te.hours || te.billableHours || 0) || 0;
+                            const isLL = (aId === llArtId);
+                            const isOveruren = (ht === HT_OVERUREN);
+                            const isCompensatie = (hours < 0);
+                            const sStr = te.startTime
+                                ? String(te.startTime.hour).padStart(2, '0') + ':' + String(te.startTime.minute).padStart(2, '0')
+                                : null;
+                            const eStr = te.endTime
+                                ? String(te.endTime.hour).padStart(2, '0') + ':' + String(te.endTime.minute).padStart(2, '0')
+                                : null;
+                            const timeBlockTxt = (sStr && eStr) ? (sStr + ' → ' + eStr) : null;
+
+                            // v87: Styling per type — compensatie duidelijker als "overuren aftrek"
+                            let icon, bg, fg, label;
+                            if (isCompensatie) {
+                                // Negatieve overuren — wordt afgetrokken van overuren-bank
+                                // omdat L&L gebruikt is om de 8u-baseline te vullen.
+                                icon = '➖'; bg = '#ffebee'; fg = '#c62828';
+                                label = 'Overuren aftrek';
+                            } else if (isLL) {
+                                icon = '📦'; bg = '#fff3e0'; fg = '#e65100';
+                                label = 'Laden & lossen';
+                            } else if (isOveruren) {
+                                icon = '⏰'; bg = '#fff8e1'; fg = '#ef6c00';
+                                label = 'Overuren';
+                            } else {
+                                icon = '✅'; bg = '#f1f8e9'; fg = '#2e7d32';
+                                label = 'Werkuren';
+                            }
+                            const absHrs = Math.abs(hours).toFixed(2);
+                            const headerLine = timeBlockTxt
+                                ? timeBlockTxt
+                                : (isCompensatie ? '−' + absHrs + ' uur (aftrek)' : absHrs + ' uur');
+                            const subLine = timeBlockTxt
+                                ? (label + ' · ' + hours.toFixed(2) + 'u')
+                                : label;
+                            const rightTxt = isCompensatie ? '−' + absHrs + 'u' : hours.toFixed(2) + 'u';
+
+                            html += `<div class="card" style="padding:10px 14px;margin-bottom:6px;background:${bg};cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
+                                <div style="display:flex;align-items:center;justify-content:space-between">
+                                    <div style="display:flex;align-items:center;gap:10px;flex:1">
+                                        <span style="font-size:18px">${icon}</span>
+                                        <div>
+                                            <div style="font-size:14px;font-weight:500">${headerLine}</div>
+                                            <div style="font-size:11px;color:${fg}">${subLine}</div>
+                                        </div>
+                                    </div>
+                                    <div style="font-size:14px;color:${fg};font-weight:600">${rightTxt}</div>
+                                </div>
+                            </div>`;
+                        }
                     }
                 } else {
                     const opacity = isWeekend ? '0.4' : '0.6';
@@ -5809,39 +6074,28 @@ const app = {
             const days = ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'];
             const months = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
 
-            // Check of er openstaande betaalschermen zijn
+            // v88: Eén "Laatste betaling" knop bovenaan — klik opent modal met 4 betaalmethoden
+            // (zodat Olivier kan switchen na een Viva-fout).
             let paymentBtns = '';
             try {
-                const lastOv = localStorage.getItem('qe_last_overschrijving');
-                if (lastOv) {
-                    const ovData = JSON.parse(lastOv);
-                    const inv = ovData.invoice || {};
-                    const pay = ovData.payment || {};
-                    const amount = parseFloat(pay.amount || inv.totalInclVat || 0).toFixed(2);
-                    paymentBtns += `
-                        <div class="card" style="margin-bottom:8px;background:rgba(46,125,50,0.06);border-left:3px solid var(--qe-green);cursor:pointer" onclick="app.reopenLastPaymentScreen('overschrijving')">
-                            <div style="display:flex;align-items:center;justify-content:space-between">
-                                <div>
-                                    <div style="font-size:13px;font-weight:600;color:#2E7D32">🏦 Overschrijving betaalscherm</div>
-                                    <div style="font-size:12px;color:var(--qe-grey);margin-top:2px">Factuur ${inv.logicId || ''} — € ${amount}</div>
-                                </div>
-                                <div style="font-size:14px;color:#2E7D32;font-weight:600">Openen →</div>
-                            </div>
-                        </div>`;
-                }
-                const lastViva = localStorage.getItem('qe_last_payment');
-                if (lastViva) {
-                    const vivaData = JSON.parse(lastViva);
-                    const inv = vivaData.invoice || {};
+                const ctxRaw = localStorage.getItem('qe_last_payment_context');
+                if (ctxRaw) {
+                    const ctx = JSON.parse(ctxRaw);
+                    const inv = (ctx.invoiceResult && ctx.invoiceResult.invoice) || {};
                     const amount = parseFloat(inv.totalInclVat || 0).toFixed(2);
-                    paymentBtns += `
-                        <div class="card" style="margin-bottom:8px;background:rgba(21,101,192,0.06);border-left:3px solid #1565C0;cursor:pointer" onclick="app.reopenLastPaymentScreen('viva')">
+                    const method = ctx.paymentMethod || '?';
+                    const methodIcon = method === 'Viva wallet' ? '💳'
+                        : method === 'Cash' ? '💵'
+                        : method.startsWith('Overschrijving') ? '🏦'
+                        : '📋';
+                    paymentBtns = `
+                        <div class="card" style="margin-bottom:12px;background:linear-gradient(135deg, rgba(21,101,192,0.08), rgba(46,125,50,0.08));border-left:4px solid #1565C0;cursor:pointer" onclick="app.openChangePaymentMethodModal()">
                             <div style="display:flex;align-items:center;justify-content:space-between">
-                                <div>
-                                    <div style="font-size:13px;font-weight:600;color:#1565C0">💳 Viva Wallet betaalscherm</div>
-                                    <div style="font-size:12px;color:var(--qe-grey);margin-top:2px">Factuur ${inv.logicId || ''} — € ${amount}</div>
+                                <div style="flex:1">
+                                    <div style="font-size:14px;font-weight:700;color:#1565C0">${methodIcon} Laatste betaling: ${method}</div>
+                                    <div style="font-size:12px;color:var(--qe-grey);margin-top:3px">Factuur ${ctx.invoiceLogicId || inv.logicId || ''} — € ${amount}</div>
+                                    <div style="font-size:11px;color:#1565C0;margin-top:4px;font-weight:600">Tik om te openen of betalingsmethode aan te passen →</div>
                                 </div>
-                                <div style="font-size:14px;color:#1565C0;font-weight:600">Openen →</div>
                             </div>
                         </div>`;
                 }
@@ -6263,6 +6517,89 @@ const app = {
         el.textContent = message;
         el.classList.add('show');
         setTimeout(() => el.classList.remove('show'), 2500);
+    },
+
+    /**
+     * v83: Vraag de monteur om kilometers heen/terug in te geven na uitklokken,
+     * en post die als commute-entry op de werkbon. Modal — kan niet weggeklikt
+     * worden zonder iets in te vullen (0 is een geldige waarde).
+     */
+    async promptKilometers(workOrderId, employeeId) {
+        return new Promise((resolve) => {
+            // Bouw modal
+            let m = document.getElementById('kmPromptModal');
+            if (m) m.remove();
+            m = document.createElement('div');
+            m.id = 'kmPromptModal';
+            m.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;padding:16px';
+            m.innerHTML = `
+                <div style="background:#fff;border-radius:16px;max-width:400px;width:100%;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,0.3)">
+                    <div style="font-size:20px;font-weight:700;color:var(--qe-darkblue);margin-bottom:8px;display:flex;align-items:center;gap:8px">
+                        🚐 Kilometers vandaag
+                    </div>
+                    <div style="font-size:13px;color:var(--qe-grey);margin-bottom:16px">
+                        Hoeveel kilometers heb je heen en terug afgelegd?
+                    </div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+                        <div>
+                            <label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:4px">Heen (km)</label>
+                            <input id="kmHeenInput" type="number" inputmode="numeric" min="0" step="1" value="0"
+                                style="width:100%;padding:14px;font-size:18px;border:2px solid #cfd8dc;border-radius:10px;text-align:center;font-weight:600">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:4px">Terug (km)</label>
+                            <input id="kmTerugInput" type="number" inputmode="numeric" min="0" step="1" value="0"
+                                style="width:100%;padding:14px;font-size:18px;border:2px solid #cfd8dc;border-radius:10px;text-align:center;font-weight:600">
+                        </div>
+                    </div>
+                    <button id="kmPromptSubmit" style="width:100%;padding:14px;background:var(--qe-darkblue);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600">
+                        Opslaan
+                    </button>
+                    <div id="kmPromptError" style="font-size:12px;color:#c62828;margin-top:8px;text-align:center;display:none"></div>
+                </div>`;
+            document.body.appendChild(m);
+
+            const heenEl = document.getElementById('kmHeenInput');
+            const terugEl = document.getElementById('kmTerugInput');
+            const errEl = document.getElementById('kmPromptError');
+            const btn = document.getElementById('kmPromptSubmit');
+
+            // Auto-focus heen veld + select-all
+            setTimeout(() => { try { heenEl.focus(); heenEl.select(); } catch(_) {} }, 100);
+
+            const submit = async () => {
+                const heen = Math.max(0, Math.round(parseFloat(heenEl.value) || 0));
+                const terug = Math.max(0, Math.round(parseFloat(terugEl.value) || 0));
+                btn.disabled = true;
+                btn.textContent = 'Opslaan...';
+                errEl.style.display = 'none';
+
+                try {
+                    const r = await RobawsAPI.addCommuteEntry({
+                        workOrderId,
+                        employeeId,
+                        distance: heen,
+                        returnDistance: terug,
+                    });
+                    if (r.code !== 200 && r.code !== 201) {
+                        throw new Error('Robaws (' + r.code + ')');
+                    }
+                    // Succes → modal weg
+                    m.remove();
+                    this.toast('Kilometers opgeslagen: ' + (heen + terug) + ' km');
+                    resolve(true);
+                } catch (e) {
+                    console.warn('[App] km POST faalde:', e && e.message);
+                    errEl.textContent = 'Opslaan mislukt: ' + (e && e.message || '?');
+                    errEl.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Opslaan';
+                }
+            };
+            btn.addEventListener('click', submit);
+            terugEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+            heenEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') terugEl.focus(); });
+        });
     },
 
     /**

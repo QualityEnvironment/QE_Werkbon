@@ -2810,38 +2810,55 @@ const RobawsAPI = {
         } catch(e) { /* fallback naar hardcoded waarden */ }
 
         // Stap 6: Werkbon + order status updaten op basis van betaalmethode
-        // Overschrijving/Viva wallet = betaald → "Gefactureerd"
-        // Cash = moet nagekeken worden → "Nakijken"
-        // Niet Ontvangen = laten zoals is
+        // v85: ALLE betalingsmethoden zetten werkbon + order op 'gefactureerd'.
+        // Voorheen enkel Viva/Overschrijving — nu ook Cash en Niet Ontvangen,
+        // omdat in alle gevallen een factuur wordt aangemaakt en de werkbon klaar is.
+        // (Monteurs-flow gebruikt executeMonteurSubmitFlow en raakt deze code niet.)
         let newStatus = null;
-        if (paymentMethod === 'Overschrijving ter plaatse' || paymentMethod === 'Viva wallet') {
+        if (paymentMethod) {
             newStatus = 'gefactureerd';
         }
 
         if (newStatus) {
-            // Werkbon status updaten
+            // v88: Werkbon status + Betaling extra-field updaten
             try {
                 const woFull = await this.get(`work-orders/${workOrderId}`);
                 if (woFull.code === 200 && woFull.data) {
                     woFull.data.status = newStatus;
+                    if (paymentMethod) {
+                        woFull.data.extraFields = woFull.data.extraFields || {};
+                        woFull.data.extraFields['Betaling'] = {
+                            type: 'SELECT',
+                            group: 'Betaling',
+                            stringValue: paymentMethod,
+                        };
+                    }
                     await this.put(`work-orders/${workOrderId}`, woFull.data);
-                    console.log(`[RobawsAPI] Werkbon ${workOrderId} status → ${newStatus}`);
+                    console.log(`[RobawsAPI] Werkbon ${workOrderId} status → ${newStatus}, Betaling → ${paymentMethod}`);
                 }
             } catch(e) {
-                console.warn('[RobawsAPI] Werkbon status updaten mislukt:', e);
+                console.warn('[RobawsAPI] Werkbon status/Betaling updaten mislukt:', e);
             }
 
-            // Sales order status updaten
+            // v88: Sales order status + Betaling extra-field updaten
             if (woSalesOrderId) {
                 try {
                     const soFull = await this.get(`sales-orders/${woSalesOrderId}`);
                     if (soFull.code === 200 && soFull.data) {
                         soFull.data.status = newStatus;
+                        if (paymentMethod) {
+                            soFull.data.extraFields = soFull.data.extraFields || {};
+                            soFull.data.extraFields['Betaling'] = {
+                                type: 'SELECT',
+                                group: 'Betaling',
+                                stringValue: paymentMethod,
+                            };
+                        }
                         await this.put(`sales-orders/${woSalesOrderId}`, soFull.data);
-                        console.log(`[RobawsAPI] Order ${woSalesOrderId} status → ${newStatus}`);
+                        console.log(`[RobawsAPI] Order ${woSalesOrderId} status → ${newStatus}, Betaling → ${paymentMethod}`);
                     }
                 } catch(e) {
-                    console.warn('[RobawsAPI] Order status updaten mislukt:', e);
+                    console.warn('[RobawsAPI] Order status/Betaling updaten mislukt:', e);
                 }
             }
         }
@@ -2960,6 +2977,21 @@ const RobawsAPI = {
     WERKUUR_ARTICLE_IDS: {
         monteurProject: 185,    // "Werkuur monteur - Project" - €65 verkoop
         ladenLossen: 19786,     // "Werkuur laden & lossen"     - €0 verkoop
+    },
+
+    /** v83: hourTypeId waarden voor uursoort in Robaws time-entries.
+     *  Zie GET /work-orders/{id}/time-entries response — werkuren=1, overuren=2. */
+    HOUR_TYPE_IDS: {
+        werkuren: 1,
+        overuren: 2,
+    },
+
+    /** v83: mobilityTypeId waarden voor commute-entries in Robaws.
+     *  -3 = "chauffeur zonder passagiers" (default voor werknemers).
+     *  Andere waarden bestaan ook (passagier, fiets, ...) maar voor de monteur-app
+     *  gebruiken we standaard chauffeur zonder passagiers. */
+    MOBILITY_TYPE_IDS: {
+        chauffeur: -3,
     },
 
     /** YYYY-MM-DD -> DD/MM/YYYY voor titel */
@@ -3121,6 +3153,9 @@ const RobawsAPI = {
         const te = {
             employeeId: String(employeeId),
             articleId: String(this.WERKUUR_ARTICLE_IDS.ladenLossen),
+            // v83: L&L is uursoort werkuren (kantoor kan dit later manueel naar
+            // overuren zetten als de monteur al 8u werkuren had geregistreerd).
+            hourTypeId: String(this.HOUR_TYPE_IDS.werkuren),
         };
         if (startTime) {
             const [sh, sm] = startTime.split(':').map(Number);
@@ -3143,6 +3178,8 @@ const RobawsAPI = {
         const { startTime, endTime } = opts;
         const body = {
             articleId: String(this.WERKUUR_ARTICLE_IDS.ladenLossen),
+            // v83: ook bij PUT update hourTypeId behouden (werkuren).
+            hourTypeId: String(this.HOUR_TYPE_IDS.werkuren),
         };
         if (startTime) {
             const [sh, sm] = startTime.split(':').map(Number);
@@ -3164,11 +3201,17 @@ const RobawsAPI = {
     },
 
         async addWorkHoursTimeEntry(opts) {
-        const { workOrderId, employeeId, startTime, endTime, breakMinutes, articleId } = opts;
+        const {
+            workOrderId, employeeId, startTime, endTime, breakMinutes, articleId,
+            // v83 nieuwe parameters:
+            hourTypeId,        // 1 = werkuren, 2 = overuren (HOUR_TYPE_IDS)
+            hoursOverride,     // expliciete uren (voor compensatie-entries zonder tijden)
+        } = opts;
         const te = {
             employeeId: String(employeeId),
             articleId: String(articleId),
         };
+        if (hourTypeId != null) te.hourTypeId = String(hourTypeId);
         if (startTime) {
             const [sh, sm] = startTime.split(':').map(Number);
             te.startTime = { hour: sh || 0, minute: sm || 0 };
@@ -3179,8 +3222,12 @@ const RobawsAPI = {
         }
         // v63: Robaws v2 wil 'breakMinutes' (we stuurden breakDuration en kreeg breakMinutes:0 terug)
         if (breakMinutes && breakMinutes > 0) te.breakMinutes = parseInt(breakMinutes, 10);
-        // Bereken hours uit start/end - pauze
-        if (startTime && endTime) {
+        // v83: hoursOverride wint van auto-calc (voor compensatie-entries die negatief zijn)
+        if (hoursOverride != null) {
+            te.hours = parseFloat(hoursOverride);
+            te.billableHours = parseFloat(hoursOverride);
+        } else if (startTime && endTime) {
+            // Bereken hours uit start/end - pauze
             const [sh, sm] = startTime.split(':').map(Number);
             const [eh, em] = endTime.split(':').map(Number);
             const minutes = ((eh || 0) * 60 + (em || 0)) - ((sh || 0) * 60 + (sm || 0)) - (parseInt(breakMinutes, 10) || 0);
@@ -3189,6 +3236,87 @@ const RobawsAPI = {
             te.billableHours = this._roundUpHalfHour(hrs);
         }
         return await this.post(`work-orders/${workOrderId}/time-entries`, te);
+    },
+
+    /**
+     * v88: Update Betaling extra-field op een document (werkbon / order / factuur).
+     * Doet GET (om bestaand object te krijgen), wijzigt extraFields.Betaling, doet PUT.
+     * Robaws v2 vereist het volledige object terug bij PUT.
+     *
+     * @param {string} resource - 'work-orders' | 'sales-orders' | 'sales-invoices'
+     * @param {string|number} id
+     * @param {string} paymentMethod - 'Viva wallet' | 'Cash' | 'Overschrijving' | 'Via factuur'
+     * @returns {Promise<{ok:boolean, code?:number, error?:string}>}
+     */
+    async updateBetalingField(resource, id, paymentMethod) {
+        try {
+            const fullRes = await this.get(`${resource}/${id}`);
+            if (fullRes.code !== 200 || !fullRes.data) {
+                return { ok: false, code: fullRes.code, error: 'GET faalde' };
+            }
+            const data = fullRes.data;
+            data.extraFields = data.extraFields || {};
+            data.extraFields['Betaling'] = {
+                type: 'SELECT',
+                group: 'Betaling',
+                stringValue: paymentMethod,
+            };
+            const putRes = await this.put(`${resource}/${id}`, data);
+            if (putRes.code !== 200 && putRes.code !== 204) {
+                return { ok: false, code: putRes.code, error: 'PUT faalde' };
+            }
+            return { ok: true, code: putRes.code };
+        } catch (e) {
+            return { ok: false, error: (e && e.message) || String(e) };
+        }
+    },
+
+    /**
+     * v88: Update de Betaling extra-field op alle 3 documenten (werkbon, order, factuur).
+     * Onafhankelijk — bij fout op één document gaan we door met de rest.
+     *
+     * @param {Object} ids - { workOrderId, salesOrderId, invoiceId }
+     * @param {string} paymentMethod
+     * @returns {Promise<{ok:boolean, results: {workOrder, salesOrder, invoice}}>}
+     */
+    async setBetalingOnAllDocs(ids, paymentMethod) {
+        const { workOrderId, salesOrderId, invoiceId } = ids || {};
+        const results = { workOrder: null, salesOrder: null, invoice: null };
+        if (workOrderId) {
+            results.workOrder = await this.updateBetalingField('work-orders', workOrderId, paymentMethod);
+        }
+        if (salesOrderId) {
+            results.salesOrder = await this.updateBetalingField('sales-orders', salesOrderId, paymentMethod);
+        }
+        if (invoiceId) {
+            results.invoice = await this.updateBetalingField('sales-invoices', invoiceId, paymentMethod);
+        }
+        const allOk = (!workOrderId || results.workOrder?.ok)
+            && (!salesOrderId || results.salesOrder?.ok)
+            && (!invoiceId || results.invoice?.ok);
+        return { ok: allOk, results };
+    },
+
+    /** v83: Voeg een kilometers/commute-lijn toe aan een werkbon.
+     *  @param {Object} opts
+     *  @param {string|number} opts.workOrderId
+     *  @param {string|number} opts.employeeId
+     *  @param {number} opts.distance - km heen
+     *  @param {number} [opts.returnDistance] - km terug (default 0)
+     *  @param {number} [opts.mobilityTypeId] - default -3 (chauffeur zonder passagiers)
+     *  @returns {Promise<{code:number, data:object}>}
+     */
+    async addCommuteEntry(opts) {
+        const {
+            workOrderId, employeeId, distance, returnDistance, mobilityTypeId,
+        } = opts;
+        const body = {
+            employeeId: String(employeeId),
+            mobilityTypeId: String(mobilityTypeId != null ? mobilityTypeId : this.MOBILITY_TYPE_IDS.chauffeur),
+            distance: parseFloat(distance) || 0,
+            returnDistance: parseFloat(returnDistance) || 0,
+        };
+        return await this.post(`work-orders/${workOrderId}/commute-entries`, body);
     },
 
     /**
@@ -3202,13 +3330,18 @@ const RobawsAPI = {
         // werkbonnen staan vooraan; 800 werkbonnen is ruim genoeg.
         // Smart break: stop zodra 2 opeenvolgende pages 0 nieuwe Tijdsregistratie
         // werkbonnen voor monthPrefix opleveren.
+        // v83b: BUG FIX — Robaws negeert ?page=N (elke "page" gaf dezelfde 100
+        // items), waardoor werkbonnen met lagere ID onbereikbaar waren (bv. id 1259
+        // voor 5/5/26). We gebruiken nu ?offset=N*limit i.p.v. ?page=N.
+        const LIMIT = 100;
         let allItems = [];
         const seenIds = new Set();
         let page = 0;
         const maxPages = 8;
         let emptyPagesInRow = 0;
         while (page < maxPages) {
-            const res = await this.get(`work-orders?limit=100&page=${page}&sort=id:desc`);
+            const offset = page * LIMIT;
+            const res = await this.get(`work-orders?limit=${LIMIT}&offset=${offset}&sort=id:desc`);
             if (res.code !== 200) {
                 throw new Error(`Tijdsregistratie-werkbonnen fetch faalde (${res.code})`);
             }
@@ -3261,8 +3394,11 @@ const RobawsAPI = {
         const today = this._localDateStr();
         const allItems = [];
         const seen = new Set();
+        // v83b: pagination fix — Robaws negeert ?page=N, gebruik ?offset=N*limit
+        const LIMIT = 100;
         for (let p = 0; p < 3; p++) {
-            const res = await this.get(`work-orders?limit=100&page=${p}&sort=id:desc`);
+            const offset = p * LIMIT;
+            const res = await this.get(`work-orders?limit=${LIMIT}&offset=${offset}&sort=id:desc`);
             if (res.code !== 200 || !res.data || !res.data.items || res.data.items.length === 0) break;
             for (const wo of res.data.items) {
                 if (wo.id == null || seen.has(String(wo.id))) continue;
