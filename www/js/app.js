@@ -38,6 +38,7 @@ const app = {
     _saveWoData() {
         try {
             // Sla alleen id/hours/materials/notes op (geen foto-data — te groot)
+            // Foto's worden in IndexedDB bewaard (zie _idb* helpers).
             const slim = {};
             for (const [id, d] of Object.entries(this.woData)) {
                 slim[id] = {
@@ -55,14 +56,132 @@ const app = {
     _restoreWoData() {
         try {
             const stored = localStorage.getItem('qe_woData');
-            if (!stored) return;
-            const slim = JSON.parse(stored);
-            for (const [id, d] of Object.entries(slim)) {
-                if (!this.woData[id]) {
-                    this.woData[id] = { hours: d.hours || [], materials: d.materials || [], photos: [], notes: d.notes || '', checklist: d.checklist || null, onderhoud: d.onderhoud || false };
+            if (stored) {
+                const slim = JSON.parse(stored);
+                for (const [id, d] of Object.entries(slim)) {
+                    if (!this.woData[id]) {
+                        this.woData[id] = { hours: d.hours || [], materials: d.materials || [], photos: [], notes: d.notes || '', checklist: d.checklist || null, onderhoud: d.onderhoud || false };
+                    }
                 }
             }
+            // v102+: foto's worden LAZY hersteld in openWorkorder() per WO,
+            // niet bij init. Voorkomt geheugendruk + langere init-tijd op toestellen
+            // met veel foto's in cache.
         } catch (e) {}
+    },
+
+    /**
+     * v102+: Lazy-load foto's uit IndexedDB voor een specifieke WO.
+     * Wordt aangeroepen in openWorkorder. Zo blijven foto's na refresh maar
+     * laden we niet alle foto-data tegelijk in RAM.
+     */
+    async _restorePhotosForWO(woId) {
+        try {
+            const db = await this._idbOpen();
+            const photos = await new Promise((resolve, reject) => {
+                const tx = db.transaction(this._IDB_STORE, 'readonly');
+                const idx = tx.objectStore(this._IDB_STORE).index('woId');
+                const req = idx.getAll(IDBKeyRange.only(String(woId)));
+                req.onsuccess = () => resolve(req.result || []);
+                req.onerror = () => reject(req.error);
+            });
+            if (!this.woData[woId]) {
+                this.woData[woId] = { hours: [], materials: [], photos: [], notes: '', checklist: null, onderhoud: false };
+            }
+            this.woData[woId].photos = this.woData[woId].photos || [];
+            for (const ph of photos) {
+                if (!this.woData[woId].photos.some(p => String(p.id) === String(ph.id))) {
+                    this.woData[woId].photos.push({ id: ph.id, data: ph.data, name: ph.name });
+                }
+            }
+            if (photos.length > 0) {
+                console.log('[App] ' + photos.length + ' foto(s) hersteld voor WO ' + woId);
+            }
+        } catch (e) {
+            console.warn('[App] _restorePhotosForWO faalde:', e && e.message);
+        }
+    },
+
+    // ========================================
+    // v101+: INDEXEDDB voor foto-persistentie
+    // ========================================
+    _IDB_NAME: 'qe_werkbon_db',
+    _IDB_VERSION: 1,
+    _IDB_STORE: 'photos',
+    _idbCached: null,
+
+    _idbOpen() {
+        if (this._idbCached) return Promise.resolve(this._idbCached);
+        return new Promise((resolve, reject) => {
+            if (!window.indexedDB) { reject(new Error('IndexedDB niet beschikbaar')); return; }
+            const req = indexedDB.open(this._IDB_NAME, this._IDB_VERSION);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(this._IDB_STORE)) {
+                    const store = db.createObjectStore(this._IDB_STORE, { keyPath: 'id' });
+                    store.createIndex('woId', 'woId', { unique: false });
+                }
+            };
+            req.onsuccess = () => { this._idbCached = req.result; resolve(req.result); };
+            req.onerror = () => reject(req.error);
+        });
+    },
+
+    async _idbSavePhoto(woId, photo) {
+        const db = await this._idbOpen();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(this._IDB_STORE, 'readwrite');
+            const store = tx.objectStore(this._IDB_STORE);
+            store.put({
+                id: String(photo.id),
+                woId: String(woId),
+                data: photo.data,
+                name: photo.name,
+                addedAt: Date.now(),
+            });
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+    },
+
+    async _idbDeletePhoto(photoId) {
+        const db = await this._idbOpen();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(this._IDB_STORE, 'readwrite');
+            tx.objectStore(this._IDB_STORE).delete(String(photoId));
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+    },
+
+    async _idbDeleteAllForWO(woId) {
+        const db = await this._idbOpen();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(this._IDB_STORE, 'readwrite');
+            const store = tx.objectStore(this._IDB_STORE);
+            const idx = store.index('woId');
+            const req = idx.openCursor(IDBKeyRange.only(String(woId)));
+            req.onsuccess = () => {
+                const cursor = req.result;
+                if (cursor) {
+                    cursor.delete();
+                    cursor.continue();
+                } else {
+                    resolve();
+                }
+            };
+            req.onerror = () => reject(req.error);
+        });
+    },
+
+    async _idbGetAllPhotos() {
+        const db = await this._idbOpen();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(this._IDB_STORE, 'readonly');
+            const req = tx.objectStore(this._IDB_STORE).getAll();
+            req.onsuccess = () => resolve(req.result || []);
+            req.onerror = () => reject(req.error);
+        });
     },
 
     // Ingediende uren bijhouden (keyed by WO id)
@@ -226,6 +345,34 @@ const app = {
         document.getElementById('loginScreen').classList.remove('hidden');
     },
 
+    /**
+     * v98+: zet een fetch/JSON-fout om naar een duidelijke Nederlandse
+     * foutmelding voor de monteur. Geeft hint of het aan internet,
+     * aan Robaws of aan onze app ligt.
+     */
+    _friendlyError(e) {
+        const msg = (e && e.message) || String(e || '');
+        if (!navigator.onLine) {
+            return 'Geen internet — controleer wifi/4G en probeer opnieuw';
+        }
+        if (/Failed to fetch|NetworkError|Network request failed/i.test(msg)) {
+            return 'Geen verbinding met de server — controleer internet';
+        }
+        if (/SyntaxError|Unexpected token|JSON/i.test(msg)) {
+            return 'Server gaf een ongeldig antwoord — probeer opnieuw';
+        }
+        if (/timeout|aborted/i.test(msg)) {
+            return 'Server reageert niet (timeout) — probeer opnieuw';
+        }
+        if (/40[134]/i.test(msg)) {
+            return 'Toegang geweigerd door server (' + msg + ')';
+        }
+        if (/50\d/i.test(msg)) {
+            return 'Serverfout (' + msg + ') — neem contact op met Levi';
+        }
+        return 'Fout: ' + (msg || 'onbekend');
+    },
+
     // PIN-flow stap 1: e-mail controleren, daarna PIN-stap tonen
     async loginCheckEmail() {
         const email = document.getElementById('loginEmail').value.trim().toLowerCase();
@@ -234,6 +381,10 @@ const app = {
         errorEl.textContent = '';
 
         if (!email) { errorEl.textContent = 'Vul je e-mailadres in'; return; }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            errorEl.textContent = 'Ongeldig e-mailadres';
+            return;
+        }
 
         btn.disabled = true;
         btn.textContent = 'Even kijken...';
@@ -243,6 +394,9 @@ const app = {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ email }),
             });
+            if (!res.ok) {
+                throw new Error('HTTP ' + res.status);
+            }
             const data = await res.json();
             if (!data.known) {
                 errorEl.textContent = 'Onbekend e-mailadres';
@@ -275,7 +429,8 @@ const app = {
             }
             setTimeout(() => document.getElementById('loginPin').focus(), 50);
         } catch (e) {
-            errorEl.textContent = 'Verbindingsfout — probeer opnieuw';
+            console.warn('[App] login email check fout:', e);
+            errorEl.textContent = this._friendlyError(e);
         } finally {
             btn.disabled = false;
             btn.textContent = 'Volgende';
@@ -319,15 +474,17 @@ const app = {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
             });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
             const data = await res.json();
-            if (!res.ok || data.error || !data.success) {
-                errorEl.textContent = data.error || 'Inloggen mislukt';
+            if (data.error || !data.success) {
+                errorEl.textContent = data.error || 'Verkeerde PIN — probeer opnieuw';
                 return;
             }
             this.currentUser = data.user;
             this.showApp();
         } catch (e) {
-            errorEl.textContent = 'Verbindingsfout — probeer opnieuw';
+            console.warn('[App] login PIN fout:', e);
+            errorEl.textContent = this._friendlyError(e);
         } finally {
             btn.disabled = false;
             btn.textContent = this._loginNeedsPinSetup ? 'PIN instellen & inloggen' : 'Inloggen';
@@ -506,14 +663,30 @@ const app = {
         // Dark mode toggle synchroniseren
         const dmToggle = document.getElementById('darkModeToggle');
         if (dmToggle) dmToggle.checked = document.body.classList.contains('dark-mode');
-        // App versie tonen — haal uit version.json
+        // App-versie tonen — Web (= www/git versie uit version.json)
+        // en APK-versie (uit native bridge, vereist v106+ APK; degradeert sierlijk).
         const versionEl = document.getElementById('appVersionInfo');
         if (versionEl) {
+            // Helper om APK-versie te lezen (graceful fallback)
+            const apkVer = (() => {
+                try {
+                    if (window.QEBridge && typeof QEBridge.getApkVersionName === 'function') {
+                        const n = QEBridge.getApkVersionName();
+                        if (n) return n;
+                    }
+                } catch(_e) {}
+                return null;
+            })();
             fetch('version.json?t=' + Date.now()).then(r => r.json()).then(d => {
-                versionEl.textContent = `Versie: ${d.version}`;
+                versionEl.innerHTML = apkVer
+                    ? `Web-versie: ${d.version}<br>App-versie: ${apkVer}`
+                    : `Versie: ${d.version}`;
             }).catch(() => {
                 const v = (window.QEBridge && QEBridge.getAppVersion) ? QEBridge.getAppVersion() : 0;
-                versionEl.textContent = v > 0 ? `Versie: ${v}` : 'Versie onbekend';
+                const line1 = v > 0 ? `Versie: ${v}` : 'Versie onbekend';
+                versionEl.innerHTML = apkVer
+                    ? `Web-versie: ${v > 0 ? v : '?'}<br>App-versie: ${apkVer}`
+                    : line1;
             });
         }
         const updateStatus = document.getElementById('updateStatus');
@@ -1104,17 +1277,51 @@ const app = {
         const planEnd = this.currentWO.endDate ? new Date(this.currentWO.endDate).toLocaleTimeString('nl-BE', {hour:'2-digit', minute:'2-digit'}) : '';
         const planTimeStr = planStart && planEnd ? `${planStart} - ${planEnd}` : (planStart || '');
 
+        // v103+: structuur
+        //   1) Werfadres (dagplanning) + navigatieknop
+        //   2) BTW tarief (altijd van Klant/Eigenaar)
+        //   3) Klant (Eigenaar) — eigen adres
+        //   4) ── scheiding ──
+        //   5) Eindklant (Bewoner) — eigen adres (alleen als verschillend van klant)
+        const endClient = this.currentWO.endClient || null;
+        const hasEndClient = endClient && (endClient.id || endClient.name)
+            && String(endClient.id || '') !== String(client.id || '');
+
+        const navLink = displayAddress
+            ? `<a href="https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(displayAddress)}" target="_blank" style="display:inline-flex;align-items:center;gap:4px;background:var(--qe-purple);color:#fff;padding:6px 10px;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none;white-space:nowrap">🗺️ Navigeer</a>`
+            : '';
+
+        const partyRows = (party) => {
+            if (!party) return '';
+            return `
+                <div class="info-row">
+                    <span class="info-icon">📍</span>
+                    <span class="info-label">Adres</span>
+                    <span class="info-value">${this.escapeHtml(party.address || '-')}</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-icon">📞</span>
+                    <span class="info-label">Telefoon</span>
+                    <span class="info-value">${party.tel ? `<a href="tel:${party.tel}">${this.escapeHtml(party.tel)}</a>` : '-'}</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-icon">✉️</span>
+                    <span class="info-label">Email</span>
+                    <span class="info-value">${party.email ? `<a href="mailto:${party.email}">${this.escapeHtml(party.email)}</a>` : '-'}</span>
+                </div>`;
+        };
+
         document.getElementById('clientInfo').innerHTML = `
-            <div class="info-row">
-                <span class="info-icon">👤</span>
-                <span class="info-label">Naam</span>
-                <span class="info-value">${this.escapeHtml(client.name || 'Onbekend')}</span>
-            </div>
-            <div class="info-row">
-                <span class="info-icon">📍</span>
-                <span class="info-label">Adres</span>
-                <span class="info-value">${this.escapeHtml(displayAddress || '-')}</span>
-            </div>
+            <!-- Werfadres + navigeer-knop -->
+            ${displayAddress ? `
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;background:rgba(0,0,0,0.04);border-radius:8px;margin-bottom:10px">
+                <div style="flex:1;min-width:0">
+                    <div style="font-size:11px;color:var(--qe-grey);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;margin-bottom:2px">Werfadres</div>
+                    <div style="font-size:14px;font-weight:500">${this.escapeHtml(displayAddress)}</div>
+                </div>
+                ${navLink}
+            </div>` : ''}
+
             ${planTimeStr ? `<div class="info-row">
                 <span class="info-icon">🕐</span>
                 <span class="info-label">Gepland</span>
@@ -1125,35 +1332,44 @@ const app = {
                 <span class="info-label">Omschrijving</span>
                 <span class="info-value">${planDescription.replace(/<[^>]*>/g, '') || '-'}</span>
             </div>` : ''}
-            <div class="info-row">
-                <span class="info-icon">📞</span>
-                <span class="info-label">Telefoon</span>
-                <span class="info-value">${client.tel ? `<a href="tel:${client.tel}">${this.escapeHtml(client.tel)}</a>` : '-'}</span>
-            </div>
-            <div class="info-row">
-                <span class="info-icon">✉️</span>
-                <span class="info-label">Email</span>
-                <span class="info-value">${client.email ? `<a href="mailto:${client.email}">${this.escapeHtml(client.email)}</a>` : '-'}</span>
-            </div>
-            <div class="info-row btw-row" style="background:rgba(106,44,145,0.06);border-radius:8px;padding:8px 12px;margin-top:4px">
+
+            <!-- BTW altijd van klant + aanpas-knop direct eronder -->
+            <div class="info-row btw-row" style="background:rgba(106,44,145,0.06);border-radius:8px;padding:8px 12px;margin:10px 0 6px">
                 <span class="info-icon">💰</span>
                 <span class="info-label">BTW tarief</span>
                 <span class="info-value" id="clientVatDisplay" style="font-weight:600;color:var(--qe-purple)">${client.vatTariffName ? this.escapeHtml(client.vatTariffName) : (client.vatPercentage !== null && client.vatPercentage !== undefined ? client.vatPercentage + '%' : 'Niet ingesteld')}</span>
             </div>
             ${client.id ? `<button class="btw-change-btn" onclick="app.openChangeVatTariff()"
-                style="width:100%;margin-top:8px;padding:10px;border:2px solid var(--qe-purple);border-radius:10px;
+                style="width:100%;margin:0 0 10px;padding:10px;border:2px solid var(--qe-purple);border-radius:10px;
                 background:transparent;color:var(--qe-purple);font-size:14px;font-weight:600;cursor:pointer;
                 display:flex;align-items:center;justify-content:center;gap:6px">
                 💰 BTW tarief aanpassen
             </button>` : ''}
-            ${displayAddress ? `
-            <button onclick="app.navigateToAddress('${this.escapeHtml(displayAddress).replace(/'/g, "\\'")}')"
-                style="width:100%;margin-top:10px;padding:12px;border:none;border-radius:10px;
-                background:linear-gradient(135deg,#6A2C91,#001E45);color:#fff;
-                font-size:15px;font-weight:600;cursor:pointer;display:flex;align-items:center;
-                justify-content:center;gap:8px;box-shadow:0 2px 8px rgba(106,44,145,0.3)">
-                🧭 Navigeer naar adres
-            </button>` : ''}
+
+            <!-- Klant (Eigenaar) -->
+            <div style="font-size:11px;color:var(--qe-grey);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;font-weight:600">
+                Klant <span style="font-style:italic;text-transform:none;color:var(--qe-purple);letter-spacing:normal;font-weight:500">(Eigenaar)</span>
+            </div>
+            <div class="info-row">
+                <span class="info-icon">👤</span>
+                <span class="info-label">Naam</span>
+                <span class="info-value">${this.escapeHtml(client.name || 'Onbekend')}</span>
+            </div>
+            ${partyRows(client)}
+
+            <!-- Eindklant (Bewoner) — alleen indien aanwezig en verschillend -->
+            ${hasEndClient ? `
+                <div style="height:1px;background:#e0e0e0;margin:14px 0 10px"></div>
+                <div style="font-size:11px;color:var(--qe-grey);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;font-weight:600">
+                    Eindklant <span style="font-style:italic;text-transform:none;color:var(--qe-orange);letter-spacing:normal;font-weight:500">(Bewoner)</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-icon">👤</span>
+                    <span class="info-label">Naam</span>
+                    <span class="info-value">${this.escapeHtml(endClient.name || '-')}</span>
+                </div>
+                ${partyRows(endClient)}
+            ` : ''}
         `;
 
         // Taakomschrijving tonen (detail van dagplanning — HTML uit Robaws)
@@ -2954,11 +3170,20 @@ const app = {
             this.compressPhoto(file, (dataUrl) => {
                 if (dataUrl) {
                     const name = file.name || `foto_${Date.now()}_${i}.jpg`;
-                    this.woData[this.currentWO.id].photos.push({
+                    const photo = {
                         id: Date.now() + i,
                         data: dataUrl,
                         name: name,
-                    });
+                    };
+                    try {
+                        this.woData[this.currentWO.id].photos.push(photo);
+                    } catch (errPush) {
+                        console.error('[App] photo push faalde:', errPush);
+                    }
+                    // v103+: foto's worden NIET meer in IndexedDB bewaard
+                    // (veroorzaakte camera-crash). Native MainActivity slaat
+                    // camera-foto's nu op in de Pictures/QE galerij, zodat
+                    // monteurs ze handmatig terug kunnen toevoegen na refresh.
                 } else {
                     failed++;
                 }
@@ -5865,26 +6090,31 @@ const app = {
                 const outS = ef.Uitgeklokt && ef.Uitgeklokt.stringValue;
                 if (!inS || !outS) return 0;
 
-                // v74: kwartier-afronding. In = round UP 15min (Bureau: max met startuur).
-                //       Uit = round DOWN 15min. Geldig voor multi-cycle dagen ook.
+                // v74: kwartier-afronding. In = round UP 15min. Uit = round DOWN 15min.
+                // Bureau scan \u2192 cap met startuur (Math.max). Camionet \u2192 g\u00e9\u00e9n cap.
+                // v95 tolerance al toegepast op roundUp15/roundDown15.
                 let totalMins = 0;
                 const lines = String(wo.remark || '').split(/\r?\n/);
                 const cycles = [];
                 let pendingIn = null;
+                let pendingInIsBureau = false;
                 for (const line of lines) {
-                    const inM = line.match(/klok-in:.*?\s\u2014\s(\d{1,2}:\d{2})\s*$/i);
+                    // Detecteer tag-type uit remark \u2014 "klok-in: bureau" of "klok-in: camionetX"
+                    const inM = line.match(/klok-in:\s*([^\u2014\-]+?)\s[\u2014\-]\s(\d{1,2}:\d{2})\s*$/i);
                     const outM = line.match(/klok-uit:.*?\s\u2014\s(\d{1,2}:\d{2})\s*$/i);
-                    if (inM) pendingIn = m(inM[1]);
-                    else if (outM && pendingIn !== null) {
-                        cycles.push([pendingIn, m(outM[1])]);
-                        pendingIn = null;
+                    if (inM) {
+                        pendingIn = m(inM[2]);
+                        pendingInIsBureau = /bureau/i.test(inM[1] || '');
+                    } else if (outM && pendingIn !== null) {
+                        cycles.push([pendingIn, m(outM[1]), pendingInIsBureau]);
+                        pendingIn = null; pendingInIsBureau = false;
                     }
                 }
                 if (cycles.length > 0) {
                     for (let i = 0; i < cycles.length; i++) {
-                        let [s, e] = cycles[i];
-                        // Eerste cycle: max(roundUp15, startuur). Andere: roundUp15.
-                        const sMin = (i === 0)
+                        let [s, e, isBureau] = cycles[i];
+                        // Bureau: cap met startuur. Camionet/L&L: geen cap.
+                        const sMin = isBureau
                             ? Math.max(roundUp15(s), userStartuurMin)
                             : roundUp15(s);
                         const eMin = roundDown15(e);
@@ -5893,6 +6123,7 @@ const app = {
                     totalMins -= userPauze;
                 } else {
                     // Fallback voor oudere werkbonnen (zonder klok-in/-uit regels)
+                    // \u2014 neem aan dat het Bureau is (cap met startuur)
                     const inMin = m(inS);
                     const outMin = roundDown15(m(outS));
                     const startMin = Math.max(roundUp15(inMin), userStartuurMin);
@@ -6805,9 +7036,12 @@ const app = {
             if (m) m.remove();
             m = document.createElement('div');
             m.id = 'kmPromptModal';
-            m.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;padding:16px';
+            // v96-fix: align-items:flex-start + padding-top:30px zodat de modal bovenaan
+            // staat ipv gecentreerd. Bij open toetsenbord blijft de hele inhoud zichtbaar
+            // en kan je naar boven scrollen om titel/subtitle/mobility/fiets te zien.
+            m.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,0.7);display:flex;align-items:flex-start;justify-content:center;padding:30px 16px 16px;overflow-y:auto;-webkit-overflow-scrolling:touch';
             m.innerHTML = `
-                <div style="background:#fff;border-radius:16px;max-width:420px;width:100%;padding:22px;box-shadow:0 8px 32px rgba(0,0,0,0.3);max-height:92vh;overflow-y:auto">
+                <div style="background:#fff;border-radius:16px;max-width:420px;width:100%;padding:22px;box-shadow:0 8px 32px rgba(0,0,0,0.3);box-sizing:border-box">
                     <div style="font-size:20px;font-weight:700;color:#1A237E;margin-bottom:6px;display:flex;align-items:center;gap:8px">
                         🚐 Kilometers vandaag
                     </div>
@@ -6843,9 +7077,19 @@ const app = {
                         </label>
                     </div>
 
-                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:14px;background:#fff8e1">
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:8px;background:#fff8e1">
                         <input id="kmFietsInput" type="checkbox" style="margin:0;width:20px;height:20px;cursor:pointer">
                         <span>🚲 Woonwerk-verkeer met de <strong>fiets</strong></span>
+                    </label>
+
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:8px;background:#e8f5e9">
+                        <input id="kmDirectThuisWerfInput" type="checkbox" style="margin:0;width:20px;height:20px;cursor:pointer">
+                        <span>🏠➡️🏗️ Rechtstreeks van <strong>thuis naar werf</strong> gereden</span>
+                    </label>
+
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:14px;background:#e8f5e9">
+                        <input id="kmDirectWerfThuisInput" type="checkbox" style="margin:0;width:20px;height:20px;cursor:pointer">
+                        <span>🏗️➡️🏠 Rechtstreeks van <strong>werf naar thuis</strong> gereden</span>
                     </label>
 
                     <button id="kmPromptSubmit" style="width:100%;padding:14px;background:#1A237E;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer">
@@ -6858,6 +7102,8 @@ const app = {
             const heenEl = document.getElementById('kmHeenInput');
             const terugEl = document.getElementById('kmTerugInput');
             const fietsEl = document.getElementById('kmFietsInput');
+            const directTWEl = document.getElementById('kmDirectThuisWerfInput');
+            const directWTEl = document.getElementById('kmDirectWerfThuisInput');
             const errEl = document.getElementById('kmPromptError');
             const btn = document.getElementById('kmPromptSubmit');
 
@@ -6870,6 +7116,8 @@ const app = {
                 const mobRadio = document.querySelector('input[name="kmMobility"]:checked');
                 const mobilityTypeId = mobRadio ? parseInt(mobRadio.value, 10) : -3;
                 const fiets = !!(fietsEl && fietsEl.checked);
+                const directThuisWerf = !!(directTWEl && directTWEl.checked);
+                const directWerfThuis = !!(directWTEl && directWTEl.checked);
 
                 btn.disabled = true;
                 btn.textContent = 'Opslaan...';
@@ -6888,31 +7136,53 @@ const app = {
                         throw new Error('Robaws (' + r.code + ')');
                     }
 
-                    // Stap 2: als woonwerk-fiets aangevinkt → set extraField op werkbon
-                    // (kantoor kan filteren voor fietsvergoeding HR/fiscaal)
-                    if (fiets) {
+                    // Stap 2: checkboxes (Fietsvergoeding + Rechtstreeks routes) → set
+                    // extraFields op de werkbon. Alleen aanraken als minstens één checked
+                    // is, en alle 3 in één PUT (anders 3 round-trips).
+                    if (fiets || directThuisWerf || directWerfThuis) {
                         try {
                             const woFull = await RobawsAPI.get(`work-orders/${workOrderId}`);
                             if (woFull.code === 200 && woFull.data) {
                                 woFull.data.extraFields = woFull.data.extraFields || {};
-                                woFull.data.extraFields['Woonwerk fiets'] = {
-                                    type: 'CHECKBOX',
-                                    group: null,
-                                    booleanValue: true,
-                                };
+                                if (fiets) {
+                                    woFull.data.extraFields['Fietsvergoeding'] = {
+                                        type: 'CHECKBOX',
+                                        group: 'Tijdsregistratie',
+                                        booleanValue: true,
+                                    };
+                                }
+                                if (directThuisWerf) {
+                                    woFull.data.extraFields['Rechtstreeks - Thuis / Werf'] = {
+                                        type: 'CHECKBOX',
+                                        group: 'Tijdsregistratie',
+                                        booleanValue: true,
+                                    };
+                                }
+                                if (directWerfThuis) {
+                                    woFull.data.extraFields['Rechtstreeks - Werf / Thuis'] = {
+                                        type: 'CHECKBOX',
+                                        group: 'Tijdsregistratie',
+                                        booleanValue: true,
+                                    };
+                                }
                                 await RobawsAPI.put(`work-orders/${workOrderId}`, woFull.data);
-                                console.log('[App] Woonwerk-fiets gemarkeerd op werkbon', workOrderId);
+                                console.log('[App] Tijdsregistratie checkboxes aangevinkt:',
+                                    {fiets, directThuisWerf, directWerfThuis}, 'op werkbon', workOrderId);
                             }
                         } catch (eFiets) {
-                            console.warn('[App] Woonwerk-fiets veld update faalde (niet kritiek):',
+                            console.warn('[App] Tijdsregistratie checkboxes update faalde (niet kritiek):',
                                 eFiets && eFiets.message);
                         }
                     }
 
                     // Succes → modal weg
                     m.remove();
-                    const fietsTxt = fiets ? ' · 🚲 fiets gemarkeerd' : '';
-                    this.toast('Kilometers opgeslagen: ' + (heen + terug) + ' km' + fietsTxt);
+                    const tags = [];
+                    if (fiets) tags.push('🚲');
+                    if (directThuisWerf) tags.push('🏠→🏗️');
+                    if (directWerfThuis) tags.push('🏗️→🏠');
+                    const tagTxt = tags.length ? ' · ' + tags.join(' ') : '';
+                    this.toast('Kilometers opgeslagen: ' + (heen + terug) + ' km' + tagTxt);
                     resolve(true);
                 } catch (e) {
                     console.warn('[App] km POST faalde:', e && e.message);
