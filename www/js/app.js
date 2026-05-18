@@ -269,10 +269,10 @@ const app = {
             window._qeBackHandlerInstalled = true;
         }
 
-        // Standaard PINs seeden (alleen als er nog geen PIN staat)
-        if (typeof RobawsAPI !== 'undefined' && RobawsAPI.seedDefaultPins) {
-            RobawsAPI.seedDefaultPins();
-        }
+        // v118: seedDefaultPins() VERWIJDERD — Robaws is nu de enige bron
+        // van PIN-validatie. Eventuele oude qe_pin_* keys in localStorage
+        // worden bij volgende online login automatisch opgeruimd
+        // (zie robaws-api.js login).
         // Ingediende werkorders + openstaande betalingen herstellen uit localStorage
         this._loadSubmittedWOs();
         // Herstel onafgemaakte werkorder-data (uren, materialen, notities)
@@ -520,7 +520,8 @@ const app = {
                 'qe_submitted_wos',
                 'qe_timer_state',
                 'qe_timer_correction',
-            
+                'qe_active_role_override',  // v117: test-rolwissel uit profiel
+
                 'qe_clock_pending_',       // v72: per-user pending sync queue (prefix-match)
             ];
             const planItemPrefix = 'planItem_';
@@ -691,6 +692,9 @@ const app = {
         }
         const updateStatus = document.getElementById('updateStatus');
         if (updateStatus) updateStatus.style.display = 'none';
+
+        // v117: rol-switcher card vullen + tonen (alleen voor bureel/technieker)
+        this.renderRoleSwitch();
 
         // === DEBUG NFC TESTER — verwijder dit blok na security audit ===
         // Toont alleen een knop als debug-nfc.html bestaat (= debug-build).
@@ -884,11 +888,418 @@ const app = {
     // registreren, geen prijzen, geen handtekening, geen betaling/factuur,
     // geen klantrapport. Alle andere rollen (Technieker, Projectleider, ...)
     // krijgen de volledige flow.
+    /**
+     * v117: actieve rol = basis-rol uit EMPLOYEES tenzij er een test-override
+     * is geactiveerd via het profielscherm. Bewaard in localStorage onder
+     * 'qe_active_role_override'. Geldigheid:
+     *   - monteur: kan NIET overriden (altijd monteur)
+     *   - technieker: kan overriden naar 'monteur' (niet 'bureel')
+     *   - bureel: kan overriden naar 'monteur' of 'technieker'
+     * Bij logout wordt de override gewist.
+     */
+    _activeRole() {
+        if (!this.currentUser) return null;
+        const base = this.currentUser.role;
+        if (base === 'monteur') return 'monteur'; // monteur: geen override toegestaan
+        let override = null;
+        try { override = localStorage.getItem('qe_active_role_override'); } catch(_) {}
+        if (!override) return base;
+        // Valideer override is toegestaan voor deze user
+        if (base === 'technieker' && (override === 'technieker' || override === 'monteur')) return override;
+        if (base === 'bureel' && (override === 'bureel' || override === 'technieker' || override === 'monteur')) return override;
+        return base;
+    },
     isMonteur() {
-        return !!(this.currentUser && this.currentUser.role === 'monteur');
+        return this._activeRole() === 'monteur';
     },
     isTechnieker() {
         return !this.isMonteur();
+    },
+
+    /** Rendert de rol-switcher card in het profielscherm. */
+    renderRoleSwitch() {
+        const card = document.getElementById('roleSwitchCard');
+        const sel = document.getElementById('roleSwitchSelect');
+        const note = document.getElementById('roleSwitchNote');
+        if (!card || !sel || !this.currentUser) return;
+
+        const base = this.currentUser.role;
+        // Monteurs zien deze card niet
+        if (base === 'monteur') {
+            card.style.display = 'none';
+            return;
+        }
+        card.style.display = '';
+
+        // Opties op basis van basis-rol
+        let options;
+        if (base === 'bureel') {
+            options = [
+                { value: 'bureel',     label: 'Bureel (standaard)' },
+                { value: 'technieker', label: 'Technieker' },
+                { value: 'monteur',    label: 'Monteur' },
+            ];
+        } else {
+            // technieker
+            options = [
+                { value: 'technieker', label: 'Technieker (standaard)' },
+                { value: 'monteur',    label: 'Monteur' },
+            ];
+        }
+
+        const active = this._activeRole();
+        sel.innerHTML = options.map(o =>
+            `<option value="${o.value}" ${o.value === active ? 'selected' : ''}>${o.label}</option>`
+        ).join('');
+
+        // Indicator zichtbaar als override actief is
+        if (active !== base) {
+            note.style.display = '';
+            note.textContent = '⚠ Test-modus: app gedraagt zich als ' + active +
+                ' (basis-rol: ' + base + ').';
+        } else {
+            note.style.display = 'none';
+            note.textContent = '';
+        }
+    },
+
+    /** Schakelt naar een andere actieve rol. */
+    switchActiveRole(newRole) {
+        if (!this.currentUser) return;
+        const base = this.currentUser.role;
+        // Validatie
+        if (base === 'monteur') {
+            this.toast('Monteurs kunnen niet van rol wisselen');
+            return;
+        }
+        const allowed = (base === 'bureel')
+            ? ['bureel', 'technieker', 'monteur']
+            : ['technieker', 'monteur'];
+        if (!allowed.includes(newRole)) {
+            this.toast('Deze rol is niet toegestaan voor jou');
+            return;
+        }
+
+        try {
+            if (newRole === base) {
+                localStorage.removeItem('qe_active_role_override');
+            } else {
+                localStorage.setItem('qe_active_role_override', newRole);
+            }
+        } catch(_) {}
+
+        this.renderRoleSwitch();
+        this.toast('Actieve rol: ' + newRole);
+
+        // Sommige UI-elementen renderen op basis van rol — herlaad de planning
+        // zodat bv. monteur-knoppen verschijnen/verdwijnen waar nodig.
+        if (this.currentScreen === 'screenPlanning') {
+            this.loadPlanning();
+        }
+    },
+
+    // ========================================
+    // v116: UITKLOK-CHECK — openstaande werkbons
+    // ========================================
+    // Wordt aangeroepen door clock.js vóór `_clockOut`. Gedrag:
+    //  - Geen openstaande werkbons → laat uitklokken door (return true).
+    //  - Technieker / bureel + ≥1 openstaande → blokkeer (return false).
+    //  - Monteur + >1 openstaande → blokkeer (return false).
+    //  - Monteur + 1 openstaande → vraag overname:
+    //        Ja → werknemer-aanvink-modal → vul uren in op die werkbon
+    //             → auto-submit via executeMonteurSubmitFlow → return true.
+    //        Nee → blokkeer (return false).
+    async checkAndHandleOpenWorkordersBeforeClockOut(session) {
+        if (!this.currentUser) return true; // safety: geen user → laat door
+
+        // v126: loading-spinner tijdens de planning-fetch
+        if (typeof this.showScanLoading === 'function') {
+            try { this.showScanLoading('Openstaande werkbons checken…'); } catch(_) {}
+        }
+        const hideLoad = () => {
+            if (typeof this.hideScanLoading === 'function') {
+                try { this.hideScanLoading(); } catch(_) {}
+            }
+        };
+
+        // 1. Vandaag-planning ophalen (met hasWerkbon-vlag)
+        let openItems = [];
+        try {
+            const today = RobawsAPI._localDateStr();
+            const empId = this.currentUser.robawsEmployeeId;
+            const userId = this.currentUser.robawsUserId;
+            const planning = await RobawsAPI.getPlanning(empId, today, userId);
+            const items = (planning && planning.items) || [];
+            openItems = items.filter(w => !w.hasWerkbon);
+        } catch(e) {
+            console.warn('[ClockOut-check] planning fetch faalde:', e && e.message);
+            // Bij API-fout: laat uitklokken toch toe — we willen geen
+            // werknemer-blokkade op infrastructuur-issues.
+            hideLoad();
+            return true;
+        }
+
+        if (openItems.length === 0) { hideLoad(); return true; }
+
+        const isMonteur = this.isMonteur();
+
+        // Vanaf hier komen er modals — spinner verbergen zodat die zichtbaar zijn
+        hideLoad();
+
+        // Technieker / bureel: altijd blokkeren bij open
+        if (!isMonteur) {
+            await this._showMessageModal(
+                'Openstaande werkbon',
+                `Je hebt nog ${openItems.length} openstaande ${openItems.length === 1 ? 'werkbon' : 'werkbons'}. ` +
+                'Werk die eerst af voor je uitklokt.'
+            );
+            return false;
+        }
+
+        // Monteur + >1 open → blokkeren
+        if (openItems.length > 1) {
+            await this._showMessageModal(
+                'Te veel openstaande werkbons',
+                `Je hebt ${openItems.length} openstaande werkbons. Auto-overname werkt alleen bij ` +
+                '1 openstaande werkbon. Werk de extra eerst manueel af.'
+            );
+            return false;
+        }
+
+        // Monteur + exact 1 open → vraag overname
+        const wo = openItems[0];
+        const accepted = await this._showKlokOvernameConfirm(wo);
+        if (!accepted) {
+            await this._showMessageModal(
+                'Niet uitgeklokt',
+                'Je mag niet uitklokken met een openstaande werkbon. Vul hem eerst af.'
+            );
+            return false;
+        }
+
+        // Werknemer-aanvink
+        const employees = await this._showEmployeeCheckList(wo);
+        if (!employees || employees.length === 0) {
+            // Gebruiker heeft geannuleerd of geen werknemers → niet uitklokken
+            return false;
+        }
+
+        // Vul uren in op de werkbon's woData
+        this._fillKlokurenForMonteur(wo, employees, session);
+
+        // Set currentWO + automatische uurcode (monteurProject)
+        this.currentWO = wo;
+        this.selectedUurcode = {
+            id: RobawsAPI.WERKUUR_ARTICLE_IDS.monteurProject,
+            name: 'Werkuur monteur - Project',
+            salePrice: 65,
+        };
+
+        // Auto-submit. executeMonteurSubmitFlow navigeert intern naar planning;
+        // dat is OK — daarna mag uitklokken alsnog doorgaan.
+        try {
+            await this.executeMonteurSubmitFlow();
+        } catch(e) {
+            console.warn('[ClockOut-check] monteur auto-submit faalde:', e && e.message);
+            await this._showMessageModal(
+                'Werkbon niet verzonden',
+                'De werkbon kon niet automatisch verstuurd worden. ' +
+                'Vul hem manueel af voor je uitklokt.'
+            );
+            return false;
+        }
+        return true; // OK om uit te klokken
+    },
+
+    /** Vul uren-blokken in op woData voor elke aangevinkte werknemer.
+     *  Eén blok per werknemer met dezelfde start/eind/duur/pauze. */
+    _fillKlokurenForMonteur(wo, employees, session) {
+        const woId = wo.id;
+        if (!this.woData[woId]) {
+            this.woData[woId] = { hours: [], materials: [], photos: [], notes: '' };
+        }
+
+        // v74 kwartier-afronding zoals _clockOut hem berekent (4 min tolerantie)
+        const TOL = 4;
+        const roundUp15 = (mins) => {
+            const r = mins % 15;
+            if (r > 0 && r <= TOL) return mins - r;
+            return Math.ceil(mins / 15) * 15;
+        };
+        const roundDown15 = (mins) => {
+            const r = mins % 15;
+            const d = (15 - r) % 15;
+            if (d > 0 && d <= TOL) return mins + d;
+            return Math.floor(mins / 15) * 15;
+        };
+        const toMin = (hhmm) => {
+            const parts = String(hhmm).split(':');
+            return (parseInt(parts[0], 10) || 0) * 60 + (parseInt(parts[1], 10) || 0);
+        };
+        const fromMin = (mins) => {
+            const h = Math.floor(mins / 60) % 24;
+            const m = mins % 60;
+            return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+        };
+
+        // Start = session start tijd, eind = huidige tijd
+        const startTime = session && session.startTime ? session.startTime : '08:00';
+        const now = new Date();
+        const endTimeRaw = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
+
+        const entryStartMin = roundUp15(toMin(startTime));
+        const entryEndMin   = roundDown15(toMin(endTimeRaw));
+        const entryStart = fromMin(entryStartMin);
+        const entryEnd   = fromMin(entryEndMin);
+
+        // Pauze: persoonlijke pauze van de uitklokkende monteur
+        const pauze = (window.QEClock && QEClock._personalPauze != null)
+            ? QEClock._personalPauze : 60;
+
+        const grossMin = Math.max(0, entryEndMin - entryStartMin);
+        const netMin = Math.max(0, grossMin - pauze);
+
+        const baseId = Date.now();
+        employees.forEach((emp, idx) => {
+            this.woData[woId].hours.push({
+                id: baseId + idx,
+                type: 'klant',
+                startTime: entryStart,
+                endTime: entryEnd,
+                duration: netMin,
+                pauze: pauze,
+                employeeId: String(emp.id),
+                employeeName: emp.name,
+            });
+        });
+
+        this._saveWoData();
+        console.log('[ClockOut-check] uren ingevuld op werkbon', woId,
+            entryStart, '->', entryEnd, 'voor', employees.map(e => e.name).join(', '));
+    },
+
+    /** Modal die de monteur vraagt of hij de geklokte uren wil overnemen. */
+    async _showKlokOvernameConfirm(wo) {
+        return new Promise(resolve => {
+            const clientName = (wo.client && wo.client.name) || wo.summary || 'Werkbon';
+            document.getElementById('modalContent').innerHTML = `
+                <h3>⏰ Geklokte uren overnemen?</h3>
+                <p style="font-size:14px;color:var(--qe-grey);margin:8px 0 14px">
+                    Je hebt nog een openstaande werkbon:
+                </p>
+                <div style="background:#f8f9fa;border-radius:10px;padding:14px;margin-bottom:14px;border-left:4px solid var(--qe-purple)">
+                    <div style="font-weight:600;font-size:15px">${this.escapeHtml(clientName)}</div>
+                    ${wo.summary && clientName !== wo.summary
+                        ? `<div style="font-size:12px;color:var(--qe-grey);margin-top:4px">${this.escapeHtml(wo.summary)}</div>`
+                        : ''}
+                </div>
+                <p style="font-size:14px;line-height:1.45;margin-bottom:14px">
+                    Wil je de geklokte uren overnemen naar deze werkbon en automatisch versturen?
+                    Daarna word je uitgeklokt.
+                </p>
+                <button onclick="window._klokOvResp(true)" class="btn btn-primary btn-full"
+                    style="padding:14px;font-size:15px;margin-bottom:8px">
+                    ✓ Ja, overnemen + uitklokken
+                </button>
+                <button onclick="window._klokOvResp(false)" class="btn btn-outline btn-full"
+                    style="padding:12px;font-size:14px">
+                    Nee, blijf ingeklokt
+                </button>
+            `;
+            this.openModal();
+            window._klokOvResp = (val) => {
+                this.closeModal();
+                delete window._klokOvResp;
+                resolve(val);
+            };
+        });
+    },
+
+    /** Modal met checkbox-lijst van werknemers gelinkt aan de werkbon.
+     *  Returns: array van { id, name } of null bij annuleren. */
+    async _showEmployeeCheckList(wo) {
+        const empIds = (wo.employeeIds || []).map(String);
+        let employees = [];
+        try {
+            employees = empIds.length > 0 ? await this._getEmployeeNames(empIds) : [];
+        } catch(e) {
+            console.warn('[ClockOut-check] _getEmployeeNames faalde:', e && e.message);
+        }
+        // Fallback: alleen huidige user
+        if (employees.length === 0 && this.currentUser) {
+            employees = [{
+                id: String(this.currentUser.robawsEmployeeId),
+                name: this.currentUser.name || 'Ik',
+            }];
+        }
+
+        return new Promise(resolve => {
+            const checkboxes = employees.map(e => `
+                <label style="display:flex;align-items:center;gap:12px;padding:12px 14px;
+                    border:1px solid #ddd;border-radius:10px;margin-bottom:8px;cursor:pointer;
+                    background:#fff">
+                    <input type="checkbox" class="emp-check"
+                        data-id="${this.escapeHtml(String(e.id))}"
+                        data-name="${this.escapeHtml(e.name)}"
+                        checked
+                        style="width:22px;height:22px;cursor:pointer">
+                    <span style="font-size:15px;font-weight:500">${this.escapeHtml(e.name)}</span>
+                </label>
+            `).join('');
+
+            document.getElementById('modalContent').innerHTML = `
+                <h3>👷 Voor wie zijn de uren?</h3>
+                <p style="font-size:13px;color:var(--qe-grey);margin:8px 0 14px;line-height:1.4">
+                    Vink aan wie er vandaag op deze werkbon werkte.
+                    Iedereen krijgt dezelfde uren.
+                </p>
+                ${checkboxes}
+                <button onclick="window._klokEmpResp(true)" class="btn btn-primary btn-full"
+                    style="padding:14px;font-size:15px;margin-top:14px">
+                    ✓ Bevestigen
+                </button>
+                <button onclick="window._klokEmpResp(false)" class="btn btn-outline btn-full"
+                    style="padding:12px;font-size:14px;margin-top:8px">
+                    Annuleren
+                </button>
+            `;
+            this.openModal();
+            window._klokEmpResp = (ok) => {
+                if (!ok) {
+                    this.closeModal();
+                    delete window._klokEmpResp;
+                    resolve(null);
+                    return;
+                }
+                const checked = Array.from(document.querySelectorAll('.emp-check:checked'))
+                    .map(cb => ({ id: cb.dataset.id, name: cb.dataset.name }));
+                this.closeModal();
+                delete window._klokEmpResp;
+                resolve(checked);
+            };
+        });
+    },
+
+    /** Simpele info-modal met 1 OK-knop. */
+    async _showMessageModal(title, message) {
+        return new Promise(resolve => {
+            document.getElementById('modalContent').innerHTML = `
+                <h3>${this.escapeHtml(title)}</h3>
+                <p style="margin:14px 0;font-size:14px;line-height:1.5;color:var(--qe-darkblue)">
+                    ${this.escapeHtml(message)}
+                </p>
+                <button onclick="window._klokMsgResp()" class="btn btn-primary btn-full"
+                    style="padding:14px;font-size:15px;margin-top:8px">
+                    OK
+                </button>
+            `;
+            this.openModal();
+            window._klokMsgResp = () => {
+                this.closeModal();
+                delete window._klokMsgResp;
+                resolve();
+            };
+        });
     },
 
     async backgroundSync() {
@@ -994,11 +1405,24 @@ const app = {
     },
 
     // ========================================
-    // DATE STRIP — vandaag en volgende werkdag (weekend skippen)
+    // DATE STRIP — vorige werkdag + vandaag + volgende werkdag (weekend skippen)
+    // v112: 3 chips i.p.v. 2 — monteurs moeten ook werkbonnen van gisteren
+    // (of vorige vrijdag, op maandag) kunnen inzien en invullen.
     // ========================================
     buildDateStrip() {
         const strip = document.getElementById('dateStrip');
         const today = new Date();
+
+        // v112: skip weekend voor "vorige werkdag"
+        //   - maandag → vrijdag (3 dagen terug)
+        //   - zondag  → vrijdag (2 dagen terug)
+        //   - zaterdag → vrijdag (1 dag terug)
+        //   - andere dagen → −1 dag
+        const prev = new Date(today);
+        prev.setDate(today.getDate() - 1);
+        while (prev.getDay() === 0 || prev.getDay() === 6) {
+            prev.setDate(prev.getDate() - 1);
+        }
 
         // v92+: skip weekend voor "volgende werkdag"
         //   - vrijdag → maandag (3 dagen verder)
@@ -1014,7 +1438,13 @@ const app = {
         const days = ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'];
         const months = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
 
-        const dates = [today, next];
+        const dates = [prev, today, next];
+
+        // Bepaal label voor "vorige werkdag" — Gisteren als het echt -1 dag is,
+        // anders de weekdag-naam (bv. "Vrijdag" als vandaag maandag is).
+        const yesterdayReal = new Date(today);
+        yesterdayReal.setDate(today.getDate() - 1);
+        const prevIsRealYesterday = prev.toDateString() === yesterdayReal.toDateString();
 
         // Bepaal het label voor de "volgende werkdag" — afhankelijk van of het morgen
         // letterlijk is, of een andere weekdag (bv. ma als het vandaag vr is)
@@ -1027,9 +1457,12 @@ const app = {
             const dateStr = this._localDateStr(d);
             const isToday = d.toDateString() === today.toDateString();
             const isActive = d.toDateString() === this.currentDate.toDateString();
+            const isPrev = d.toDateString() === prev.toDateString();
             const label = isToday
                 ? 'Vandaag'
-                : (nextIsRealTomorrow ? 'Morgen' : dayNames[d.getDay()]);
+                : isPrev
+                    ? (prevIsRealYesterday ? 'Gisteren' : dayNames[d.getDay()])
+                    : (nextIsRealTomorrow ? 'Morgen' : dayNames[d.getDay()]);
 
             return `
                 <div class="date-chip ${isActive ? 'active' : ''} ${isToday ? 'today' : ''}"
@@ -2060,23 +2493,44 @@ const app = {
                 </select>
             </div>` : '';
 
+        // v112: Pincode-stijl tijdinvoer — losse uren-/minuten-inputs met
+        // numeriek toetsenbord. Smart auto-pad:
+        //  - Uren: cijfers 0-2 wachten op een 2e (kan 00-23 worden),
+        //          cijfers 3-9 worden meteen "0X" en focus springt verder.
+        //  - Minuten: cijfers 0-5 wachten op een 2e (kan 00-59 worden),
+        //             cijfers 6-9 worden meteen "0X" en focus springt verder.
+        //  - Bij blur: padding leading zero + clamp naar geldige range.
+        const pinInput = (id, value, nextId, mode) => `
+            <input type="text"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                maxlength="2"
+                class="form-input pin-time"
+                id="${id}"
+                value="${String(value).padStart(2,'0')}"
+                onfocus="this.select()"
+                oninput="app._pinTimeInput(this, '${mode}'${nextId ? ", '" + nextId + "'" : ''})"
+                onblur="app._pinTimeBlur(this, '${mode}')"
+                style="flex:1;text-align:center;font-size:20px;font-weight:600;letter-spacing:2px;padding:14px 8px">
+        `;
+
         document.getElementById('modalContent').innerHTML = `
             <h3>${label}</h3>
             ${employeeSelect}
             <div class="form-group" style="margin-bottom:12px">
                 <label>Van</label>
                 <div style="display:flex;gap:8px;align-items:center">
-                    <select class="form-input" id="fromH" style="flex:1">${hourOpts(nowH)}</select>
-                    <span style="font-size:20px;font-weight:600">:</span>
-                    <select class="form-input" id="fromM" style="flex:1">${minOpts(nowM)}</select>
+                    ${pinInput('fromH', nowH, 'fromM', 'hour')}
+                    <span style="font-size:24px;font-weight:700">:</span>
+                    ${pinInput('fromM', nowM, 'toH', 'minute')}
                 </div>
             </div>
             <div class="form-group" style="margin-bottom:12px">
                 <label>Tot</label>
                 <div style="display:flex;gap:8px;align-items:center">
-                    <select class="form-input" id="toH" style="flex:1">${hourOpts((nowH + 1) % 24)}</select>
-                    <span style="font-size:20px;font-weight:600">:</span>
-                    <select class="form-input" id="toM" style="flex:1">${minOpts(nowM)}</select>
+                    ${pinInput('toH', (nowH + 1) % 24, 'toM', 'hour')}
+                    <span style="font-size:24px;font-weight:700">:</span>
+                    ${pinInput('toM', nowM, null, 'minute')}
                 </div>
             </div>
             <div class="form-group" style="margin-bottom:12px">
@@ -2088,11 +2542,105 @@ const app = {
         `;
     },
 
+    /**
+     * v112: helper voor de pincode-stijl tijdinvoer. Smart auto-pad:
+     *   - mode='hour':   cijfers 3-9 worden meteen "0X" en focus springt
+     *                    door. Cijfers 0-2 wachten op een 2e cijfer.
+     *   - mode='minute': cijfers 6-9 worden meteen "0X" en focus springt
+     *                    door. Cijfers 0-5 wachten op een 2e cijfer.
+     * Bij 2 cijfers: range-validatie (uur max 23, minuut max 59).
+     * Bij ongeldig 2-cijferig getal: trim naar 1 cijfer met leading zero,
+     * zodat de gebruiker opnieuw kan typen.
+     */
+    _pinTimeInput(input, mode, nextFieldId) {
+        // Strip niet-numerieke karakters
+        let v = (input.value || '').replace(/[^0-9]/g, '');
+        if (v !== input.value) input.value = v;
+        if (v.length === 0) return;
+
+        const max = (mode === 'hour') ? 23 : 59;
+        const padThreshold = (mode === 'hour') ? 3 : 6;
+
+        if (v.length === 1) {
+            const d = parseInt(v, 10);
+            if (d >= padThreshold) {
+                // Cijfer kan niet als eerste van een 2-cijferig getal werken
+                // → forceer "0X" en spring door naar volgend veld
+                input.value = '0' + v;
+                if (nextFieldId) {
+                    const next = document.getElementById(nextFieldId);
+                    if (next) { next.focus(); next.select(); }
+                } else {
+                    input.blur();
+                }
+            }
+            // else: wachten op 2e cijfer
+            return;
+        }
+
+        if (v.length === 2) {
+            const num = parseInt(v, 10);
+            if (num > max) {
+                // 2e cijfer maakt het ongeldig → strip 2e cijfer en pad
+                // het 1e met leading zero zodat de gebruiker opnieuw kan typen
+                input.value = '0' + v[0];
+                // Nu staat er bv. "07" — als die ook > max is, clamp.
+                if (parseInt(input.value, 10) > max) {
+                    input.value = String(max).padStart(2, '0');
+                }
+                // Spring door (we hebben nu 2 geldige cijfers)
+                if (nextFieldId) {
+                    const next = document.getElementById(nextFieldId);
+                    if (next) { next.focus(); next.select(); }
+                } else {
+                    input.blur();
+                }
+                return;
+            }
+            // Geldig 2-cijferig getal → spring door
+            if (nextFieldId) {
+                const next = document.getElementById(nextFieldId);
+                if (next) { next.focus(); next.select(); }
+            } else {
+                input.blur();
+            }
+        }
+    },
+
+    /**
+     * v112: bij verlaten van een pin-input: leading zero padding en
+     * range-clamp. Lege input wordt "00".
+     */
+    _pinTimeBlur(input, mode) {
+        let v = (input.value || '').replace(/[^0-9]/g, '');
+        if (v.length === 0) {
+            input.value = '00';
+            return;
+        }
+        if (v.length === 1) v = '0' + v;
+        const max = (mode === 'hour') ? 23 : 59;
+        let num = parseInt(v, 10);
+        if (num > max) num = max;
+        input.value = String(num).padStart(2, '0');
+    },
+
     saveManualHours(type) {
-        const fh = parseInt(document.getElementById('fromH').value);
-        const fm = parseInt(document.getElementById('fromM').value);
-        const th = parseInt(document.getElementById('toH').value);
-        const tm = parseInt(document.getElementById('toM').value);
+        // v112: pin-inputs kunnen lege strings of buiten-range waarden geven.
+        // Parse defensief en valideer uren 0-23, minuten 0-59.
+        const parseHM = (raw, max) => {
+            const n = parseInt(raw, 10);
+            if (isNaN(n)) return null;
+            if (n < 0 || n > max) return null;
+            return n;
+        };
+        const fh = parseHM(document.getElementById('fromH').value, 23);
+        const fm = parseHM(document.getElementById('fromM').value, 59);
+        const th = parseHM(document.getElementById('toH').value,   23);
+        const tm = parseHM(document.getElementById('toM').value,   59);
+        if (fh == null || fm == null || th == null || tm == null) {
+            this.toast('Vul geldige tijden in (00:00–23:59)');
+            return;
+        }
         const from = String(fh).padStart(2,'0') + ':' + String(fm).padStart(2,'0');
         const to = String(th).padStart(2,'0') + ':' + String(tm).padStart(2,'0');
         const pauze = parseInt(document.getElementById('hourPauze')?.value || 0);
@@ -4115,6 +4663,49 @@ const app = {
         };
     },
 
+    /**
+     * v112: Foto's uploaden naar een sales-invoice in Robaws.
+     * Werkt rechtstreeks vanuit JS (geen server-side proxy) want de
+     * Robaws-credentials zitten reeds in RobawsAPI. Wordt vanuit
+     * executeSubmitFlow aangeroepen ná invoice-creation, zodat dezelfde
+     * foto's die op de werkbon staan ook bij de factuur-bestanden te
+     * vinden zijn.
+     */
+    async _uploadPhotosToInvoice(photos, invoiceId) {
+        if (!photos || !photos.length || !invoiceId) return;
+        const auth = btoa(RobawsAPI.API_KEY + ':' + RobawsAPI.API_SECRET);
+        const BASE = RobawsAPI.BASE_URL || 'https://app.robaws.com/api/v2';
+        for (let i = 0; i < photos.length; i++) {
+            const p = photos[i];
+            const name = (p && p.name) || ('foto_' + (i + 1) + '.jpg');
+            try {
+                let base64 = (p && p.data) || '';
+                if (base64.includes(',')) base64 = base64.split(',')[1];
+                const binary = atob(base64);
+                const bytes = new Uint8Array(binary.length);
+                for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
+                let mime = 'image/jpeg';
+                if (/\.png$/i.test(name)) mime = 'image/png';
+                else if (/\.heic$/i.test(name)) mime = 'image/heic';
+                else if (/\.webp$/i.test(name)) mime = 'image/webp';
+                const blob = new Blob([bytes], { type: mime });
+                const fd = new FormData();
+                fd.append('file', blob, name);
+                const res = await fetch(BASE + '/sales-invoices/' + invoiceId + '/documents', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': 'Basic ' + auth,
+                        'X-Tenant': RobawsAPI.TENANT,
+                    },
+                    body: fd,
+                });
+                console.log('[Photo→Invoice] ' + name + ' → HTTP ' + res.status);
+            } catch (e) {
+                console.warn('[Photo→Invoice] upload mislukt voor ' + name + ':', e && e.message);
+            }
+        }
+    },
+
     async _uploadPhotosAndSignature(data, workOrderId, signatureName, signatureData) {
         // Foto's
         if (data.photos.length > 0 && workOrderId) {
@@ -4373,6 +4964,17 @@ const app = {
                     }
                 } catch (e) {
                     console.warn('[App] Refetch factuur faalde:', e && e.message);
+                }
+            }
+
+            // v112: dezelfde foto's die op de werkbon staan ook uploaden naar
+            // de factuur-bestanden. Loopt parallel met de werkbon-flow zodat
+            // bv. de boekhouding ze direct bij de factuur ziet hangen.
+            if (invoiceId && data.photos && data.photos.length > 0) {
+                try {
+                    await this._uploadPhotosToInvoice(data.photos, invoiceId);
+                } catch (e) {
+                    console.warn('[App] Foto-upload naar factuur faalde (niet kritiek):', e && e.message);
                 }
             }
 
@@ -7051,10 +7653,262 @@ const app = {
         return '+++' + s.substr(0, 3) + '/' + s.substr(3, 4) + '/' + s.substr(7, 5) + '+++';
     },
 
+    // ================================================================
+    // v119+: AUTO-KM BEREKENING via Google Routes API
+    // ----------------------------------------------------------------
+    //  Start/eind = bureau, tenzij "rechtstreeks van/naar thuis" → dan
+    //  het werknemer-adres uit Robaws. Werf-adressen uit dagplanning.
+    //  heen = startAddr → eerste werf van de dag
+    //  terug = laatste werf van de dag → endAddr
+    // ================================================================
+    GOOGLE_MAPS_API_KEY: 'AIzaSyDdgkLVxmuOEddVcodKDl7yO4vlI_NvGYA',
+    QE_OFFICE_ADDRESS:  'Deuzeldlaan 36, 2900 Schoten, België',
+
+    /** Format een Robaws-`address`-object naar een Google-leesbare string. */
+    _formatRobawsAddress(addr) {
+        if (!addr) return null;
+        const cityLine = [addr.postalCode, addr.city].filter(Boolean).join(' ').trim();
+        const parts = [
+            (addr.addressLine1 || '').trim(),
+            cityLine,
+            (addr.country || 'België').trim(),
+        ].filter(s => s);
+        return parts.join(', ');
+    },
+
+    /** Stash voor diagnostiek — bevat de laatste set keys van de employee
+     *  response zodat we in de modal kunnen tonen welke velden Robaws teruggaf. */
+    _lastEmployeeKeys: null,
+    _lastEmployeeExtraKeys: null,
+
+    /** Werknemer-adres uit Robaws. Probeert meerdere structuren omdat
+     *  Robaws het adres op verschillende plekken kan zetten:
+     *   - emp.address als object met addressLine1/postalCode/city/country
+     *   - emp.homeAddress / emp.privateAddress / emp.addresses[0]
+     *   - of als losse top-level velden direct op emp (addressLine1, street, postalCode, city, ...)
+     *  Returns geformatteerde string of null. */
+    async _fetchEmployeeAddress(employeeId) {
+        try {
+            const res = await RobawsAPI.get('employees/' + employeeId);
+            if (res.code !== 200 || !res.data) {
+                console.warn('[KM] employee fetch faalde, code', res.code);
+                this._lastEmployeeKeys = ['fetch-faalde:' + res.code];
+                return null;
+            }
+            const emp = res.data;
+            this._lastEmployeeKeys = Object.keys(emp);
+            this._lastEmployeeExtraKeys = (emp.extraFields && typeof emp.extraFields === 'object')
+                ? Object.keys(emp.extraFields)
+                : null;
+            console.log('[KM] employee object keys:', Object.keys(emp));
+            console.log('[KM] employee extraFields keys:', this._lastEmployeeExtraKeys);
+
+            // 1) Probeer geneste address-objects (Robaws gebruikt `domicileAddress`
+            //    op employees — bevestigd via debug-output v127)
+            const objCandidates = [
+                emp.domicileAddress,
+                emp.address,
+                emp.homeAddress,
+                emp.privateAddress,
+                Array.isArray(emp.addresses) ? emp.addresses[0] : null,
+            ].filter(Boolean);
+            for (const cand of objCandidates) {
+                const formatted = this._formatRobawsAddress(cand);
+                if (formatted) {
+                    console.log('[KM] werknemer-adres gevonden via geneste object:', formatted);
+                    return formatted;
+                }
+            }
+
+            // 2) Probeer een synthetisch object opgebouwd uit losse velden direct op emp.
+            //  Robaws kan in de employees-response het adres als losse properties zetten:
+            //  addressLine1, addressLine2, postalCode, city, country, street, streetNumber...
+            const synthetic = {
+                addressLine1: emp.addressLine1 || emp.street || emp.straat || null,
+                addressLine2: emp.addressLine2 || null,
+                postalCode:   emp.postalCode || emp.postcode || emp.zip || null,
+                city:         emp.city || emp.stad || null,
+                country:      emp.country || emp.land || null,
+            };
+            // Numeriek straat-nr toevoegen aan addressLine1 als er een apart `streetNumber` is
+            if (synthetic.addressLine1 && (emp.streetNumber || emp.huisnummer || emp.number)) {
+                const nr = emp.streetNumber || emp.huisnummer || emp.number;
+                if (!String(synthetic.addressLine1).match(new RegExp('\\b' + nr + '\\b'))) {
+                    synthetic.addressLine1 = synthetic.addressLine1 + ' ' + nr;
+                }
+            }
+            if (synthetic.addressLine1 || synthetic.city || synthetic.postalCode) {
+                const formatted = this._formatRobawsAddress(synthetic);
+                if (formatted) {
+                    console.log('[KM] werknemer-adres gevonden via losse velden:', formatted);
+                    return formatted;
+                }
+            }
+
+            // 3) Probeer extraFields — Robaws bewaart custom velden hier.
+            //    Adres kan staan als 'Adres', 'Address', 'Thuisadres', etc.
+            if (emp.extraFields && typeof emp.extraFields === 'object') {
+                for (const [key, val] of Object.entries(emp.extraFields)) {
+                    const lcKey = key.toLowerCase();
+                    if (!lcKey.includes('adres') && !lcKey.includes('address')) continue;
+                    // ExtraField kan een string of een object zijn
+                    const stringValue = (val && typeof val === 'object')
+                        ? (val.stringValue || val.value || val.textValue || null)
+                        : (typeof val === 'string' ? val : null);
+                    if (stringValue && stringValue.trim()) {
+                        console.log('[KM] werknemer-adres uit extraFields["' + key + '"]:', stringValue);
+                        return stringValue.trim();
+                    }
+                }
+            }
+
+            console.warn('[KM] geen werknemer-adres in employee record. Raw:',
+                JSON.stringify(emp).slice(0, 800));
+            return null;
+        } catch (e) {
+            console.warn('[KM] employee-adres ophalen mislukt:', e && e.message);
+            return null;
+        }
+    },
+
+    /** Werf-adressen uit dagplanning van vandaag, in volgorde (vroegst → laatst).
+     *  Returns array van geformatteerde adres-strings, of null. */
+    async _fetchTodayWerfAddresses(employeeId) {
+        try {
+            const today = RobawsAPI._localDateStr();
+            const planning = await RobawsAPI.getPlanning(employeeId, today, null);
+            const items = (planning && planning.items) || [];
+            // getPlanning sorteert al op startDate ascending — items[0] = eerste, items[len-1] = laatste
+            const addrs = items
+                .map(it => (it.address || '').trim())
+                .filter(a => a);
+            if (addrs.length === 0) {
+                console.warn('[KM] geen dagplanning-items met adres voor vandaag');
+                return null;
+            }
+            // De-duplicate opeenvolgende identieke adressen (bv. 2 planningen op dezelfde werf)
+            const dedup = [];
+            for (const a of addrs) {
+                if (dedup.length === 0 || dedup[dedup.length - 1] !== a) dedup.push(a);
+            }
+            console.log('[KM] dagplanning adressen vandaag (' + dedup.length + '):', dedup);
+            return dedup;
+        } catch (e) {
+            console.warn('[KM] dagplanning-adressen ophalen faalde:', e && e.message);
+            return null;
+        }
+    },
+
+    /** Google Routes API (v2). Returns:
+     *   { km: <number> }                op succes
+     *   { km: null, error: <string> }   op fout (exacte fout-tekst voor debug) */
+    async _googleDistanceKm(origin, destination) {
+        if (!origin || !destination) return { km: null, error: 'origin/destination leeg' };
+        try {
+            const res = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Goog-Api-Key': this.GOOGLE_MAPS_API_KEY,
+                    'X-Goog-FieldMask': 'routes.distanceMeters',
+                },
+                body: JSON.stringify({
+                    origin: { address: origin },
+                    destination: { address: destination },
+                    travelMode: 'DRIVE',
+                    routingPreference: 'TRAFFIC_UNAWARE',
+                }),
+            });
+            let body = '';
+            try { body = await res.text(); } catch(_) {}
+            let data = null;
+            try { data = body ? JSON.parse(body) : null; } catch(_) {}
+            if (!res.ok) {
+                const msg = (data && data.error && data.error.message)
+                    || `HTTP ${res.status}`
+                    + (body ? (' — ' + body.slice(0, 200)) : '');
+                console.warn('[KM] Routes API non-OK:', res.status, msg);
+                return { km: null, error: 'HTTP ' + res.status + ': ' + msg };
+            }
+            const meters = data && data.routes && data.routes[0] && data.routes[0].distanceMeters;
+            if (typeof meters !== 'number') {
+                console.warn('[KM] Routes API geen distanceMeters:', data);
+                return { km: null, error: 'Geen distanceMeters in response' };
+            }
+            return { km: Math.round(meters / 1000) };
+        } catch (e) {
+            const msg = (e && e.message) || String(e);
+            console.warn('[KM] Routes API fetch gooi-fout:', msg);
+            // CORS / netwerk faal geeft typisch "Failed to fetch" of "Load failed"
+            return { km: null, error: 'Fetch faalde: ' + msg };
+        }
+    },
+
+    /** Hoofd-functie: bereken heen + terug enkel tot/van eerste/laatste werf.
+     *  Tussenliggende werven tellen NIET mee (werknemers krijgen uurloon onderweg).
+     *   - heen  = startAddr → eerste werf van de dag
+     *   - terug = laatste werf van de dag → endAddr
+     *  startAddr/endAddr = bureau, tenzij "rechtstreeks van/naar thuis" → werknemer-adres.
+     *  Fiets-vinkje heeft GEEN invloed op de km — werknemer kan met fiets naar bureau
+     *  komen en daarna met camionet vertrekken; de km worden dan nog steeds berekend. */
+    async _autoCalcKilometers(employeeId, options) {
+        const werven = await this._fetchTodayWerfAddresses(employeeId);
+        if (!werven || werven.length === 0) {
+            return { heen: 0, terug: 0, source: 'geen-werf-adres', error: 'Geen dagplanning-adres gevonden' };
+        }
+        let startAddr = this.QE_OFFICE_ADDRESS;
+        let endAddr   = this.QE_OFFICE_ADDRESS;
+        let empAddrMissing = false;
+        if (options.directThuisWerf || options.directWerfThuis) {
+            const empAddr = await this._fetchEmployeeAddress(employeeId);
+            if (empAddr) {
+                if (options.directThuisWerf) startAddr = empAddr;
+                if (options.directWerfThuis) endAddr   = empAddr;
+            } else {
+                empAddrMissing = true;
+                console.warn('[KM] werknemer-adres niet gevonden, val terug op bureau');
+            }
+        }
+        const eersteWerf  = werven[0];
+        const laatsteWerf = werven[werven.length - 1];
+        console.log('[KM] berekenen:', { startAddr, eersteWerf, laatsteWerf, endAddr });
+        const [heenRes, terugRes] = await Promise.all([
+            this._googleDistanceKm(startAddr, eersteWerf),
+            this._googleDistanceKm(laatsteWerf, endAddr),
+        ]);
+        const heen  = heenRes  && heenRes.km;
+        const terug = terugRes && terugRes.km;
+        const ok = (typeof heen === 'number' && typeof terug === 'number');
+        const apiError = (heenRes && heenRes.error) || (terugRes && terugRes.error) || null;
+        // Wanneer een rechtstreeks-vinkje aanstaat maar het werknemer-adres niet
+        // gevonden is, val de berekening terug op bureau-adres → user ziet zelfde
+        // km. Toon dat expliciet zodat de gebruiker weet waarom.
+        let warning = null;
+        if (empAddrMissing && ok) {
+            let keysHint = '';
+            if (Array.isArray(this._lastEmployeeKeys) && this._lastEmployeeKeys.length) {
+                keysHint = ' [emp keys: ' + this._lastEmployeeKeys.join(', ') + ']';
+            }
+            if (Array.isArray(this._lastEmployeeExtraKeys) && this._lastEmployeeExtraKeys.length) {
+                keysHint += ' [extraFields: ' + this._lastEmployeeExtraKeys.join(', ') + ']';
+            }
+            warning = 'Werknemer-adres niet gevonden in Robaws — gerekend vanaf bureau.' + keysHint;
+        }
+        return {
+            heen:  typeof heen  === 'number' ? heen  : 0,
+            terug: typeof terug === 'number' ? terug : 0,
+            source: ok ? 'google-maps' : 'partial',
+            startAddr, eersteWerf, laatsteWerf, endAddr,
+            error: ok ? null : ('Google Maps gaf geen afstand' + (apiError ? ' — ' + apiError : '')),
+            warning,
+        };
+    },
+
     /**
      * v83: Vraag de monteur om kilometers heen/terug in te geven na uitklokken,
      * en post die als commute-entry op de werkbon. Modal — kan niet weggeklikt
      * worden zonder iets in te vullen (0 is een geldige waarde).
+     * v119: bij open auto-fill via Google Maps Distance Matrix.
      */
     async promptKilometers(workOrderId, employeeId) {
         return new Promise((resolve) => {
@@ -7119,10 +7973,53 @@ const app = {
                         <span>🏗️➡️🏠 Rechtstreeks van <strong>werf naar thuis</strong> gereden</span>
                     </label>
 
+                    <!-- v131: knop om rit te splitsen in 2 mobiliteits-segmenten -->
+                    <button id="kmSplitToggle" type="button"
+                            style="width:100%;padding:11px;background:#fff;color:#1A237E;border:2px dashed #1A237E;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:14px">
+                        ➕ Rit splitsen (deel met andere mobiliteit)
+                    </button>
+
+                    <div id="kmSplitSection" style="display:none;border:2px solid #cfd8dc;border-radius:12px;padding:14px;margin-bottom:14px;background:#fafafa">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                            <div style="font-size:13px;font-weight:700;color:#1A237E">🚐➕ Tweede rit-segment</div>
+                            <button id="kmSplitRemove" type="button" style="background:none;border:none;color:#c62828;cursor:pointer;font-size:13px;font-weight:600;padding:0">✕ verwijder</button>
+                        </div>
+                        <div style="font-size:11px;color:#888;margin-bottom:10px;line-height:1.4">
+                            Vul hier de km in die je in een <strong>andere</strong> mobiliteit aflegde (bv. solo-deel voordat je iemand oppikte). De hoofd-keuze hierboven geldt voor de rest.
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+                            <div>
+                                <label style="font-size:11px;color:#666;display:block;margin-bottom:3px">Heen (km)</label>
+                                <input id="kmHeen2Input" type="number" inputmode="numeric" min="0" step="1" value="0"
+                                    style="width:100%;padding:10px;font-size:15px;border:2px solid #cfd8dc;border-radius:8px;text-align:center;font-weight:600;box-sizing:border-box">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:#666;display:block;margin-bottom:3px">Terug (km)</label>
+                                <input id="kmTerug2Input" type="number" inputmode="numeric" min="0" step="1" value="0"
+                                    style="width:100%;padding:10px;font-size:15px;border:2px solid #cfd8dc;border-radius:8px;text-align:center;font-weight:600;box-sizing:border-box">
+                            </div>
+                        </div>
+                        <label style="font-size:11px;color:#666;display:block;margin-bottom:4px">Mobiliteit voor dit segment</label>
+                        <div id="kmMobility2Radio" style="display:grid;gap:5px">
+                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:2px solid #cfd8dc;border-radius:8px;cursor:pointer;font-size:13px;background:#fff">
+                                <input type="radio" name="kmMobility2" value="-3" checked style="margin:0">
+                                <span>🚐 Chauffeur zonder passagiers</span>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:2px solid #cfd8dc;border-radius:8px;cursor:pointer;font-size:13px;background:#fff">
+                                <input type="radio" name="kmMobility2" value="-1" style="margin:0">
+                                <span>🚐👥 Chauffeur (met passagiers)</span>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:2px solid #cfd8dc;border-radius:8px;cursor:pointer;font-size:13px;background:#fff">
+                                <input type="radio" name="kmMobility2" value="-2" style="margin:0">
+                                <span>🧍 Passagier</span>
+                            </label>
+                        </div>
+                    </div>
+
                     <button id="kmPromptSubmit" style="width:100%;padding:14px;background:#1A237E;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer">
                         Opslaan
                     </button>
-                    <div id="kmPromptError" style="font-size:12px;color:#c62828;margin-top:8px;text-align:center;display:none"></div>
+                    <div id="kmPromptError" style="font-size:11px;color:#e65100;background:#fff3e0;border:1px solid #ffcc80;border-radius:8px;padding:8px;margin-top:8px;text-align:left;display:none;word-wrap:break-word;max-height:120px;overflow-y:auto;line-height:1.4"></div>
                 </div>`;
             document.body.appendChild(m);
 
@@ -7133,9 +8030,98 @@ const app = {
             const directWTEl = document.getElementById('kmDirectWerfThuisInput');
             const errEl = document.getElementById('kmPromptError');
             const btn = document.getElementById('kmPromptSubmit');
+            // v131: split-rit elementen
+            const splitToggleEl = document.getElementById('kmSplitToggle');
+            const splitSectionEl = document.getElementById('kmSplitSection');
+            const splitRemoveEl = document.getElementById('kmSplitRemove');
+            const heen2El = document.getElementById('kmHeen2Input');
+            const terug2El = document.getElementById('kmTerug2Input');
+            const openSplit = () => {
+                splitSectionEl.style.display = 'block';
+                splitToggleEl.style.display = 'none';
+            };
+            const closeSplit = () => {
+                splitSectionEl.style.display = 'none';
+                splitToggleEl.style.display = 'block';
+                heen2El.value = '0';
+                terug2El.value = '0';
+            };
+            if (splitToggleEl) splitToggleEl.addEventListener('click', openSplit);
+            if (splitRemoveEl) splitRemoveEl.addEventListener('click', closeSplit);
 
             // Auto-focus heen veld + select-all
             setTimeout(() => { try { heenEl.focus(); heenEl.select(); } catch(_) {} }, 100);
+
+            // ============================================================
+            // v119: Auto-bereken km via Google Maps Distance Matrix.
+            //  - Loopt bij open van de modal (na 250ms zodat user de modal ziet)
+            //  - Loopt opnieuw bij elke checkbox-wijziging (fiets / directTW / directWT)
+            //  - Tijdens berekening: inputs disabled + opacity:0.5 + placeholder "..."
+            //  - Als google iets teruggeeft → veld vullen
+            //  - User kan altijd nog handmatig overschrijven (na de async call)
+            // ============================================================
+            let _kmCalcSeq = 0;
+            const self = this;
+            const recalcKm = async () => {
+                const seq = ++_kmCalcSeq;
+                const opts = {
+                    directThuisWerf: !!(directTWEl && directTWEl.checked),
+                    directWerfThuis: !!(directWTEl && directWTEl.checked),
+                };
+                // Loading state
+                try {
+                    heenEl.disabled = true;
+                    terugEl.disabled = true;
+                    heenEl.style.opacity = '0.5';
+                    terugEl.style.opacity = '0.5';
+                    heenEl.value = '...';
+                    terugEl.value = '...';
+                    errEl.style.display = 'none';
+                } catch(_) {}
+                let result = null;
+                let thrownMsg = null;
+                try {
+                    result = await self._autoCalcKilometers(employeeId, opts);
+                } catch (e) {
+                    thrownMsg = e && e.message || String(e);
+                    console.warn('[KM] auto-calc faalde:', thrownMsg);
+                }
+                // Race-check: alleen toepassen als deze call de meest recente is
+                if (seq !== _kmCalcSeq) return;
+                try {
+                    heenEl.disabled = false;
+                    terugEl.disabled = false;
+                    heenEl.style.opacity = '1';
+                    terugEl.style.opacity = '1';
+                } catch(_) {}
+                if (result) {
+                    heenEl.value = String(result.heen);
+                    terugEl.value = String(result.terug);
+                    console.log('[KM] auto-fill:', result);
+                    if (result.error) {
+                        errEl.textContent = '⚠️ ' + result.error + ' — vul handmatig in.';
+                        errEl.style.color = '#e65100';
+                        errEl.style.display = 'block';
+                    } else if (result.warning) {
+                        errEl.textContent = 'ℹ️ ' + result.warning;
+                        errEl.style.color = '#0277bd';
+                        errEl.style.display = 'block';
+                    }
+                } else {
+                    heenEl.value = '0';
+                    terugEl.value = '0';
+                    if (thrownMsg) {
+                        errEl.textContent = '⚠️ Auto-km mislukt (' + thrownMsg + ') — vul handmatig in.';
+                        errEl.style.color = '#e65100';
+                        errEl.style.display = 'block';
+                    }
+                }
+            };
+            // Initial calc - bij open
+            setTimeout(() => { recalcKm(); }, 250);
+            // Re-calc bij thuis-werf vinkjes (fiets-vinkje heeft geen invloed meer)
+            if (directTWEl) directTWEl.addEventListener('change', recalcKm);
+            if (directWTEl) directWTEl.addEventListener('change', recalcKm);
 
             const submit = async () => {
                 const heen = Math.max(0, Math.round(parseFloat(heenEl.value) || 0));
@@ -7146,12 +8132,20 @@ const app = {
                 const directThuisWerf = !!(directTWEl && directTWEl.checked);
                 const directWerfThuis = !!(directWTEl && directWTEl.checked);
 
+                // v131: detecteer split-rit (2e mobility-blok)
+                const splitOpen = splitSectionEl && splitSectionEl.style.display !== 'none';
+                const heen2 = splitOpen ? Math.max(0, Math.round(parseFloat(heen2El.value) || 0)) : 0;
+                const terug2 = splitOpen ? Math.max(0, Math.round(parseFloat(terug2El.value) || 0)) : 0;
+                const mob2Radio = document.querySelector('input[name="kmMobility2"]:checked');
+                const mobility2TypeId = mob2Radio ? parseInt(mob2Radio.value, 10) : -3;
+                const hasSplit = splitOpen && (heen2 > 0 || terug2 > 0);
+
                 btn.disabled = true;
                 btn.textContent = 'Opslaan...';
                 errEl.style.display = 'none';
 
                 try {
-                    // Stap 1: commute-entry voor de auto-km
+                    // Stap 1: commute-entry voor de hoofd-rit
                     const r = await RobawsAPI.addCommuteEntry({
                         workOrderId,
                         employeeId,
@@ -7161,6 +8155,21 @@ const app = {
                     });
                     if (r.code !== 200 && r.code !== 201) {
                         throw new Error('Robaws (' + r.code + ')');
+                    }
+
+                    // v131: stap 1b — tweede commute-entry indien split aangevinkt
+                    if (hasSplit) {
+                        const r2 = await RobawsAPI.addCommuteEntry({
+                            workOrderId,
+                            employeeId,
+                            distance: heen2,
+                            returnDistance: terug2,
+                            mobilityTypeId: mobility2TypeId,
+                        });
+                        if (r2.code !== 200 && r2.code !== 201) {
+                            throw new Error('Robaws split (' + r2.code + ')');
+                        }
+                        console.log('[App] split commute-entry gepost:', { heen2, terug2, mobility2TypeId });
                     }
 
                     // Stap 2: checkboxes (Fietsvergoeding + Rechtstreeks routes) → set
@@ -7208,8 +8217,10 @@ const app = {
                     if (fiets) tags.push('🚲');
                     if (directThuisWerf) tags.push('🏠→🏗️');
                     if (directWerfThuis) tags.push('🏗️→🏠');
+                    if (hasSplit) tags.push('🔀');
                     const tagTxt = tags.length ? ' · ' + tags.join(' ') : '';
-                    this.toast('Kilometers opgeslagen: ' + (heen + terug) + ' km' + tagTxt);
+                    const totaalKm = (heen + terug) + (hasSplit ? (heen2 + terug2) : 0);
+                    this.toast('Kilometers opgeslagen: ' + totaalKm + ' km' + tagTxt);
                     resolve(true);
                 } catch (e) {
                     console.warn('[App] km POST faalde:', e && e.message);
@@ -7225,44 +8236,242 @@ const app = {
         });
     },
 
+    /** v128: zorg dat de scan-overlay CSS-keyframes 1x geïnjecteerd zijn. */
+    _ensureScanOverlayStyles() {
+        if (document.getElementById('qeScanOverlayStyles')) return;
+        const style = document.createElement('style');
+        style.id = 'qeScanOverlayStyles';
+        style.textContent = `
+            .qe-scan-backdrop {
+                position: fixed; inset: 0; z-index: 99998;
+                background: rgba(15, 23, 42, 0.55);
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+                display: flex; align-items: center; justify-content: center;
+                padding: 24px;
+                opacity: 0;
+                transition: opacity 220ms ease-out;
+            }
+            .qe-scan-backdrop.qe-show { opacity: 1; }
+
+            .qe-scan-card {
+                background: #ffffff;
+                border-radius: 22px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.25), 0 4px 12px rgba(0,0,0,0.08);
+                padding: 36px 28px 28px;
+                max-width: 360px; width: 100%;
+                text-align: center;
+                transform: scale(0.88) translateY(16px);
+                opacity: 0;
+                transition: transform 280ms cubic-bezier(0.18, 0.89, 0.32, 1.28),
+                            opacity 200ms ease-out;
+            }
+            .qe-scan-backdrop.qe-show .qe-scan-card {
+                transform: scale(1) translateY(0);
+                opacity: 1;
+            }
+            .qe-scan-backdrop.qe-hiding {
+                opacity: 0;
+                transition: opacity 180ms ease-in;
+            }
+            .qe-scan-backdrop.qe-hiding .qe-scan-card {
+                transform: scale(0.94);
+                opacity: 0;
+                transition: transform 180ms ease-in, opacity 180ms ease-in;
+            }
+
+            .qe-scan-icon-wrap {
+                width: 84px; height: 84px;
+                border-radius: 50%;
+                display: flex; align-items: center; justify-content: center;
+                margin: 0 auto 18px;
+            }
+            .qe-scan-icon-wrap.success { background: rgba(46, 125, 50, 0.12); }
+            .qe-scan-icon-wrap.error   { background: rgba(198, 40, 40, 0.12); }
+            .qe-scan-icon-wrap.loading { background: rgba(26, 35, 126, 0.10); }
+
+            .qe-scan-icon-wrap svg { width: 56px; height: 56px; display: block; }
+            .qe-scan-icon-wrap.success svg { color: #2e7d32; }
+            .qe-scan-icon-wrap.error   svg { color: #c62828; }
+            .qe-scan-icon-wrap.loading svg { color: #1A237E; animation: qeScanSpin 1s linear infinite; }
+
+            /* SVG-stroke draw animations */
+            .qe-check-path {
+                stroke-dasharray: 50;
+                stroke-dashoffset: 50;
+                animation: qeDraw 450ms 120ms ease-out forwards;
+            }
+            .qe-cross-path {
+                stroke-dasharray: 30;
+                stroke-dashoffset: 30;
+                animation: qeDraw 350ms 120ms ease-out forwards;
+            }
+            .qe-circle-path {
+                stroke-dasharray: 190;
+                stroke-dashoffset: 190;
+                animation: qeDraw 500ms ease-out forwards;
+            }
+            @keyframes qeDraw { to { stroke-dashoffset: 0; } }
+            @keyframes qeScanSpin { to { transform: rotate(360deg); } }
+
+            .qe-scan-title {
+                font-size: 24px; font-weight: 700;
+                letter-spacing: 0.4px;
+                margin: 0 0 8px;
+            }
+            .qe-scan-title.success { color: #2e7d32; }
+            .qe-scan-title.error   { color: #c62828; }
+            .qe-scan-title.loading { color: #1A237E; }
+
+            .qe-scan-msg {
+                font-size: 15px; line-height: 1.45;
+                color: #455a64;
+                white-space: pre-line;
+                margin: 0;
+            }
+            .qe-scan-sub {
+                font-size: 13px; color: #90a4ae;
+                margin-top: 14px;
+            }
+            .qe-scan-tap-hint {
+                margin-top: 20px;
+                font-size: 12px; color: #b0bec5;
+                letter-spacing: 0.5px;
+            }
+        `;
+        document.head.appendChild(style);
+    },
+
+    /** Sluit een overlay met afsluit-animatie + roept callback.
+     *  Element wordt alleen uit DOM verwijderd als het géén persistent
+     *  wrapper is (#scanResult is persistent en wordt enkel verborgen). */
+    _closeScanOverlay(el, onDone) {
+        if (!el || el.dataset.closing === '1') return;
+        el.dataset.closing = '1';
+        el.classList.remove('qe-show');
+        el.classList.add('qe-hiding');
+        setTimeout(() => {
+            if (el.id !== 'scanResult') {
+                try { el.remove(); } catch(_) {}
+            }
+            if (typeof onDone === 'function') {
+                try { onDone(); } catch (e) { console.warn('[Scan] onDone fout:', e); }
+            }
+        }, 200);
+    },
+
     /**
-     * Toon een fullscreen scan-resultaat overlay (groot SUCCES of MISLUKT).
-     * Wordt aangeroepen vanuit QEClock.onNfcScan na elke NFC-scan.
+     * v126/v128: Loading-overlay tussen scan en SUCCES/MISLUKT.
+     * Card-stijl met spinner. Idempotent — meerdere showScanLoading
+     * calls werken zonder duplicate overlays.
+     */
+    showScanLoading(message) {
+        this._ensureScanOverlayStyles();
+        let overlay = document.getElementById('scanLoading');
+        if (overlay) {
+            // bestaande overlay: update tekst
+            const msgEl = overlay.querySelector('.qe-scan-msg');
+            if (msgEl && message) msgEl.textContent = message;
+            return;
+        }
+        overlay = document.createElement('div');
+        overlay.id = 'scanLoading';
+        overlay.className = 'qe-scan-backdrop';
+        overlay.innerHTML = `
+            <div class="qe-scan-card">
+                <div class="qe-scan-icon-wrap loading">
+                    <svg viewBox="0 0 50 50" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round">
+                        <circle cx="25" cy="25" r="20" stroke-opacity="0.18" />
+                        <path d="M25 5 a20 20 0 0 1 20 20" />
+                    </svg>
+                </div>
+                <h3 class="qe-scan-title loading">Even geduld…</h3>
+                <p class="qe-scan-msg">${this._escapeHtml(message || 'Bezig met verwerken…')}</p>
+                <div class="qe-scan-sub">Robaws krijgt je scan binnen</div>
+            </div>`;
+        document.body.appendChild(overlay);
+        // Force reflow voor de open-animatie
+        // eslint-disable-next-line no-unused-expressions
+        overlay.offsetWidth;
+        overlay.classList.add('qe-show');
+    },
+
+    hideScanLoading() {
+        const overlay = document.getElementById('scanLoading');
+        if (overlay) this._closeScanOverlay(overlay);
+    },
+
+    /** Veilige escape voor inline HTML inserts (titel/melding). */
+    _escapeHtml(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    },
+
+    /**
+     * Card-stijl scan-resultaat overlay (SUCCES of MISLUKT).
+     * v128: animatie + SVG icoons + professionele look.
      */
     showScanResult(success, message, onDone, duration) {
+        this._ensureScanOverlayStyles();
+        // Verberg loading direct (zonder fade) — anders zit hij in de weg
+        const loading = document.getElementById('scanLoading');
+        if (loading) { try { loading.remove(); } catch(_) {} }
+
         const overlay = document.getElementById('scanResult');
-        const icon = document.getElementById('scanResultIcon');
-        const title = document.getElementById('scanResultTitle');
-        const msgEl = document.getElementById('scanResultMsg');
         if (!overlay) {
             this.toast(message);
             if (typeof onDone === 'function') { try { onDone(); } catch(_) {} }
             return;
         }
-        if (success) {
-            overlay.style.background = 'rgba(46,125,50,0.97)';
-            overlay.style.color = '#ffffff';
-            icon.textContent = '✅';
-            title.textContent = 'SUCCES';
-        } else {
-            overlay.style.background = 'rgba(198,40,40,0.97)';
-            overlay.style.color = '#ffffff';
-            icon.textContent = '❌';
-            title.textContent = 'MISLUKT';
-        }
-        msgEl.textContent = message || '';
+
+        // Reset eventuele oude classes/state (her-show na een eerdere result)
+        overlay.classList.remove('qe-hiding', 'qe-show');
+        overlay.removeAttribute('data-closing');
+        overlay.className = 'qe-scan-backdrop';
         overlay.style.display = 'flex';
+        overlay.onclick = null;
+
+        const title = success ? 'Gelukt' : 'Mislukt';
+        const iconSvg = success
+            ? `<svg viewBox="0 0 52 52" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+                   <circle class="qe-circle-path" cx="26" cy="26" r="22" />
+                   <path class="qe-check-path" d="M14 27 l8 8 l16 -16" />
+               </svg>`
+            : `<svg viewBox="0 0 52 52" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+                   <circle class="qe-circle-path" cx="26" cy="26" r="22" />
+                   <path class="qe-cross-path" d="M18 18 l16 16" />
+                   <path class="qe-cross-path" d="M34 18 l-16 16" />
+               </svg>`;
+        overlay.innerHTML = `
+            <div class="qe-scan-card">
+                <div class="qe-scan-icon-wrap ${success ? 'success' : 'error'}">${iconSvg}</div>
+                <h3 class="qe-scan-title ${success ? 'success' : 'error'}">${this._escapeHtml(title)}</h3>
+                <p class="qe-scan-msg">${this._escapeHtml(message || '')}</p>
+                <div class="qe-scan-tap-hint">Tik om te sluiten</div>
+            </div>`;
+        // Force reflow + show
+        // eslint-disable-next-line no-unused-expressions
+        overlay.offsetWidth;
+        overlay.classList.add('qe-show');
+
         try { if (navigator.vibrate) navigator.vibrate(success ? 120 : [80, 60, 80]); } catch(_) {}
+
         const dur = typeof duration === 'number' ? duration : (success ? 2200 : 6000);
         let closed = false;
         const close = () => {
             if (closed) return;
             closed = true;
-            overlay.style.display = 'none';
-            overlay.onclick = null;
-            if (typeof onDone === 'function') {
-                try { onDone(); } catch(e) { console.warn('[ScanResult] onDone fout:', e); }
-            }
+            this._closeScanOverlay(overlay, () => {
+                overlay.style.display = 'none';
+                overlay.innerHTML = '';
+                if (typeof onDone === 'function') {
+                    try { onDone(); } catch(e) { console.warn('[Scan] onDone fout:', e); }
+                }
+            });
         };
         overlay.onclick = close;
         setTimeout(close, dur);
