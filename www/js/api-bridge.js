@@ -186,15 +186,71 @@ const APIBridge = {
             const email = (body.email || '').toLowerCase().trim();
             // Via Robaws checken — lijst-endpoint bevat extraFields
             try {
+                let found = null;
                 const res = await RobawsAPI.get(`employees?email=${encodeURIComponent(email)}&limit=10`);
                 const items = (res.data && res.data.items) || [];
-                const found = items.find(e => (e.email || '').toLowerCase() === email);
+                found = items.find(e => (e.email || '').toLowerCase() === email);
+                // v132: tweede poging — sommige werknemers worden niet via ?email
+                // filter teruggegeven (case/encoding-verschillen). Doorblader alle.
+                if (!found) {
+                    let page = 0;
+                    const all = [];
+                    do {
+                        const r2 = await RobawsAPI.get(`employees?limit=100&page=${page}`);
+                        const it2 = (r2.data && r2.data.items) || [];
+                        if (it2.length === 0) break;
+                        all.push(...it2);
+                        page++;
+                        if (page >= (r2.data.totalPages || 1)) break;
+                    } while (page < 5);
+                    found = all.find(e => (e.email || '').toLowerCase() === email);
+                }
+                // v136: derde poging — directe lookup via EMPLOYEES mapping
+                // (voor wanneer Robaws-email afwijkt van de getypte email,
+                // bv. dax.leekens@qe.be vs daxleekens@qe.be).
+                if (!found) {
+                    const mapped = RobawsAPI.EMPLOYEES[email];
+                    if (mapped && mapped.employeeId) {
+                        try {
+                            const direct = await RobawsAPI.get(`employees/${mapped.employeeId}`);
+                            if (direct.code === 200 && direct.data) {
+                                found = direct.data;
+                                console.log('[APIBridge] check-email: gevonden via directe lookup id=' + mapped.employeeId);
+                            }
+                        } catch(_) {}
+                    }
+                }
                 if (found) {
+                    // v134: cache het gevonden employee object voor 5 min zodat
+                    // login() geen tweede zoektocht moet doen (voorkomt Robaws
+                    // rate-limit voor werknemers waar ?email= filter niet werkt
+                    // en pagination nodig is — typisch techniekers).
+                    try {
+                        localStorage.setItem('qe_login_emp_cache_' + email,
+                            JSON.stringify({ at: Date.now(), emp: found }));
+                    } catch(_) {}
+                    // v132: PIN-detectie robuuster — probeer meerdere veld-namen +
+                    // value-types omdat admin de PIN handmatig in Robaws kan
+                    // hebben ingegeven onder een afwijkende key.
                     const ef = found.extraFields || {};
-                    const pf = ef['Pincode'] || null;
-                    const pinVal = pf ? String(pf.stringValue ?? pf.intValue ?? pf.value ?? '') : '';
+                    let pinVal = '';
+                    const tryKeys = ['Pincode', 'PIN', 'Pin', 'pincode', 'pin'];
+                    for (const k of tryKeys) {
+                        const pf = ef[k];
+                        if (!pf) continue;
+                        const v = pf.stringValue ?? pf.intValue ?? pf.value ?? pf.numberValue ?? null;
+                        if (v != null && String(v).trim()) { pinVal = String(v).trim(); break; }
+                    }
+                    // Last resort — scan alle extraFields op key die "pin" bevat
+                    if (!pinVal) {
+                        for (const [k, pf] of Object.entries(ef)) {
+                            if (!/pin/i.test(k)) continue;
+                            const v = pf && (pf.stringValue ?? pf.intValue ?? pf.value ?? pf.numberValue);
+                            if (v != null && String(v).trim()) { pinVal = String(v).trim(); break; }
+                        }
+                    }
                     const hasPin = !!pinVal;
-                    console.log('[APIBridge] check-email:', email, 'hasPin:', hasPin);
+                    console.log('[APIBridge] check-email:', email, 'hasPin:', hasPin, 'extraFields keys:', Object.keys(ef));
                     return this.jsonResponse({ known: true, hasPin });
                 }
             } catch(e) {
