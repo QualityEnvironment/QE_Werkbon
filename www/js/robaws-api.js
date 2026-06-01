@@ -65,8 +65,59 @@ const RobawsAPI = {
     },
 
     // === BASIS API CALLS ===
-    async get(endpoint) {
-        const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
+    // v184: cache + in-flight-dedup laag rond get().
+    //  - Enkel GET wordt gecached, nooit mutaties (post/put).
+    //  - Enkel top-level "resource/{id}" GETs (geen query, geen sub-resource)
+    //    krijgen een TTL-cache. Lijst/query-GETs (met ?) worden NIET gecached
+    //    maar wel ge-dedup't (gelijktijdige identieke calls -> 1 fetch).
+    //  - Elke cache-/dedup-hit geeft een DEEP CLONE terug, zodat code die een
+    //    record ophaalt-muteert-PUT (installatie/klant/werkbon) de cache niet
+    //    corrumpeert.
+    //  - put()/post() invalideren de betrokken resource/{id}-sleutel.
+    _getCache: {},        // key -> { at, value }
+    _getInflight: {},     // key -> Promise
+
+    /** TTL (ms) voor een endpoint, of 0 als niet cachebaar. */
+    _cacheTtlFor(key) {
+        if (key.includes('?')) return 0;                  // lijst/query -> niet cachen
+        const m = key.match(/^([a-z-]+)\/(\d+)$/);         // exact "resource/id"
+        if (!m) return 0;                                  // sub-resource e.d. -> niet cachen
+        const TTL = {
+            'clients':        15 * 60 * 1000,
+            'employees':      60 * 60 * 1000,
+            'employee-roles': 60 * 60 * 1000,
+            'articles':       60 * 60 * 1000,
+            'vat-tariffs':    60 * 60 * 1000,
+            'sales-orders':    5 * 60 * 1000,
+            'installations':   5 * 60 * 1000,
+            'planning-items':      60 * 1000,
+            'work-orders':         30 * 1000,
+        };
+        return TTL[m[1]] != null ? TTL[m[1]] : 60 * 1000;  // default 60s voor andere /{id}
+    },
+
+    _cloneResult(r) {
+        if (!r) return r;
+        try {
+            return { code: r.code, data: (r.data == null) ? r.data : JSON.parse(JSON.stringify(r.data)) };
+        } catch (_) {
+            return { code: r.code, data: r.data };
+        }
+    },
+
+    /** Wis de cache-sleutel die bij een mutatie hoort (resource/{id}-prefix). */
+    _invalidateCache(endpoint) {
+        const e = String(endpoint).replace(/^\//, '');
+        const m = e.match(/^([a-z-]+\/\d+)/);   // bv "work-orders/456" (ook bij .../time-entries)
+        if (m) {
+            delete this._getCache[m[1]];
+            delete this._getInflight[m[1]];
+        }
+    },
+
+    /** Rauwe fetch zonder cache (interne helper). */
+    async _rawGet(key) {
+        const url = this.BASE_URL + '/' + key;
         const res = await fetch(url, { headers: this.getHeaders() });
         if (res.status === 204) return { code: 204, data: null };
         const txt = await res.text();
@@ -78,7 +129,43 @@ const RobawsAPI = {
         }
     },
 
+    async get(endpoint, opts) {
+        const key = String(endpoint).replace(/^\//, '');
+        const ttl = this._cacheTtlFor(key);
+        const bypass = !!(opts && opts.bypassCache);
+
+        // 1. Cache-hit
+        if (ttl > 0 && !bypass) {
+            const hit = this._getCache[key];
+            if (hit && (Date.now() - hit.at) < ttl) {
+                return this._cloneResult(hit.value);
+            }
+        }
+        // 2. In-flight dedup: deel een lopende identieke GET
+        if (!bypass && this._getInflight[key]) {
+            const shared = await this._getInflight[key];
+            return this._cloneResult(shared);
+        }
+        // 3. Echte fetch (in-flight registreren voor dedup)
+        const p = this._rawGet(key);
+        this._getInflight[key] = p;
+        let result;
+        try {
+            result = await p;
+        } finally {
+            delete this._getInflight[key];
+        }
+        // 4. Cache schrijven (enkel 200 + cachebaar) en clone teruggeven
+        if (ttl > 0 && result && result.code === 200) {
+            if (Object.keys(this._getCache).length > 800) this._getCache = {};  // simpele size-cap
+            this._getCache[key] = { at: Date.now(), value: result };
+            return this._cloneResult(result);
+        }
+        return result;
+    },
+
     async post(endpoint, body) {
+        this._invalidateCache(endpoint);   // v184: cache van het betrokken record wissen
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
         const res = await fetch(url, {
             method: 'POST',
@@ -97,6 +184,7 @@ const RobawsAPI = {
     },
 
     async put(endpoint, body) {
+        this._invalidateCache(endpoint);   // v184: cache van het betrokken record wissen
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
         const res = await fetch(url, {
             method: 'PUT',
@@ -1344,13 +1432,16 @@ const RobawsAPI = {
     // PLANNING
     // =============================================
     async getPlanning(employeeId, date, userId = null) {
-        // v112: ook gisteren toestaan zodat de date-strip met 3 chips
-        // (gisteren/vandaag/morgen) werkt. Eerder viel gisteren door de
-        // whitelist en kreeg de gebruiker vandaag-planning te zien.
+        // v138: GEEN whitelist meer — elke datum wordt geaccepteerd en strikt
+        // gefilterd. Voorheen werd elke datum buiten {gisteren, vandaag, morgen}
+        // gereset naar today wat ervoor zorgde dat morgen-chip soms vandaag-
+        // items toonde (race condition bij middernacht-overgang).
+        // Cutoff is de eerste van vandaag-1d zodat we minimaal gisteren laden
+        // maar ook verder terug indien `date` ouder is.
+        const today    = this._localDateStr();
         const yesterday = this._localDateStr(null, -1);
-        const today = this._localDateStr();
-        const tomorrow = this._localDateStr(null, 1);
-        if (date !== yesterday && date !== today && date !== tomorrow) date = today;
+        const cutoff   = (date && date < yesterday) ? date : yesterday;
+        console.log('[getPlanning] gevraagd voor date=' + date + ' (today=' + today + ', cutoff=' + cutoff + ')');
 
         // Haal planning items op met paginatie
         let allItems = [];
@@ -1368,21 +1459,20 @@ const RobawsAPI = {
 
             allItems = allItems.concat(items);
 
-            // Stop als we voorbij de oudste mogelijke datum zijn.
-            // v112: vergelijken met `yesterday` (was `today`) — anders worden
-            // gisteren-items vroegtijdig afgekapt.
+            // Stop als we voorbij de cutoff (= oudste relevante datum) zijn
             const lastDate = (items[items.length - 1].startDate || '').split('T')[0];
-            if (lastDate < yesterday) break;
+            if (lastDate < cutoff) break;
 
             totalPages = result.data.totalPages || 1;
             page++;
         } while (page < totalPages);
 
-        // Filter op datum
+        // Strikt filter op datum — exact equal match
         let filtered = allItems.filter(item => {
             const itemDate = (item.startDate || '').split('T')[0];
             return itemDate === date;
         });
+        console.log('[getPlanning] ' + filtered.length + ' items na filter op ' + date + ' (uit ' + allItems.length + ' geladen)');
 
         // Sorteer op startDate (vroegste eerst)
         filtered.sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
@@ -1391,17 +1481,26 @@ const RobawsAPI = {
         const planningIdsMetWerkbon = await this._getPlanningIdsWithWorkOrders(userId);
 
         // Verrijk elk item met klantgegevens + BTW + ordernummer
-        const enriched = [];
-        for (const item of filtered) {
+        // v183: BTW-tarieven 1x als gecachede map (geen vat-tariffs/{id} per klant).
+        const vatMap = await this.getVatTariffMap();
+        // v183: parallelliseer de enrichment OVER de items (Promise.all) i.p.v. een
+        // sequentiele for...of. Binnen een item blijven de calls serieel, dus de
+        // gelijktijdige concurrency = aantal items (typisch 3-8) -> veilig qua
+        // rate-limit. Promise.all behoudt de volgorde.
+        const enriched = await Promise.all(filtered.map(async (item) => {
             const hasWerkbon = planningIdsMetWerkbon.has(String(item.id));
 
             // Haal het volledige planning-item op voor de complete description (HTML)
             // Het list-endpoint kapt de description af, het detail-endpoint geeft alles.
             let fullDescription = item.description || item.notes || '';
+            // v182: regie (timeAndMaterial) staat OP de dagplanning zelf. Primair
+            // van het list-item, daarna eventueel overschreven door het detail-item.
+            let planRegie = (item.timeAndMaterial === true);
             try {
                 const fullItem = await this.get(`planning-items/${item.id}`);
-                if (fullItem.code === 200 && fullItem.data && fullItem.data.description) {
-                    fullDescription = fullItem.data.description;
+                if (fullItem.code === 200 && fullItem.data) {
+                    if (fullItem.data.description) fullDescription = fullItem.data.description;
+                    if (typeof fullItem.data.timeAndMaterial === 'boolean') planRegie = fullItem.data.timeAndMaterial;
                 }
             } catch(e) { /* Fallback naar list-description */ }
 
@@ -1420,6 +1519,7 @@ const RobawsAPI = {
                 planningTypeId: item.planningTypeId || null,
                 hourTypeId: item.hourTypeId || null,
                 hasWerkbon: hasWerkbon,
+                timeAndMaterial: planRegie,   // v182: regie komt ENKEL van de dagplanning
                 client: null,
                 endClient: null,  // v102+: ook eindklant ophalen
             };
@@ -1441,84 +1541,36 @@ const RobawsAPI = {
                             vatTariffName: null,
                         };
 
-                        // BTW tarief ophalen
-                        if (c.vatTariffId) {
-                            try {
-                                const vatResult = await this.get(`vat-tariffs/${c.vatTariffId}`);
-                                if (vatResult.code === 200) {
-                                    entry.client.vatPercentage = vatResult.data.percentage ?? null;
-                                    entry.client.vatTariffName = vatResult.data.name ?? null;
-                                }
-                            } catch (e) { /* BTW niet gevonden, niet erg */ }
+                        // v183: BTW-tarief uit de 1x gecachede map (geen call per klant).
+                        const vt = c.vatTariffId ? vatMap[String(c.vatTariffId)] : null;
+                        if (vt) {
+                            entry.client.vatPercentage = vt.percentage ?? null;
+                            entry.client.vatTariffName = vt.name ?? null;
                         }
                     }
                 } catch (e) { /* Klant niet gevonden */ }
             }
 
-            // v102+: Eindklant (Bewoner) ophalen — als endClientId is ingevuld
-            // op het planning-item én anders dan clientId.
-            if (item.endClientId && String(item.endClientId) !== String(item.clientId || '')) {
-                try {
-                    const ecResult = await this.get(`clients/${item.endClientId}`);
-                    if (ecResult.code === 200 && ecResult.data) {
-                        const ec = ecResult.data;
-                        entry.endClient = {
-                            id: ec.id,
-                            name: ec.name || '',
-                            email: ec.email || '',
-                            tel: ec.tel || '',
-                            address: this.formatAddress(ec.address),
-                        };
-                    }
-                } catch (e) { /* Eindklant niet gevonden */ }
-            }
+            // v185: eindklant + line-items + documenten worden NIET meer hier
+            // (bij elke lijst-load, per item) opgehaald. Dat is detail-only data en
+            // wordt lazy geladen in app._loadWorkorderDetailData() bij het openen van
+            // een werkbon (parallel + v184-cache). De IDs (endClientId, id) zitten al
+            // in de entry zodat openWorkorder ze kan ophalen.
 
-            // Planning line-items ophalen (materialen/artikelen die meegegeven moeten worden)
-            try {
-                const liRes = await this.get(`planning-items/${item.id}/line-items`);
-                if (liRes.code === 200 && liRes.data) {
-                    const lineItems = liRes.data.items || liRes.data || [];
-                    entry.lineItems = lineItems.map(li => ({
-                        id: li.id,
-                        description: li.description || '',
-                        quantity: li.quantity || 1,
-                        unitType: li.unitType || null,
-                        type: li.type || 'LINE',
-                        articleId: li.articleId || (li.article && li.article.id) || null,
-                    }));
-                }
-            } catch(e) { console.warn('[RobawsAPI] Line-items ophalen mislukt:', e); }
-
-            // Planning documenten/bestanden ophalen
-            try {
-                const docRes = await this.get(`planning-items/${item.id}/documents`);
-                if (docRes.code === 200 && docRes.data) {
-                    const docs = Array.isArray(docRes.data) ? docRes.data : (docRes.data.items || []);
-                    entry.documents = docs.map(d => ({
-                        id: d.id,
-                        name: d.name || 'Bestand',
-                        contentType: d.contentType || '',
-                        size: d.size || 0,
-                        url: d.url || d.previewUrl || null,
-                    }));
-                }
-            } catch(e) { console.warn('[RobawsAPI] Documenten ophalen mislukt:', e); }
-
-            // Ordernummer + regie-vinkje ophalen van sales order
+            // Ordernummer ophalen van sales order. (Regie NIET van de order —
+            // v182: die komt ENKEL van de dagplanning, zie planRegie hierboven.)
             if (item.salesOrderId) {
                 try {
                     const soResult = await this.get(`sales-orders/${item.salesOrderId}`);
                     if (soResult.code === 200) {
                         entry.orderLogicId = soResult.data.logicId || null;
                         entry.orderStatus = soResult.data.status || null;
-                        // Regie (timeAndMaterial) overnemen van de order
-                        entry.timeAndMaterial = soResult.data.timeAndMaterial ?? false;
                     }
                 } catch (e) { /* Order niet gevonden */ }
             }
 
-            enriched.push(entry);
-        }
+            return entry;
+        }));
 
         return { items: enriched, date, employeeId };
     },
@@ -1591,25 +1643,29 @@ const RobawsAPI = {
         const timeOperationIds = roleResult.data.timeOperationIds || [];
         console.log('[RobawsAPI] timeOperationIds:', timeOperationIds.length, 'items');
 
-        // Stap 3: Haal elk artikel op
+        // Stap 3: Haal elk artikel PARALLEL op (v183: was sequentieel per artikel).
+        // Promise.all behoudt de volgorde; gefaalde/lege resultaten filteren we eruit.
+        const artResults = await Promise.all(
+            timeOperationIds.map(articleId =>
+                this.get(`articles/${articleId}`).catch(e => {
+                    console.warn('[RobawsAPI] Artikel', articleId, 'fout:', e && e.message);
+                    return null;
+                })
+            )
+        );
         const uurcodes = [];
-        for (const articleId of timeOperationIds) {
-            try {
-                const artResult = await this.get(`articles/${articleId}`);
-                if (artResult.code === 200) {
-                    const art = artResult.data;
-                    const name = art.name || `Uurcode ${articleId}`;
-                    uurcodes.push({
-                        id: art.id,
-                        name: name,
-                        unitPrice: art.unitPrice ?? null,
-                        salePrice: art.salePrice ?? null,
-                        costPrice: art.costPrice ?? null,
-                        isVerplaatsing: name.toLowerCase().includes('verplaatsing'),
-                    });
-                }
-            } catch (e) {
-                console.warn('[RobawsAPI] Artikel', articleId, 'fout:', e.message);
+        for (const artResult of artResults) {
+            if (artResult && artResult.code === 200 && artResult.data) {
+                const art = artResult.data;
+                const name = art.name || `Uurcode ${art.id}`;
+                uurcodes.push({
+                    id: art.id,
+                    name: name,
+                    unitPrice: art.unitPrice ?? null,
+                    salePrice: art.salePrice ?? null,
+                    costPrice: art.costPrice ?? null,
+                    isVerplaatsing: name.toLowerCase().includes('verplaatsing'),
+                });
             }
         }
 
@@ -2385,14 +2441,23 @@ const RobawsAPI = {
         // 2. Alle werkbons van afgelopen 7 dagen ophalen → mappen op planningItemId
         const sinceDate = this._localDateStr(null, -7);
         const werkbonsPerPlanning = {};
-        let woPage = 0;
-        do {
-            const r = await this.get(`work-orders?limit=100&page=${woPage}&sort=createdAt:desc`);
+        // v186: ?include=timeEntries -> time-entries komen INLINE mee (geen
+        // per-werkbon time-entries-call meer in stap 4, zie HANDLEIDING 2.16).
+        // Ook ?offset= i.p.v. ?page= (Robaws negeert page op /work-orders, v83b)
+        // + dedup op id zodat dezelfde werkbon niet dubbel telt.
+        const WO_LIMIT = 100;
+        const seenWoIds = new Set();
+        for (let woPage = 0; woPage < 15; woPage++) {
+            const r = await this.get(`work-orders?limit=${WO_LIMIT}&offset=${woPage * WO_LIMIT}&sort=createdAt:desc&include=timeEntries`);
             if (r.code !== 200) break;
-            const items = r.data.items || [];
+            const items = (r.data && r.data.items) || [];
             if (items.length === 0) break;
             let stop = false;
             for (const wo of items) {
+                if (wo.id != null) {
+                    if (seenWoIds.has(String(wo.id))) continue;
+                    seenWoIds.add(String(wo.id));
+                }
                 const d = wo.date || '';
                 if (d && d < sinceDate) { stop = true; break; }
                 if (!wo.planningItemId) continue;
@@ -2401,37 +2466,28 @@ const RobawsAPI = {
                 werkbonsPerPlanning[key].push(wo);
             }
             if (stop) break;
-            const totalPages = r.data.totalPages || 1;
-            woPage++;
-            if (woPage >= totalPages || woPage > 10) break;
-        } while (true);
+            if (items.length < WO_LIMIT) break;
+            if (r.data.totalPages && (woPage + 1) >= r.data.totalPages) break;
+        }
 
         // 3. Enkel plannings die al ≥1 werkbon hebben overhouden
         const planningenMetWerkbon = planningenInScope.filter(p => werkbonsPerPlanning[String(p.id)]);
 
         // 4. Voor elke planning: client + sub-entries van alle linked werkbons sommeren
-        const result = [];
-        for (const p of planningenMetWerkbon) {
+        // v186: verwerk alle plannings PARALLEL (Promise.all) i.p.v. sequentieel.
+        const result = await Promise.all(planningenMetWerkbon.map(async (p) => {
             const wos = werkbonsPerPlanning[String(p.id)] || [];
-            // Klant
+            // Klant + order parallel ophalen (gecached via v184)
+            const [cr, sr] = await Promise.all([
+                p.clientId ? this.get(`clients/${p.clientId}`).catch(() => null) : Promise.resolve(null),
+                p.salesOrderId ? this.get(`sales-orders/${p.salesOrderId}`).catch(() => null) : Promise.resolve(null),
+            ]);
             let clientName = '', clientAddress = '';
-            if (p.clientId) {
-                try {
-                    const cr = await this.get(`clients/${p.clientId}`);
-                    if (cr.code === 200) {
-                        clientName = cr.data.name || '';
-                        clientAddress = this.formatAddress(cr.data.address);
-                    }
-                } catch(e) {}
+            if (cr && cr.code === 200 && cr.data) {
+                clientName = cr.data.name || '';
+                clientAddress = this.formatAddress(cr.data.address);
             }
-            // Order
-            let orderLogicId = null;
-            if (p.salesOrderId) {
-                try {
-                    const sr = await this.get(`sales-orders/${p.salesOrderId}`);
-                    if (sr.code === 200) orderLogicId = sr.data.logicId || null;
-                } catch(e) {}
-            }
+            const orderLogicId = (sr && sr.code === 200 && sr.data) ? (sr.data.logicId || null) : null;
             // Sub-entries van elke werkbon
             let totalHours = 0;
             let totalCommute = 0;
@@ -2441,41 +2497,41 @@ const RobawsAPI = {
             // We hebben de uurcode-articleIds nodig om uren te splitsen klant vs verplaatsing
             // → niet beschikbaar zonder employee-rol; we slaan beide totals op en laten UI splitsen op articleId
             const hoursPerArticle = {}; // articleId → totalHours
-            for (const wo of wos) {
+            // v186: time-entries komen INLINE mee via ?include=timeEntries (geen
+            // per-werkbon call meer). line-items wel nog per werkbon -> parallel.
+            const liResults = await Promise.all(
+                wos.map(wo => this.get(`work-orders/${wo.id}/line-items`).catch(() => null))
+            );
+            wos.forEach((wo, idx) => {
                 sourceWerkbonIds.push(wo.id);
                 if (wo.remark && wo.remark.trim()) remarks.push(wo.remark.trim());
-                // time-entries
-                try {
-                    const te = await this.get(`work-orders/${wo.id}/time-entries`);
-                    const teItems = (te.data && (te.data.items || te.data)) || [];
-                    for (const t of teItems) {
-                        const hrs = parseFloat(t.hours || t.billableHours || 0);
-                        const aId = String(t.articleId || '');
-                        if (!hoursPerArticle[aId]) hoursPerArticle[aId] = 0;
-                        hoursPerArticle[aId] += hrs;
-                        totalHours += hrs;
-                    }
-                } catch(e) {}
+                // time-entries (inline)
+                const teItems = wo.timeEntries || [];
+                for (const t of teItems) {
+                    const hrs = parseFloat(t.hours || t.billableHours || 0);
+                    const aId = String(t.articleId || (t.article && t.article.id) || '');
+                    if (!hoursPerArticle[aId]) hoursPerArticle[aId] = 0;
+                    hoursPerArticle[aId] += hrs;
+                    totalHours += hrs;
+                }
                 // line-items (materialen)
-                try {
-                    const li = await this.get(`work-orders/${wo.id}/line-items`);
-                    const liItems = (li.data && (li.data.items || li.data)) || [];
-                    for (const l of liItems) {
-                        const aId = String(l.articleId || '');
-                        const desc = l.description || '';
-                        const key = aId + '|' + desc;
-                        if (!materialMap[key]) {
-                            materialMap[key] = {
-                                articleId: aId || null,
-                                description: desc,
-                                quantity: 0,
-                                unitPrice: parseFloat(l.price || 0),
-                            };
-                        }
-                        materialMap[key].quantity += parseFloat(l.quantity || 0);
+                const li = liResults[idx];
+                const liItems = (li && li.data && (li.data.items || li.data)) || [];
+                for (const l of liItems) {
+                    const aId = String(l.articleId || '');
+                    const desc = l.description || '';
+                    const key = aId + '|' + desc;
+                    if (!materialMap[key]) {
+                        materialMap[key] = {
+                            articleId: aId || null,
+                            description: desc,
+                            quantity: 0,
+                            unitPrice: parseFloat(l.price || 0),
+                        };
                     }
-                } catch(e) {}
-            }
+                    materialMap[key].quantity += parseFloat(l.quantity || 0);
+                }
+            });
 
             // Origineel werkbon = de eerste (oudste) — dat is de "echte" werkbon, latere zijn al correcties.
             // BUG-fix: vroegere code sorteerde lexicografisch ('10' < '2'), waardoor
@@ -2488,7 +2544,7 @@ const RobawsAPI = {
                 return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
             })[0];
 
-            result.push({
+            return {
                 planningItemId: p.id,
                 clientId: p.clientId,
                 clientName,
@@ -2509,8 +2565,8 @@ const RobawsAPI = {
                     materials: Object.values(materialMap).filter(m => m.quantity !== 0),
                     remark: remarks.join(' | '),
                 },
-            });
-        }
+            };
+        }));
 
         // Sorteer: vandaag eerst, dan op startDate desc
         result.sort((a, b) => {
@@ -2619,7 +2675,10 @@ const RobawsAPI = {
         // wanneer we het installatie-adres ophalen voor `siteAddress`, en later
         // gebruikt als extra TEXT-lijn op de factuur (zodat de back-office
         // direct kan zien welke postcode bij de werkbon hoort).
+        // v177: ook de gemeente bewaren zodat we "2900 Schoten" kunnen plakken
+        // i.p.v. enkel "2900".
         let invoicePostalCode = '';
+        let invoiceCity       = '';
 
         // Stap 1: Werkorder details
         const woResult = await this.get(`work-orders/${workOrderId}`);
@@ -2715,6 +2774,8 @@ const RobawsAPI = {
                         country: instAddr.country || null,
                     };
                     invoicePostalCode = instAddr.postalCode || '';
+                    // v177: ook de gemeente bewaren voor de "2900 Schoten" tekstlijn
+                    invoiceCity = instAddr.city || '';
                 }
             } catch(e) {
                 console.warn('Installatie-adres ophalen voor factuur mislukt:', e);
@@ -2753,10 +2814,16 @@ const RobawsAPI = {
         // 3b: v112 — Postcode-tekstlijn (uit dagplanning werfadres) zodat de
         // back-office in één oogopslag weet welke postcode bij deze factuur
         // hoort. Komt rechts ná de notities-lijn.
-        if (invoicePostalCode && String(invoicePostalCode).trim()) {
+        // v177: nu ook de gemeentenaam erbij in Belgisch standaardformaat
+        // ("2900 Schoten"). Als de gemeente onbekend is, valt het automatisch
+        // terug op enkel de postcode zoals voorheen.
+        const pcTrim   = String(invoicePostalCode || '').trim();
+        const cityTrim = String(invoiceCity || '').trim();
+        const postcodeText = (pcTrim && cityTrim) ? (pcTrim + ' ' + cityTrim) : pcTrim;
+        if (postcodeText) {
             const postcodeLine = {
                 type: 'TEXT',
-                description: String(invoicePostalCode).trim(),
+                description: postcodeText,
             };
             if (woSalesOrderId) postcodeLine.orderId = woSalesOrderId;
             const r = await this.post(`sales-invoices/${invoiceId}/line-items`, postcodeLine);
@@ -2910,7 +2977,7 @@ const RobawsAPI = {
             // We ondersteunen nu zowel '1' als '5' als 21% (Robaws blijkt
             // historisch beide te gebruiken) en loggen een waarschuwing
             // i.p.v. stille foute berekening.
-            const vatRates = { '1': 0.21, '2': 0.12, '3': 0, '4': 0.06, '5': 0.21 };
+            const vatRates = { '1': 0.21, '2': 0, '3': 0, '4': 0.06, '5': 0.21 };  // v182: id 2 = Verlegd (0%), niet 12%
             for (const l of lines) {
                 const lineExcl = (Number(l.quantity) || 0) * (Number(l.price) || 0) * (1 - (Number(l.discount) || 0) / 100);
                 const tariffKey = String(l.vatTariffId);
@@ -3104,6 +3171,150 @@ const RobawsAPI = {
         // enkel nog zodat de app-flow kan doorgaan na een geslaagde terminal-betaling.
         return { success: true, code: 200, skipped: true };
     },
+
+    /**
+     * v146: Registreer een EXTERNE betaling op een Robaws sales-invoice.
+     * Gebruikt voor Mollie Tap-to-Pay payments die buiten Robaws zelf zijn
+     * geïnitieerd. Het volledige bedrag posten zet de factuur automatisch
+     * op "betaald" (openstaand saldo = 0).
+     *
+     * Robaws v2 endpoint: POST /sales-invoices/{id}/payments
+     *
+     * @param {Object} opts
+     * @param {string|number} opts.invoiceId  - factuur ID in Robaws
+     * @param {number} opts.amount            - totaal incl. BTW (in EUR)
+     * @param {string} [opts.date]            - YYYY-MM-DD (default: vandaag)
+     * @param {string} [opts.paymentMethod]   - bv. "Mollie Tap" / "Bancontact"
+     * @param {string} [opts.reference]       - bv. Mollie tr_xxxx voor traceability
+     * @returns {Promise<{success, code, data, error?}>}
+     */
+    /**
+     * v169: Stuur een werkbon-PDF per email via Robaws.
+     *
+     * Officieel endpoint (uit Robaws Public API docs):
+     *   POST /api/v2/{resourceTypeBasePath}/{resourceId}/emails
+     *
+     * Voor werkbons:
+     *   POST /api/v2/work-orders/{id}/emails
+     *
+     * Body:
+     *   - templateName / templateId  → kies welk template Robaws moet gebruiken
+     *   - recipients.to              → bestemmings-adressen
+     *   - send: true                 → echt versturen (vs. opslaan als draft)
+     *   - sendAsUserId (optioneel)   → namens een specifieke gebruiker
+     *
+     * Response 201 → { id: "..." } (id van de email)
+     *
+     * @param {string|number} workOrderId
+     * @param {string} email - bestemmings-adres (single email)
+     * @param {Object} [opts]
+     * @param {string} [opts.templateName] - bv. "Werkbon naar klant" (default uit constante)
+     * @param {string} [opts.templateId]   - alternatief voor templateName
+     * @param {string} [opts.subject]      - override template-onderwerp
+     * @param {Object} [opts.templateContext] - dict voor vervangingscodes
+     * @param {string} [opts.sendAsUserId] - namens deze user (default: API-user)
+     * @returns {Promise<{ok: boolean, emailId?: string, error?: string}>}
+     */
+    async sendWorkOrderByEmail(workOrderId, email, opts = {}) {
+        if (!workOrderId || !email) return { ok: false, error: 'workOrderId en email verplicht' };
+        const trimmed = String(email).trim();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+            return { ok: false, error: 'Ongeldig email-adres' };
+        }
+
+        // Default template-naam (configurabel in Robaws Instellingen → e-mailtemplates)
+        const templateName = opts.templateName || this.EMAIL_TEMPLATE_WERKBON || 'Werkbon naar klant';
+        const body = {
+            recipients: { to: [trimmed] },
+            send: true,
+        };
+        if (opts.templateId) body.templateId = opts.templateId;
+        else body.templateName = templateName;
+        if (opts.subject) body.subject = opts.subject;
+        if (opts.templateContext) body.templateContext = opts.templateContext;
+        if (opts.sendAsUserId) body.sendAsUserId = String(opts.sendAsUserId);
+
+        try {
+            const r = await this.post(`work-orders/${workOrderId}/emails`, body);
+            if (r.code === 200 || r.code === 201 || r.code === 204) {
+                const emailId = (r.data && r.data.id) || null;
+                console.log('[sendWorkOrderByEmail] ✓ verstuurd via template "' + templateName + '" → id', emailId);
+                return { ok: true, emailId };
+            }
+            const errMsg = `HTTP ${r.code}: ${JSON.stringify(r.data).slice(0, 300)}`;
+            console.warn('[sendWorkOrderByEmail] faalde:', errMsg);
+            return { ok: false, error: errMsg };
+        } catch (e) {
+            const errMsg = (e && e.message) || String(e);
+            console.warn('[sendWorkOrderByEmail] gooi-fout:', errMsg);
+            return { ok: false, error: errMsg };
+        }
+    },
+
+    /** v169: configurabele template-naam voor werkbon-mails.
+     *  Moet exact matchen met de naam in Robaws Instellingen → e-mailtemplates.
+     *  Bij wijziging in Robaws ook hier aanpassen. */
+    EMAIL_TEMPLATE_WERKBON: 'Werkbon naar klant',
+
+    async registerInvoicePayment({ invoiceId, amount, date, paymentMethod, reference }) {
+        if (!invoiceId) return { success: false, error: 'invoiceId verplicht' };
+        if (!amount || amount <= 0) return { success: false, error: 'amount > 0 verplicht' };
+
+        const isoDate = date || this._localDateStr();
+        const amountStr = (Math.round(parseFloat(amount) * 100) / 100).toFixed(2);
+
+        // Robaws v2 verwacht bedragen als string in het amount-object (zelfde
+        // patroon als bij sales-invoices/line-items). We proberen meerdere
+        // gangbare body-vormen indien de eerste een 4xx geeft.
+        const bodyVariants = [
+            // Variant A: amount object met value/currency (Mollie-stijl)
+            {
+                amount: { value: amountStr, currency: 'EUR' },
+                date: isoDate,
+                paymentMethod: paymentMethod || 'Bancontact',
+                remark: reference ? ('Mollie ' + reference) : '',
+            },
+            // Variant B: flat amount (legacy v1-stijl)
+            {
+                amount: parseFloat(amountStr),
+                date: isoDate,
+                paymentMethod: paymentMethod || 'Bancontact',
+                remark: reference ? ('Mollie ' + reference) : '',
+            },
+            // Variant C: minimal (alleen amount + date)
+            {
+                amount: { value: amountStr, currency: 'EUR' },
+                date: isoDate,
+            },
+        ];
+
+        const path = `sales-invoices/${invoiceId}/payments`;
+        let lastErr = null;
+        for (let i = 0; i < bodyVariants.length; i++) {
+            const body = bodyVariants[i];
+            console.log('[Robaws] registerInvoicePayment poging ' + (i+1) + ':', body);
+            try {
+                const res = await this.post(path, body);
+                console.log('[Robaws] registerInvoicePayment response:', res.code, res.data);
+                if (res.code === 200 || res.code === 201 || res.code === 204) {
+                    return { success: true, code: res.code, data: res.data, variant: i + 1 };
+                }
+                lastErr = { code: res.code, data: res.data };
+                // 400/422 = body-format probleem → probeer volgende variant
+                if (res.code !== 400 && res.code !== 422) break;
+            } catch (e) {
+                lastErr = { error: e && e.message };
+                break;
+            }
+        }
+        return {
+            success: false,
+            code: lastErr && lastErr.code,
+            error: (lastErr && lastErr.data && (lastErr.data.message || JSON.stringify(lastErr.data).slice(0, 200)))
+                || (lastErr && lastErr.error)
+                || 'onbekende fout',
+        };
+    },
     // =============================================
     // TIJDSREGISTRATIE VIA WERKBONNEN (v58+)
     // =============================================
@@ -3115,10 +3326,111 @@ const RobawsAPI = {
     },
 
     /** v83: hourTypeId waarden voor uursoort in Robaws time-entries.
-     *  Zie GET /work-orders/{id}/time-entries response — werkuren=1, overuren=2. */
+     *  Zie GET /work-orders/{id}/time-entries response — werkuren=1, overuren=2.
+     *  v138: weekend-versies worden runtime opgehaald via _loadWeekendHourTypeIds. */
     HOUR_TYPE_IDS: {
         werkuren: 1,
         overuren: 2,
+        werkurenZaterdag: null,
+        werkurenZondag:   null,
+        overurenZaterdag: null,
+        overurenZondag:   null,
+    },
+
+    /** v138: probeer Robaws's hour-types endpoint en cache namen → IDs. */
+    // v180: cache van hourType-id -> naam (1 call), zodat het dagoverzicht
+    // overuren-varianten ("Overuren zaterdag/zondag") correct kan herkennen.
+    // Voorheen werd enkel id===2 als overuren geteld -> weekend-overuren viel
+    // in de werkuren-bak.
+    _hourTypeNameCache: null,
+    async getHourTypeNameMap() {
+        if (this._hourTypeNameCache) return this._hourTypeNameCache;
+        const map = {};
+        try {
+            const res = await this.get('hour-types?limit=100');
+            if (res.code === 200) {
+                const items = (res.data && res.data.items) || res.data || [];
+                for (const ht of items) {
+                    if (ht && ht.id != null) map[String(ht.id)] = ht.name || '';
+                }
+            }
+        } catch (e) {
+            console.warn('[RobawsAPI] getHourTypeNameMap faalde:', e && e.message);
+        }
+        this._hourTypeNameCache = map;
+        return map;
+    },
+
+    // v183: BTW-tarieven 1x ophalen als map {id: {percentage, name}} (gecached),
+    // zodat getPlanning niet per klant een vat-tariffs/{id}-call hoeft te doen.
+    _vatTariffMapCache: null,
+    async getVatTariffMap() {
+        if (this._vatTariffMapCache) return this._vatTariffMapCache;
+        const map = {};
+        try {
+            const res = await this.get('vat-tariffs?limit=50');
+            if (res.code === 200) {
+                const items = (res.data && res.data.items) || res.data || [];
+                for (const t of items) {
+                    if (t && t.id != null) {
+                        map[String(t.id)] = { percentage: t.percentage ?? null, name: t.name ?? null };
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn('[RobawsAPI] getVatTariffMap faalde:', e && e.message);
+        }
+        this._vatTariffMapCache = map;
+        return map;
+    },
+
+    _weekendHourTypesLoaded: false,
+    async _loadWeekendHourTypeIds() {
+        if (this._weekendHourTypesLoaded) return;
+        this._weekendHourTypesLoaded = true;   // markeer direct om re-tries te vermijden
+        try {
+            const res = await this.get('hour-types?limit=50');
+            if (res.code !== 200) {
+                console.warn('[RobawsAPI] hour-types endpoint gaf', res.code);
+                return;
+            }
+            const items = (res.data && res.data.items) || res.data || [];
+            const byName = {};
+            for (const ht of items) {
+                const n = (ht.name || '').toLowerCase().trim();
+                if (n && ht.id != null) byName[n] = ht.id;
+            }
+            if (byName['werkuren zaterdag']) this.HOUR_TYPE_IDS.werkurenZaterdag = byName['werkuren zaterdag'];
+            if (byName['werkuren zondag'])   this.HOUR_TYPE_IDS.werkurenZondag   = byName['werkuren zondag'];
+            if (byName['overuren zaterdag']) this.HOUR_TYPE_IDS.overurenZaterdag = byName['overuren zaterdag'];
+            if (byName['overuren zondag'])   this.HOUR_TYPE_IDS.overurenZondag   = byName['overuren zondag'];
+            console.log('[RobawsAPI] weekend hourTypes:', this.HOUR_TYPE_IDS);
+        } catch(e) {
+            console.warn('[RobawsAPI] hour-types lookup faalde:', e && e.message);
+        }
+    },
+
+    /** v138: voor een gegeven hourTypeId en datum (YYYY-MM-DD), geef de juiste
+     *  weekend-variant terug als de datum een zaterdag of zondag is.
+     *  Werkt enkel als de weekend-IDs gevonden zijn — anders blijft origineel. */
+    async getWeekendAdjustedHourTypeId(hourTypeId, dateStr) {
+        if (!hourTypeId || !dateStr) return hourTypeId;
+        await this._loadWeekendHourTypeIds();
+        const day = new Date(String(dateStr) + 'T12:00:00').getDay();
+        if (day !== 0 && day !== 6) return hourTypeId;
+        const base = String(hourTypeId);
+        const isWerk = base === String(this.HOUR_TYPE_IDS.werkuren);
+        const isOver = base === String(this.HOUR_TYPE_IDS.overuren);
+        if (!isWerk && !isOver) return hourTypeId;
+        const target = isWerk
+            ? (day === 6 ? this.HOUR_TYPE_IDS.werkurenZaterdag : this.HOUR_TYPE_IDS.werkurenZondag)
+            : (day === 6 ? this.HOUR_TYPE_IDS.overurenZaterdag : this.HOUR_TYPE_IDS.overurenZondag);
+        if (target) {
+            console.log('[RobawsAPI] weekend-adjust hourTypeId ' + hourTypeId + ' → ' + target + ' (day=' + day + ')');
+            return target;
+        }
+        console.warn('[RobawsAPI] geen weekend hourTypeId gevonden — gebruik default ' + hourTypeId);
+        return hourTypeId;
     },
 
     /** v83/v95: mobilityTypeId waarden voor commute-entries in Robaws.
@@ -3344,9 +3656,13 @@ const RobawsAPI = {
         const {
             workOrderId, employeeId, startTime, endTime, breakMinutes, articleId,
             // v83 nieuwe parameters:
-            hourTypeId,        // 1 = werkuren, 2 = overuren (HOUR_TYPE_IDS)
-            hoursOverride,     // expliciete uren (voor compensatie-entries zonder tijden)
+            hourTypeId: rawHourTypeId,  // 1 = werkuren, 2 = overuren (HOUR_TYPE_IDS)
+            hoursOverride,              // expliciete uren (voor compensatie-entries zonder tijden)
+            date,                       // v138: optioneel — datum voor weekend-adjust (default = today)
         } = opts;
+        // v138: op zaterdag/zondag → werkuren/overuren-zaterdag/zondag variant
+        const dateForAdjust = date || this._localDateStr();
+        const hourTypeId = await this.getWeekendAdjustedHourTypeId(rawHourTypeId, dateForAdjust);
         const te = {
             employeeId: String(employeeId),
             articleId: String(articleId),
@@ -3529,64 +3845,214 @@ const RobawsAPI = {
         return await this.post(`work-orders/${workOrderId}/commute-entries`, body);
     },
 
+    // =============================================
+    // v137: KLANT ZOEKEN + AANMAKEN (technieker ad-hoc werkbon flow)
+    // =============================================
+
+    // Caches alle Robaws clients voor 10 min zodat klant-search instant is.
+    _allClientsCache: null,        // {at: timestamp, items: [...]}
+    _allClientsCacheMs: 10 * 60 * 1000,
+
+    /** Haal (en cache) alle Robaws-klanten paginerend op. */
+    async _fetchAllClientsCached() {
+        const now = Date.now();
+        if (this._allClientsCache && (now - this._allClientsCache.at) < this._allClientsCacheMs) {
+            return this._allClientsCache.items;
+        }
+        const all = [];
+        let page = 0;
+        const MAX_PAGES = 20;      // ~2000 clients ruim genoeg voor QE
+        do {
+            const res = await this.get(`clients?limit=100&page=${page}`);
+            const items = (res.data && res.data.items) || [];
+            if (items.length === 0) break;
+            all.push(...items);
+            page++;
+            if (page >= (res.data.totalPages || 1)) break;
+        } while (page < MAX_PAGES);
+        this._allClientsCache = { at: now, items: all };
+        console.log('[RobawsAPI] _fetchAllClientsCached:', all.length, 'klanten geladen');
+        return all;
+    },
+
+    /**
+     * Live klantzoek voor de "+ Nieuwe werkbon" modal. Robaws's `?q=`-filter
+     * werkt niet betrouwbaar voor clients → we doen client-side substring match
+     * op naam, email en telefoon. Cache met 10 min TTL maakt het snel.
+     */
+    async searchClients(query, limit = 15) {
+        const q = String(query || '').trim().toLowerCase();
+        if (!q || q.length < 2) return [];
+        const all = await this._fetchAllClientsCached();
+        const matches = [];
+        for (const c of all) {
+            if (matches.length >= limit) break;
+            const name  = (c.name  || '').toLowerCase();
+            const email = (c.email || '').toLowerCase();
+            const tel   = (c.tel   || '').toLowerCase();
+            const addr  = c.address ? this.formatAddress(c.address).toLowerCase() : '';
+            if (name.includes(q) || email.includes(q) || tel.includes(q) || addr.includes(q)) {
+                matches.push(c);
+            }
+        }
+        // Sorteer: name-startsWith zaken eerst, dan rest
+        matches.sort((a, b) => {
+            const an = (a.name || '').toLowerCase();
+            const bn = (b.name || '').toLowerCase();
+            const aStarts = an.startsWith(q) ? 0 : 1;
+            const bStarts = bn.startsWith(q) ? 0 : 1;
+            if (aStarts !== bStarts) return aStarts - bStarts;
+            return an.localeCompare(bn);
+        });
+        return matches.map(c => ({
+            id: c.id,
+            name: c.name || '',
+            email: c.email || '',
+            tel: c.tel || '',
+            address: c.address ? this.formatAddress(c.address) : '',
+            rawAddress: c.address || null,
+        }));
+    },
+
+    /**
+     * Maak een nieuwe klant aan in Robaws. Minimaal naam + adres-velden.
+     * Returns het volledige client-object van Robaws.
+     */
+    async createClient({ name, addressLine1, postalCode, city, country, email, tel }) {
+        if (!name || !String(name).trim()) throw new Error('Naam is verplicht');
+        const body = {
+            name: String(name).trim(),
+            address: {
+                addressLine1: addressLine1 || null,
+                postalCode:   postalCode || null,
+                city:         city || null,
+                country:      country || 'België',
+            },
+        };
+        if (email) body.email = String(email).trim();
+        if (tel)   body.tel   = String(tel).trim();
+        const res = await this.post('clients', body);
+        if (res.code !== 200 && res.code !== 201) {
+            throw new Error('Klant aanmaken faalde (HTTP ' + res.code + ')');
+        }
+        return res.data;
+    },
+
+    /**
+     * Maak een nieuwe sales-order (opdracht) aan voor een klant.
+     * Returns het volledige sales-order object.
+     */
+    async createSalesOrder({ clientId, title, assignedUserId, salesAgentUserId, address }) {
+        if (!clientId) throw new Error('clientId is verplicht');
+        const body = {
+            clientId: String(clientId),
+            title:    String(title || '').trim(),
+        };
+        if (assignedUserId)   body.assignedUserId   = String(assignedUserId);
+        if (salesAgentUserId) body.salesAgentUserId = String(salesAgentUserId);
+        if (address)          body.address          = address;
+        const res = await this.post('sales-orders', body);
+        if (res.code !== 200 && res.code !== 201) {
+            throw new Error('Order aanmaken faalde (HTTP ' + res.code + ')');
+        }
+        return res.data;
+    },
+
+    /**
+     * Maak een nieuw planning-item (dagplanning) aan voor een werknemer.
+     * startDate/endDate moeten ISO-strings met UTC offset zijn.
+     */
+    async createPlanningItem({
+        salesOrderId, clientId, employeeIds, startDate, endDate,
+        summary, description, address, hourTypeId, planningTypeId,
+    }) {
+        const body = {};
+        if (summary)        body.summary        = String(summary);
+        if (description)    body.description    = String(description);
+        if (salesOrderId)   body.salesOrderId   = String(salesOrderId);
+        if (clientId)       body.clientId       = String(clientId);
+        if (Array.isArray(employeeIds) && employeeIds.length) {
+            body.employeeIds = employeeIds.map(String);
+        }
+        if (startDate)      body.startDate      = startDate;
+        if (endDate)        body.endDate        = endDate;
+        if (address)        body.address        = address;
+        if (hourTypeId != null)     body.hourTypeId     = String(hourTypeId);
+        if (planningTypeId != null) body.planningTypeId = String(planningTypeId);
+        const res = await this.post('planning-items', body);
+        if (res.code !== 200 && res.code !== 201) {
+            throw new Error('Dagplanning aanmaken faalde (HTTP ' + res.code + ')');
+        }
+        return res.data;
+    },
+
     /**
      * Haal Tijdsregistratie-werkbonnen op voor de huidige user, voor een
      * bepaalde maand (YYYY-MM). Filter op assignedUserId zodat techniekers
      * enkel hun eigen kaarten zien.
      */
     async getMyTimeRegistrationWorkOrders(userId, monthPrefix) {
-        // v66: maxPages drastisch verlaagd naar 8 + smart break om rate-limit
-        // (HTTP 429) te vermijden. Sort=id:desc behouden — onze recente
-        // werkbonnen staan vooraan; 800 werkbonnen is ruim genoeg.
-        // Smart break: stop zodra 2 opeenvolgende pages 0 nieuwe Tijdsregistratie
-        // werkbonnen voor monthPrefix opleveren.
-        // v83b: BUG FIX — Robaws negeert ?page=N (elke "page" gaf dezelfde 100
-        // items), waardoor werkbonnen met lagere ID onbereikbaar waren (bv. id 1259
-        // voor 5/5/26). We gebruiken nu ?offset=N*limit i.p.v. ?page=N.
+        // v178: deterministische + efficiente fetch.
+        //  - ?include=timeEntries -> time-entries komen INLINE mee (geen N+1 meer;
+        //    zie ROBAWS_API_HANDLEIDING 2.16). loadDagoverzicht hoeft dus geen
+        //    aparte GET /work-orders/{id}/time-entries per werkbon meer te doen.
+        //  - Stop-conditie op DATUM i.p.v. de oude "smart break". De vorige aanpak
+        //    stopte na 2 pagina's zonder maand-match; omdat /work-orders op id:desc
+        //    staat en er constant nieuwe werkbonnen bijkomen (elke klok-in), viel
+        //    die break elke load op een ANDERE diepte -> wisselende registraties.
+        //    Nu stoppen we zodra een volledige pagina ouder is dan de maandstart:
+        //    id:desc ~ aanmaakvolgorde en tijdsregistratie-werkbonnen worden op hun
+        //    eigen dag aangemaakt, dus alle items van de doelmaand staan bovenaan
+        //    en nieuwe komen er bovenop -> STABIEL resultaat tussen loads.
+        //  - Server-side filteren op user/status/datum kan NIET op /work-orders
+        //    (2.18: status genegeerd; 2.1: enkel clientId/salesOrderId werken),
+        //    vandaar de client-side filter onderaan.
         const LIMIT = 100;
-        let allItems = [];
+        const monthStart = monthPrefix + '-01';   // bv "2026-06-01"
+        const allItems = [];
         const seenIds = new Set();
-        let page = 0;
-        const maxPages = 8;
-        let emptyPagesInRow = 0;
-        while (page < maxPages) {
+        const MAX_PAGES = 40;   // veiligheidsplafond; de datum-stop kapt normaal
+                                // al na enkele pagina's binnen een maand.
+        for (let page = 0; page < MAX_PAGES; page++) {
             const offset = page * LIMIT;
-            const res = await this.get(`work-orders?limit=${LIMIT}&offset=${offset}&sort=id:desc`);
+            const res = await this.get(
+                `work-orders?limit=${LIMIT}&offset=${offset}&sort=id:desc&include=timeEntries`
+            );
             if (res.code !== 200) {
                 throw new Error(`Tijdsregistratie-werkbonnen fetch faalde (${res.code})`);
             }
-            if (!res.data || !res.data.items || res.data.items.length === 0) break;
-            let foundOnPage = 0;
-            for (const it of res.data.items) {
+            const items = (res.data && res.data.items) || [];
+            if (items.length === 0) break;
+
+            let maxRealDate = '';   // hoogste ECHTE datum op deze pagina
+            for (const it of items) {
+                const d = (it.date || '').substring(0, 10);
+                if (d && d > maxRealDate) maxRealDate = d;
                 if (it.id == null || seenIds.has(String(it.id))) continue;
                 seenIds.add(String(it.id));
                 allItems.push(it);
-                // Tel matching items (status + datum) op voor smart break
-                const status = String(it.status || '').toLowerCase();
-                const dateMonth = (it.date || '').substring(0, 7);
-                if (status.includes('tijdsregistratie') && dateMonth === monthPrefix) {
-                    foundOnPage++;
-                }
             }
-            if (foundOnPage === 0) emptyPagesInRow++;
-            else emptyPagesInRow = 0;
-            if (emptyPagesInRow >= 2) break;
-            page++;
-            if (res.data.totalPages && page >= res.data.totalPages) break;
+
+            // Deterministische stop: zagen we een echte datum EN is de hele pagina
+            // ouder dan de maandstart, dan zijn alle volgende pagina's (lagere id =
+            // ouder) dat ook -> klaar. Lege/null-datums tellen niet mee voor de stop.
+            if (maxRealDate && maxRealDate < monthStart) break;
+            if (items.length < LIMIT) break;
+            if (res.data.totalPages && (page + 1) >= res.data.totalPages) break;
         }
-        // Filter: status=Tijdsregistratie EN assignedUser=ingelogde user EN maand klopt
+        // Client-side filter: status~tijdsregistratie + assignedUser = user + maand.
         const filtered = allItems.filter(item => {
             const status = String(item.status || '').toLowerCase();
             if (!status.includes('tijdsregistratie')) return false;
-            const dateMonth = (item.date || '').substring(0, 7);
-            if (dateMonth !== monthPrefix) return false;
+            if ((item.date || '').substring(0, 7) !== monthPrefix) return false;
             const itemUserId = item.assignedUserId
                 || (item.assignedUser && item.assignedUser.id);
             if (itemUserId && String(itemUserId) !== String(userId)) return false;
             return true;
         });
-        console.log('[RobawsAPI] Tijdsregistratie-werkbonnen: ' + allItems.length +
-            ' fetched, ' + filtered.length + ' voor user ' + userId + ' in ' + monthPrefix);
+        console.log('[RobawsAPI] Tijdsregistratie-werkbonnen (v178 include+datumstop): ' +
+            allItems.length + ' gescand, ' + filtered.length + ' voor user ' + userId +
+            ' in ' + monthPrefix);
         return filtered;
     },
 

@@ -21,6 +21,33 @@ const app = {
      * en daardoor rond middernacht de verkeerde dag teruggaf.
      * Delegeert naar RobawsAPI._localDateStr (laden vóór app.js).
      */
+    // v166: Centrale styling voor het "Tijd"-veld (extraFields.Tijd). Gebruikt
+    // in zowel het uren-overzicht als het aanpassings-scherm. Eén plek om kleuren,
+    // iconen en labels te beheren — voorkomt drift wanneer er nieuwe types
+    // worden toegevoegd in Robaws.
+    _TIJD_STYLES: {
+        'Op tijd':              { color: '#2e7d32', bg: '#f1f8e9', icon: '',   label: 'Werkuren' },
+        'Te laat':              { color: '#e65100', bg: '#fff3e0', icon: '⚠️', label: 'Te laat' },
+        'Ziek':                 { color: '#b71c1c', bg: '#ffebee', icon: '🤒', label: 'Ziek' },
+        'Verlof':               { color: '#1565c0', bg: '#e3f2fd', icon: '🏖️', label: 'Verlof' },
+        'Betaalde feestdag':    { color: '#b8860b', bg: '#fff8e1', icon: '🎉', label: 'Betaalde feestdag' },
+        'Inhaal rustdag':       { color: '#00695c', bg: '#e0f2f1', icon: '🛌', label: 'Inhaal rustdag' },
+        'Sociaal verlof':       { color: '#6a1b9a', bg: '#f3e5f5', icon: '🤝', label: 'Sociaal verlof' },
+    },
+
+    _getTijdStyle(tijd) {
+        return this._TIJD_STYLES[tijd] || this._TIJD_STYLES['Op tijd'];
+    },
+
+    /** v166: true voor types die als afwezigheid tellen (Ziek + 4 verloftypes).
+     *  Bij deze types wordt 8u forfaitair geboekt en krijgt de uren-kaart
+     *  een afzonderlijke kleur (override op werkuren/overuren styling). */
+    _isAbsenceTijd(tijd) {
+        return tijd === 'Ziek' || tijd === 'Verlof'
+            || tijd === 'Betaalde feestdag' || tijd === 'Inhaal rustdag'
+            || tijd === 'Sociaal verlof';
+    },
+
     _localDateStr(d, offsetDays) {
         if (typeof RobawsAPI !== 'undefined' && RobawsAPI._localDateStr) {
             return RobawsAPI._localDateStr(d, offsetDays);
@@ -328,12 +355,36 @@ const app = {
 
         // Timer herstellen als app weer zichtbaar wordt (na achtergrond)
         document.addEventListener('visibilitychange', () => {
-            if (!document.hidden && this.timer.running) {
-                // Herstart interval (was gestopt door OS) — elapsed wordt
-                // correct berekend via Date.now() - startTime
-                clearInterval(this.timer.interval);
-                this.timer.interval = setInterval(() => this.updateTimerDisplay(), 1000);
-                this.updateTimerDisplay();
+            if (!document.hidden) {
+                // Timer herstart
+                if (this.timer.running) {
+                    clearInterval(this.timer.interval);
+                    this.timer.interval = setInterval(() => this.updateTimerDisplay(), 1000);
+                    this.updateTimerDisplay();
+                }
+                // v158: Mollie polling — direct Worker check bij visibility return.
+                // Onafhankelijk van Java's onResume (die soms niet fire't bij
+                // Tap-return). Page Visibility API is de meest betrouwbare
+                // signaal voor "WebView is weer zichtbaar".
+                if (typeof this.onAppResumed === 'function') {
+                    try { this.onAppResumed(); } catch(_) {}
+                }
+            }
+        });
+
+        // v158: Focus event als extra trigger — sommige Android-WebView versies
+        // fire'n alleen focus en geen visibilitychange bij activity-resume.
+        window.addEventListener('focus', () => {
+            if (typeof this.onAppResumed === 'function') {
+                try { this.onAppResumed(); } catch(_) {}
+            }
+        });
+
+        // v158: pageshow vangt het geval op waarbij de pagina uit de bfcache
+        // gehaald wordt (gebeurt bij sommige back-navigation paden).
+        window.addEventListener('pageshow', (e) => {
+            if (e.persisted && typeof this.onAppResumed === 'function') {
+                try { this.onAppResumed(); } catch(_) {}
             }
         });
     },
@@ -1008,11 +1059,14 @@ const app = {
     },
 
     // ========================================
-    // v116: UITKLOK-CHECK — openstaande werkbons
+    // v116/v167: UITKLOK-CHECK — openstaande werkbons
     // ========================================
     // Wordt aangeroepen door clock.js vóór `_clockOut`. Gedrag:
     //  - Geen openstaande werkbons → laat uitklokken door (return true).
-    //  - Technieker / bureel + ≥1 openstaande → blokkeer (return false).
+    //  - Bureel + ≥1 openstaande → blokkeer (return false).
+    //  - Technieker + ≥1 openstaande → vraag bevestiging:
+    //        Ja → laat uitklokken door (return true). Werkbon blijft open.
+    //        Nee → blokkeer (return false). (v167)
     //  - Monteur + >1 openstaande → blokkeer (return false).
     //  - Monteur + 1 openstaande → vraag overname:
     //        Ja → werknemer-aanvink-modal → vul uren in op die werkbon
@@ -1055,14 +1109,22 @@ const app = {
         // Vanaf hier komen er modals — spinner verbergen zodat die zichtbaar zijn
         hideLoad();
 
-        // Technieker / bureel: altijd blokkeren bij open
-        if (!isMonteur) {
+        // Bureel: altijd blokkeren bij open (geen werkbon-overname mogelijk)
+        const activeRole = this._activeRole();
+        if (activeRole === 'bureel') {
             await this._showMessageModal(
                 'Openstaande werkbon',
                 `Je hebt nog ${openItems.length} openstaande ${openItems.length === 1 ? 'werkbon' : 'werkbons'}. ` +
                 'Werk die eerst af voor je uitklokt.'
             );
             return false;
+        }
+
+        // v167: Technieker mag dag eindigen met open werkbons — via bevestigingsdialog.
+        // De werkbons blijven open zoals ze zijn; de technieker kan ze morgen verder afmaken.
+        if (activeRole === 'technieker') {
+            const accepted = await this._showTechniekerEndDayConfirm(openItems);
+            return accepted;   // true = dag beëindigen, false = blijf ingeklokt
         }
 
         // Monteur + >1 open → blokkeren
@@ -1219,6 +1281,50 @@ const app = {
             window._klokOvResp = (val) => {
                 this.closeModal();
                 delete window._klokOvResp;
+                resolve(val);
+            };
+        });
+    },
+
+    /** v167: Bevestigingsdialog voor techniekers die uit willen klokken met
+     *  openstaande werkbons. Anders dan monteurs (die overname doen) mogen
+     *  techniekers de werkbons gewoon open laten staan voor de volgende dag.
+     *  Returns: true = dag beëindigen, false = blijf ingeklokt. */
+    async _showTechniekerEndDayConfirm(openItems) {
+        return new Promise(resolve => {
+            const count = openItems.length;
+            const woordvorm = count === 1 ? 'werkbon' : 'werkbons';
+            const lijst = openItems.slice(0, 5).map(wo => {
+                const clientName = (wo.client && wo.client.name) || wo.summary || 'Werkbon';
+                return `<div style="font-size:13px;padding:4px 0;color:#374151">• ${this.escapeHtml(clientName)}</div>`;
+            }).join('');
+            const meer = count > 5 ? `<div style="font-size:12px;color:var(--qe-grey);padding-top:4px">… en ${count - 5} meer</div>` : '';
+
+            document.getElementById('modalContent').innerHTML = `
+                <h3>🚪 Dag beëindigen?</h3>
+                <p style="font-size:14px;color:var(--qe-grey);margin:8px 0 14px">
+                    Je hebt nog ${count} openstaande ${woordvorm}:
+                </p>
+                <div style="background:#fff8e1;border-radius:10px;padding:14px;margin-bottom:14px;border-left:4px solid #f59e0b">
+                    ${lijst}
+                    ${meer}
+                </div>
+                <p style="font-size:14px;line-height:1.45;margin-bottom:14px">
+                    Deze blijven open staan en kan je morgen afwerken. Wil je toch al uitklokken?
+                </p>
+                <button onclick="window._techEndResp(true)" class="btn btn-primary btn-full"
+                    style="padding:14px;font-size:15px;margin-bottom:8px">
+                    ✓ Ja, beëindig dag
+                </button>
+                <button onclick="window._techEndResp(false)" class="btn btn-outline btn-full"
+                    style="padding:12px;font-size:14px">
+                    Nee, blijf ingeklokt
+                </button>
+            `;
+            this.openModal();
+            window._techEndResp = (val) => {
+                this.closeModal();
+                delete window._techEndResp;
                 resolve(val);
             };
         });
@@ -1391,8 +1497,80 @@ const app = {
         window.scrollTo(0, 0);
 
         if (screenId === 'screenUitgevoerd') this.loadUitgevoerd();
-        if (screenId === 'screenDagoverzicht') this.loadDagoverzicht();
+        if (screenId === 'screenDagoverzicht') this.loadDagoverzicht(0);
         if (screenId === 'screenClock') this.onNavigateToClock();
+
+        // v137: toon FAB enkel op planning-tab + niet voor monteurs
+        this._updateNewWoFabVisibility();
+    },
+
+    /**
+     * v176: refresh ALLEEN het huidige scherm i.p.v. de hele app.
+     * Wordt aangeroepen vanuit de native SwipeRefreshLayout (zie MainActivity.java).
+     * Stopt de native spinner via QEBridge.refreshDone() in een finally-block,
+     * zodat de spinner ook stopt als de refresh-loader gooit.
+     */
+    async refreshCurrentScreen() {
+        const screen = this.currentScreen;
+        console.log('[Refresh] Refresh huidig scherm:', screen);
+        try {
+            switch (screen) {
+                case 'screenPlanning':
+                    await this.loadPlanning();
+                    break;
+                case 'screenDagoverzicht':
+                    await this.loadDagoverzicht();
+                    break;
+                case 'screenUitgevoerd':
+                    await this.loadUitgevoerd();
+                    break;
+                case 'screenClock':
+                    if (typeof this.onNavigateToClock === 'function') {
+                        await this.onNavigateToClock();
+                    }
+                    break;
+                case 'screenDetail':
+                    // Werkbon-detail: herlaad als we de WO nog hebben
+                    if (this.currentWO && this.currentWO.id) {
+                        await this.openWorkorder(this.currentWO.id);
+                    }
+                    break;
+                case 'screenOrderDetail':
+                    if (this._lastOrderDetailId) {
+                        await this.openOrderDetail(this._lastOrderDetailId);
+                    }
+                    break;
+                case 'screenInstHistory':
+                    if (this._lastInstHistoryId) {
+                        await this.openInstallationHistory(this._lastInstHistoryId);
+                    }
+                    break;
+                case 'screenProfile':
+                    // Profiel heeft geen dynamische data — niets te refreshen
+                    break;
+                default:
+                    // Geen specifieke loader voor dit scherm: stilletjes niets doen.
+                    console.log('[Refresh] Geen refresh-handler voor', screen);
+            }
+        } catch (e) {
+            console.error('[Refresh] Refresh van', screen, 'mislukt:', e);
+        } finally {
+            // Stop het native SwipeRefresh-spinner ongeacht succes/fout.
+            try {
+                if (window.QEBridge && typeof QEBridge.refreshDone === 'function') {
+                    QEBridge.refreshDone();
+                }
+            } catch (_) { /* native bridge mogelijk niet beschikbaar — geen probleem */ }
+        }
+    },
+
+    /** v137: bepaalt of de + Nieuwe-werkbon FAB zichtbaar moet zijn. */
+    _updateNewWoFabVisibility() {
+        const fab = document.getElementById('newWoFab');
+        if (!fab) return;
+        const onPlanning = this.currentScreen === 'screenPlanning';
+        const allowed    = this.currentUser && this._activeRole() !== 'monteur';
+        fab.style.display = (onPlanning && allowed) ? 'flex' : 'none';
     },
 
     goBack() {
@@ -1517,7 +1695,7 @@ const app = {
         }
 
         const list = document.getElementById('workorderList');
-        list.innerHTML = '<div class="spinner"></div>';
+        list.innerHTML = this._skelList(4);
 
         const dateStr = this._localDateStr(this.currentDate);
 
@@ -1550,7 +1728,7 @@ const app = {
                 const isToday = dateStr === this._localDateStr();
                 list.innerHTML = `
                     <div class="empty-state">
-                        <div class="empty-icon">📋</div>
+                        <div class="empty-icon">${this.icon('clipboard', { size: 44, stroke: 1.6 })}</div>
                         <h3>Geen werkorders</h3>
                         <p>Geen werkorders voor ${isToday ? 'vandaag' : 'morgen'}</p>
                     </div>
@@ -1585,13 +1763,70 @@ const app = {
             console.error('Planning laden mislukt:', err);
             list.innerHTML = `
                 <div class="empty-state">
-                    <div class="empty-icon">⚠️</div>
+                    <div class="empty-icon">${this.icon('alert', { size: 44, stroke: 1.6 })}</div>
                     <h3>Fout bij laden</h3>
                     <p style="font-size:12px;color:var(--qe-grey);word-break:break-all;margin-bottom:8px">${this.escapeHtml(err.message)}</p>
                     <button class="btn btn-primary btn-sm" onclick="app.loadPlanning()">Opnieuw proberen</button>
                 </div>
             `;
         }
+    },
+
+    // v187: inline lijn-icoon helper (vervangt emoji-iconen, geen externe webfont nodig)
+    icon(name, opts) {
+        opts = opts || {};
+        const s = opts.size || 18;
+        const sw = opts.stroke || 2;
+        const cls = opts.cls ? ` class="${opts.cls}"` : '';
+        const st = opts.style ? ` style="${opts.style}"` : '';
+        const P = {
+            'map-pin': '<path d="M12 21s-6-5.7-6-10a6 6 0 0 1 12 0c0 4.3-6 10-6 10z"/><circle cx="12" cy="11" r="2.3"/>',
+            'phone': '<path d="M5 4h3.5l1.5 4.5L8 10a11 11 0 0 0 5 5l1.6-2 4.4 1.5V19a2 2 0 0 1-2 2A16 16 0 0 1 4 6a2 2 0 0 1 1-2z"/>',
+            'mail': '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
+            'clock': '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+            'calendar': '<rect x="4" y="5" width="16" height="16" rx="2"/><path d="M16 3v4M8 3v4M4 10h16"/>',
+            'clipboard': '<rect x="6" y="4" width="12" height="16" rx="2"/><path d="M9 4h6v3H9z"/><path d="M9 12h6M9 16h4"/>',
+            'cash': '<rect x="3" y="6" width="18" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 9v6M18 9v6"/>',
+            'percent': '<path d="M19 5 5 19"/><circle cx="7.5" cy="7.5" r="2"/><circle cx="16.5" cy="16.5" r="2"/>',
+            'user': '<circle cx="12" cy="8" r="3.5"/><path d="M5.5 20a6.5 6.5 0 0 1 13 0"/>',
+            'navigation': '<path d="M3 11 21 3l-8 18-2-7-8-3z"/>',
+            'check': '<path d="M5 12l4 4 10-10"/>',
+            'check-circle': '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
+            'alert': '<path d="M12 4 3 19h18z"/><path d="M12 10v4M12 17h.01"/>',
+            'package': '<path d="M12 3 21 7.5v9L12 21 3 16.5v-9z"/><path d="M3 7.5 12 12l9-4.5M12 12v9"/>',
+            'minus': '<path d="M5 12h14"/>'
+        };
+        return `<svg${cls}${st} width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
+    },
+
+    // v187: skeleton-lijst tijdens laden (vervangt de spinner -> rustiger overgang)
+    _skelList(n) {
+        let r = '';
+        for (let i = 0; i < (n || 4); i++) {
+            r += `<div class="qe-skel-row"><div class="qe-skel" style="width:42px;height:34px"></div><div style="flex:1"><div class="qe-skel" style="width:55%;height:12px;margin-bottom:8px"></div><div class="qe-skel" style="width:78%;height:10px"></div></div></div>`;
+        }
+        return `<div class="qe-skel-list">${r}</div>`;
+    },
+
+    // v187: tellende getallen (uren-overzicht)
+    _animateCountUps(root) {
+        try {
+            const els = (root || document).querySelectorAll('.qe-countup[data-count]');
+            els.forEach((el) => {
+                const target = parseFloat(el.getAttribute('data-count')) || 0;
+                const dec = parseInt(el.getAttribute('data-dec') || '0', 10);
+                if (!target) { el.textContent = target.toFixed(dec); return; }
+                const dur = 750; let t0 = null;
+                const step = (ts) => {
+                    if (!t0) t0 = ts;
+                    const p = Math.min((ts - t0) / dur, 1);
+                    const e = 1 - Math.pow(1 - p, 3);
+                    el.textContent = (target * e).toFixed(dec);
+                    if (p < 1) requestAnimationFrame(step); else el.textContent = target.toFixed(dec);
+                };
+                requestAnimationFrame(step);
+            });
+        } catch (e) { /* animatie mag de UI nooit breken */ }
     },
 
     renderWorkorderCard(wo) {
@@ -1624,6 +1859,11 @@ const app = {
             : '';
 
         const tel = wo.client?.tel || wo.client?.phone || '';
+        // v181: regie (tijd & materiaal) zichtbaar maken in de planning-lijst
+        const isRegie = !!wo.timeAndMaterial;
+        const regieChip = isRegie
+            ? `<span class="wo-regie-tag">${this.icon('cash', { size: 13 })} Regie</span>`
+            : '';
 
         return `
             <div class="card card-clickable" onclick="app.openWorkorder('${wo.id}')">
@@ -1634,15 +1874,15 @@ const app = {
                     <div class="wo-info">
                         <h3>${this.escapeHtml(clientName)}</h3>
                         ${wo.summary ? `<div style="font-size:13px;color:var(--qe-darkblue);font-weight:500;margin:2px 0">${this.escapeHtml(wo.summary)}</div>` : ''}
-                        ${address ? `<div class="wo-address">📍 ${this.escapeHtml(address)}</div>` : ''}
-                        <span class="wo-type ${type}">${typeLabel}</span>
+                        ${address ? `<div class="wo-address">${this.icon('map-pin', { size: 14 })} ${this.escapeHtml(address)}</div>` : ''}
+                        <span class="wo-type ${type}">${typeLabel}</span>${regieChip}
                         ${orderNr ? `<span style="margin-left:6px;font-size:11px;color:var(--qe-purple);font-weight:500">${this.escapeHtml(orderNr)}</span>` : ''}
                         ${histBadge}
-                        ${hasMaterials || hasHours ? '<span style="margin-left:6px;font-size:11px;color:var(--qe-green)">✓ In bewerking</span>' : ''}
+                        ${hasMaterials || hasHours ? `<span style="margin-left:6px;font-size:11px;color:var(--qe-green)">${this.icon('check', { size: 12, style: 'vertical-align:-2px' })} In bewerking</span>` : ''}
                     </div>
                     <div style="display:flex;flex-direction:column;gap:6px;align-items:center;flex-shrink:0">
-                        ${tel ? `<a href="tel:${this.escapeHtml(tel)}" class="wo-nav-btn" onclick="event.stopPropagation()" title="Bel klant" style="text-decoration:none">📞</a>` : ''}
-                        ${address ? `<button class="wo-nav-btn" onclick="event.stopPropagation(); app.navigateToAddress('${this.escapeHtml(address).replace(/'/g, "\\'")}')" title="Navigeer">🧭</button>` : ''}
+                        ${tel ? `<a href="tel:${this.escapeHtml(tel)}" class="wo-nav-btn" onclick="event.stopPropagation()" title="Bel klant" style="text-decoration:none">${this.icon('phone', { size: 17 })}</a>` : ''}
+                        ${address ? `<button class="wo-nav-btn" onclick="event.stopPropagation(); app.navigateToAddress('${this.escapeHtml(address).replace(/'/g, "\\'")}')" title="Navigeer">${this.icon('navigation', { size: 17 })}</button>` : ''}
                     </div>
                 </div>
             </div>
@@ -1667,18 +1907,21 @@ const app = {
             }
 
             // Probeer ook Robaws werkbonnen te tellen (via sales-orders of work-orders)
-            for (const cid of clientIds) {
-                try {
-                    const res = await fetch(`api/werkbon-queue.php?action=countByClient&clientId=${cid}`);
-                    const data = await res.json();
-                    if (data.count !== undefined) {
-                        this._clientHistoryCache[cid] = data.count;
-                    } else {
-                        this._clientHistoryCache[cid] = localCounts[cid] || 0;
-                    }
-                } catch(e) {
-                    this._clientHistoryCache[cid] = localCounts[cid] || 0;
-                }
+            // v173: parallelliseren met Promise.all i.p.v. sequentiële await-loop.
+            // Voorheen: N klanten × ~300ms = 1.5-3 sec achtergrond-blokkade.
+            // Nu: alle tellingen tegelijk = ~500ms voor de hele batch.
+            const countResults = await Promise.all(
+                clientIds.map(cid =>
+                    fetch(`api/werkbon-queue.php?action=countByClient&clientId=${cid}`)
+                        .then(r => r.json())
+                        .then(data => ({ cid, count: data.count }))
+                        .catch(() => ({ cid, count: undefined }))
+                )
+            );
+            for (const { cid, count } of countResults) {
+                this._clientHistoryCache[cid] = (count !== undefined)
+                    ? count
+                    : (localCounts[cid] || 0);
             }
 
             // Re-render werkorder kaarten met badges
@@ -1692,6 +1935,56 @@ const app = {
     // ========================================
     // WERKORDER DETAIL
     // ========================================
+    // v185: detail-only data (eindklant, line-items, documenten) lazy laden bij
+    // het openen van een werkbon i.p.v. tijdens elke planning-lijst-load. Parallel,
+    // en met v184-cache (clients/{id}) instant bij heropenen. Mapping identiek aan
+    // de oude getPlanning-enrichment zodat clientInfo / _renderPlanLineItems /
+    // _renderPlanDocuments dezelfde shape krijgen. Idempotent: al-geladen data wordt
+    // overgeslagen.
+    async _loadWorkorderDetailData(wo) {
+        if (!wo) return;
+        const woIdAtStart = wo.id;
+        const needEndClient = wo.endClientId
+            && String(wo.endClientId) !== String(wo.clientId || '')
+            && !wo.endClient;
+        const [ecRes, liRes, docRes] = await Promise.all([
+            needEndClient ? RobawsAPI.get(`clients/${wo.endClientId}`).catch(() => null) : Promise.resolve(null),
+            wo.lineItems ? Promise.resolve(null) : RobawsAPI.get(`planning-items/${wo.id}/line-items`).catch(() => null),
+            wo.documents ? Promise.resolve(null) : RobawsAPI.get(`planning-items/${wo.id}/documents`).catch(() => null),
+        ]);
+        // Ondertussen een andere werkbon geopend? Resultaat niet toepassen.
+        if (!this.currentWO || String(this.currentWO.id) !== String(woIdAtStart)) return;
+
+        if (ecRes && ecRes.code === 200 && ecRes.data) {
+            const ec = ecRes.data;
+            wo.endClient = {
+                id: ec.id, name: ec.name || '', email: ec.email || '',
+                tel: ec.tel || '', address: RobawsAPI.formatAddress(ec.address),
+            };
+        }
+        if (liRes && liRes.code === 200 && liRes.data) {
+            const lineItems = liRes.data.items || liRes.data || [];
+            wo.lineItems = lineItems.map(li => ({
+                id: li.id,
+                description: li.description || '',
+                quantity: li.quantity || 1,
+                unitType: li.unitType || null,
+                type: li.type || 'LINE',
+                articleId: li.articleId || (li.article && li.article.id) || null,
+            }));
+        }
+        if (docRes && docRes.code === 200 && docRes.data) {
+            const docs = Array.isArray(docRes.data) ? docRes.data : (docRes.data.items || []);
+            wo.documents = docs.map(d => ({
+                id: d.id,
+                name: d.name || 'Bestand',
+                contentType: d.contentType || '',
+                size: d.size || 0,
+                url: d.url || d.previewUrl || null,
+            }));
+        }
+    },
+
     async openWorkorder(woId) {
         this.currentWO = this.workorders.find(w => String(w.id) === String(woId));
         if (!this.currentWO) return;
@@ -1707,6 +2000,14 @@ const app = {
         const clientName = this.currentWO.client?.name || 'Onbekend';
         document.getElementById('detailTitle').textContent = summary || clientName;
         document.getElementById('detailSubtitle').textContent = summary ? clientName : '';
+        // v181: regie (tijd & materiaal) heel zichtbaar bovenaan tonen
+        const _regieBanner = document.getElementById('detailRegieBanner');
+        if (_regieBanner) _regieBanner.style.display = this.currentWO.timeAndMaterial ? 'block' : 'none';
+
+        // v185: detail-data (eindklant + line-items + documenten) lazy laden.
+        // Stond vroeger in getPlanning (= bij elke lijst-load, per item); nu enkel
+        // bij het openen van DEZE werkbon, parallel + met v184-cache bij heropenen.
+        await this._loadWorkorderDetailData(this.currentWO);
 
         // Fill client info — gebruik dagplanning data waar beschikbaar
         const client = this.currentWO.client || {};
@@ -1730,24 +2031,24 @@ const app = {
             && String(endClient.id || '') !== String(client.id || '');
 
         const navLink = displayAddress
-            ? `<a href="https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(displayAddress)}" target="_blank" style="display:inline-flex;align-items:center;gap:4px;background:var(--qe-purple);color:#fff;padding:6px 10px;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none;white-space:nowrap">🗺️ Navigeer</a>`
+            ? `<a href="https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(displayAddress)}" target="_blank" style="display:inline-flex;align-items:center;gap:4px;background:var(--qe-purple);color:#fff;padding:6px 10px;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none;white-space:nowrap">${this.icon('navigation', { size: 14, style: 'vertical-align:-2px' })} Navigeer</a>`
             : '';
 
         const partyRows = (party) => {
             if (!party) return '';
             return `
                 <div class="info-row">
-                    <span class="info-icon">📍</span>
+                    <span class="info-icon">${this.icon('map-pin')}</span>
                     <span class="info-label">Adres</span>
                     <span class="info-value">${this.escapeHtml(party.address || '-')}</span>
                 </div>
                 <div class="info-row">
-                    <span class="info-icon">📞</span>
+                    <span class="info-icon">${this.icon('phone')}</span>
                     <span class="info-label">Telefoon</span>
                     <span class="info-value">${party.tel ? `<a href="tel:${party.tel}">${this.escapeHtml(party.tel)}</a>` : '-'}</span>
                 </div>
                 <div class="info-row">
-                    <span class="info-icon">✉️</span>
+                    <span class="info-icon">${this.icon('mail')}</span>
                     <span class="info-label">Email</span>
                     <span class="info-value">${party.email ? `<a href="mailto:${party.email}">${this.escapeHtml(party.email)}</a>` : '-'}</span>
                 </div>`;
@@ -1765,19 +2066,19 @@ const app = {
             </div>` : ''}
 
             ${planTimeStr ? `<div class="info-row">
-                <span class="info-icon">🕐</span>
+                <span class="info-icon">${this.icon('clock')}</span>
                 <span class="info-label">Gepland</span>
                 <span class="info-value">${this.escapeHtml(planTimeStr)}</span>
             </div>` : ''}
             ${planDescription ? `<div class="info-row">
-                <span class="info-icon">📋</span>
+                <span class="info-icon">${this.icon('clipboard')}</span>
                 <span class="info-label">Omschrijving</span>
                 <span class="info-value">${planDescription.replace(/<[^>]*>/g, '') || '-'}</span>
             </div>` : ''}
 
             <!-- BTW altijd van klant + aanpas-knop direct eronder -->
             <div class="info-row btw-row" style="background:rgba(106,44,145,0.06);border-radius:8px;padding:8px 12px;margin:10px 0 6px">
-                <span class="info-icon">💰</span>
+                <span class="info-icon">${this.icon('percent')}</span>
                 <span class="info-label">BTW tarief</span>
                 <span class="info-value" id="clientVatDisplay" style="font-weight:600;color:var(--qe-purple)">${client.vatTariffName ? this.escapeHtml(client.vatTariffName) : (client.vatPercentage !== null && client.vatPercentage !== undefined ? client.vatPercentage + '%' : 'Niet ingesteld')}</span>
             </div>
@@ -1785,7 +2086,7 @@ const app = {
                 style="width:100%;margin:0 0 10px;padding:10px;border:2px solid var(--qe-purple);border-radius:10px;
                 background:transparent;color:var(--qe-purple);font-size:14px;font-weight:600;cursor:pointer;
                 display:flex;align-items:center;justify-content:center;gap:6px">
-                💰 BTW tarief aanpassen
+                ${this.icon('percent', { size: 15 })} BTW tarief aanpassen
             </button>` : ''}
 
             <!-- Klant (Eigenaar) -->
@@ -1793,7 +2094,7 @@ const app = {
                 Klant <span style="font-style:italic;text-transform:none;color:var(--qe-purple);letter-spacing:normal;font-weight:500">(Eigenaar)</span>
             </div>
             <div class="info-row">
-                <span class="info-icon">👤</span>
+                <span class="info-icon">${this.icon('user')}</span>
                 <span class="info-label">Naam</span>
                 <span class="info-value">${this.escapeHtml(client.name || 'Onbekend')}</span>
             </div>
@@ -1806,7 +2107,7 @@ const app = {
                     Eindklant <span style="font-style:italic;text-transform:none;color:var(--qe-orange);letter-spacing:normal;font-weight:500">(Bewoner)</span>
                 </div>
                 <div class="info-row">
-                    <span class="info-icon">👤</span>
+                    <span class="info-icon">${this.icon('user')}</span>
                     <span class="info-label">Naam</span>
                     <span class="info-value">${this.escapeHtml(endClient.name || '-')}</span>
                 </div>
@@ -1838,12 +2139,18 @@ const app = {
         // Planning documenten/bestanden tonen
         this._renderPlanDocuments();
 
-        // Load installations — alleen die van de dagplanning
+        // v181: ENKEL installaties die aan de dagplanning gelinkt zijn — geen
+        // fallback meer naar alle klant-installaties. Geen gelinkte installaties?
+        // Dan tonen we ook niets (lege staat).
         const installationIds = this.currentWO.installationIds || [];
         if (installationIds.length > 0) {
             this.loadInstallations(null, installationIds);
-        } else if (client.id) {
-            this.loadInstallations(client.id, []);
+        } else {
+            this._loadedInstallations = [];
+            const instEl = document.getElementById('installationInfo');
+            if (instEl) instEl.innerHTML = '<p class="text-grey text-sm">Geen installaties gekoppeld aan deze dagplanning</p>';
+            const docEl = document.getElementById('documentList');
+            if (docEl) docEl.innerHTML = '<p class="text-grey text-sm">Geen documenten beschikbaar</p>';
         }
 
         // Restore saved data
@@ -2760,34 +3067,21 @@ const app = {
     },
 
     // ========================================
-    // ONDERHOUD — werkuren niet factureren
+    // v138: ONDERHOUD-vinkje verwijderd — alle data.onderhoud blijft false.
+    // Functies bestaan nog als no-ops voor backwards-compat met bestaande oproepen.
     // ========================================
     toggleOnderhoud(checked) {
-        if (!this.currentWO) return;
-        const data = this.woData[this.currentWO.id];
-        data.onderhoud = checked;
-        const label = document.getElementById('onderhoudLabel');
-        if (label) {
-            label.textContent = checked
-                ? 'Werkuren worden NIET gefactureerd'
-                : 'Werkuren worden gefactureerd';
-            label.style.color = checked ? 'var(--qe-purple)' : 'var(--qe-grey)';
-            label.style.fontWeight = checked ? '600' : '400';
+        // No-op — feature verwijderd in v138.
+        if (this.currentWO && this.woData[this.currentWO.id]) {
+            this.woData[this.currentWO.id].onderhoud = false;
         }
-        this._saveWoData();
     },
 
     _restoreOnderhoud() {
-        if (!this.currentWO) return;
-        const section = document.getElementById('onderhoudSection');
-        // Monteurs mogen geen onderhoud aanvinken
-        const isMonteur = this.currentUser && this.currentUser.role === 'monteur';
-        if (section) section.style.display = isMonteur ? 'none' : 'flex';
-        if (isMonteur) return;
-        const data = this.woData[this.currentWO.id];
-        const cb = document.getElementById('onderhoudCheckbox');
-        if (cb) cb.checked = !!data.onderhoud;
-        this.toggleOnderhoud(!!data.onderhoud);
+        // No-op — section is hidden in HTML. Force onderhoud = false.
+        if (this.currentWO && this.woData[this.currentWO.id]) {
+            this.woData[this.currentWO.id].onderhoud = false;
+        }
     },
 
     // ========================================
@@ -3122,7 +3416,14 @@ const app = {
                 if (result.code !== 200) throw new Error('Kon BTW tarieven niet ophalen');
                 this._vatTariffsCache = (result.data.items || []).filter(t => t.name);
             }
-            const tariffs = this._vatTariffsCache;
+            // v181: techniekers mogen enkel kiezen tussen 3 tarieven —
+            // 21% (id 1), 6% (id 4), Verlegd (id 2). Andere tarieven verbergen.
+            // (Levi bevestigde deze IDs; de oude hardcoded comment "2=12%"
+            //  elders klopt dus niet voor dit tarief — apart na te kijken.)
+            const ALLOWED_VAT_IDS = ['1', '4', '2'];
+            const tariffs = ALLOWED_VAT_IDS
+                .map(id => this._vatTariffsCache.find(t => String(t.id) === id))
+                .filter(Boolean);
             const currentVatId = this.currentWO.client.vatTariffId;
 
             document.getElementById('modalContent').innerHTML = `
@@ -3935,7 +4236,11 @@ const app = {
         }
 
         section.style.display = '';
-        list.innerHTML = docs.map(doc => {
+        // v181: knop om alle bestanden in 1 keer te downloaden (bij >1 bestand)
+        const bulkBtn = docs.length > 1
+            ? `<button class="btn btn-primary btn-sm btn-full" style="margin-bottom:8px" onclick="app.downloadAllPlanDocuments()">⬇️ Alle ${docs.length} bestanden downloaden</button>`
+            : '';
+        list.innerHTML = bulkBtn + docs.map(doc => {
             const icon = this._getFileIcon(doc.contentType);
             const sizeStr = doc.size > 0 ? this._formatFileSize(doc.size) : '';
             return `
@@ -4046,6 +4351,28 @@ const app = {
         }
     },
 
+    // v181: download ALLE dagplanning-bestanden in 1 keer (lus + native opslaan).
+    async downloadAllPlanDocuments() {
+        const docs = (this.currentWO && this.currentWO.documents) || [];
+        if (docs.length === 0) { this.toast('Geen bestanden'); return; }
+        let ok = 0, fail = 0;
+        this.toast(docs.length + ' bestanden downloaden…');
+        for (const doc of docs) {
+            try {
+                const result = await RobawsAPI.getDocumentUrl(doc.id);
+                await this._saveBlobNative(result.blob, doc.name || ('bestand_' + doc.id), result.contentType);
+                try { URL.revokeObjectURL(result.blobUrl); } catch(_) {}
+                ok++;
+            } catch (e) {
+                console.warn('[PlanDocs] download faalde voor', doc && doc.name, e && e.message);
+                fail++;
+            }
+        }
+        this.toast(fail === 0
+            ? ('✓ ' + ok + ' bestand(en) opgeslagen in Downloads')
+            : (ok + ' opgeslagen, ' + fail + ' mislukt'));
+    },
+
     renderPhotos() {
         if (!this.currentWO) return;
         const data = this.woData[this.currentWO.id];
@@ -4071,11 +4398,19 @@ const app = {
         const client = this.currentWO.client || {};
         const warnings = [];
 
-        // Kritiek
-        if (!data.hours || data.hours.filter(h => h.type === 'klant').length === 0) {
-            warnings.push({ level: 'error', msg: 'Geen werkuren geregistreerd' });
+        // v138: uren-verplichting alleen voor monteurs. Techniekers/bureel mogen
+        // zonder uren versturen (bv. korte oproep zonder factureerbare tijd).
+        const isMonteur = this.isMonteur();
+        const noHours = !data.hours || data.hours.filter(h => h.type === 'klant').length === 0;
+        if (noHours) {
+            if (isMonteur) {
+                warnings.push({ level: 'error', msg: 'Geen werkuren geregistreerd' });
+            } else {
+                warnings.push({ level: 'info', msg: 'Geen werkuren — werkbon wordt zonder uren verstuurd' });
+            }
         }
-        if (!this.selectedUurcode) {
+        // Uurcode-check alleen relevant als er WEL werkuren zijn
+        if (!noHours && !this.selectedUurcode) {
             warnings.push({ level: 'error', msg: 'Geen uurcode geselecteerd' });
         }
 
@@ -4311,6 +4646,9 @@ const app = {
         if (sigSection) sigSection.style.display = 'none';
         const sigName = document.getElementById('wbSignatureName');
         if (sigName) sigName.value = '';
+        // v169: reset email-veld
+        const sigEmail = document.getElementById('wbSignatureEmail');
+        if (sigEmail) sigEmail.value = '';
 
         // Reset betaalmethode
         this._selectedPaymentMethod = null;
@@ -4345,7 +4683,7 @@ const app = {
         }
 
         // Bewaar vatTariffId op currentWO voor factuur-aanmaak
-        // Robaws vat-tariff IDs: 1=21%, 2=12%, 3=0%, 4=6%
+        // Robaws vat-tariff IDs: 1=21%, 2=Verlegd (0%), 3=0%, 4=6%   // v182: 2 = verlegd, niet 12%
         // BUG-fix: Robaws kan vatPercentage als string ("6") teruggeven.
         // De vorige === vergelijkingen faalden dan stilletjes en de
         // factuur kreeg de default 6% (vatTariffId='4'), waardoor
@@ -4355,8 +4693,8 @@ const app = {
             : Number(client.vatPercentage);
         if (vatPctNum === 6) this.currentWO.vatTariffId = '4';
         else if (vatPctNum === 21) this.currentWO.vatTariffId = '1';
-        else if (vatPctNum === 12) this.currentWO.vatTariffId = '2';
         else if (vatPctNum === 0) this.currentWO.vatTariffId = '3';
+        // v182: 12% -> id 2 mapping VERWIJDERD (id 2 = Verlegd/0%, niet 12%).
 
         this.navigate('screenWerkbon');
     },
@@ -4566,6 +4904,70 @@ const app = {
         canvas.addEventListener('mousemove', move);
         canvas.addEventListener('mouseup', end);
         canvas.addEventListener('mouseleave', end);
+    },
+
+    /** v170: Vul het email-veld in met de facturatie-email van de klant.
+     *  Cascade: invoiceEmail / billingEmail → extraFields.Facturatie / Facturatie email
+     *           → email. User kan na het invullen nog manueel aanpassen. */
+    async fillKlantEmail() {
+        const inputEl = document.getElementById('wbSignatureEmail');
+        const btnEl = document.getElementById('btnFillKlantEmail');
+        if (!inputEl) return;
+
+        const clientId = this.currentWO && this.currentWO.clientId;
+        if (!clientId) {
+            this.toast('Geen klant gekoppeld aan deze werkbon');
+            return;
+        }
+
+        // Loading state
+        const origBtn = btnEl ? btnEl.textContent : '';
+        if (btnEl) { btnEl.textContent = '⏳'; btnEl.disabled = true; }
+
+        try {
+            const res = await RobawsAPI.get(`clients/${clientId}`);
+            if (res.code !== 200 || !res.data) {
+                this.toast('Klant niet gevonden');
+                return;
+            }
+            const c = res.data;
+
+            // Cascade: zoek dedicated billing-email eerst, dan algemene email.
+            // Robaws kan billing-email in verschillende velden zetten — we
+            // proberen alle bekende paden.
+            const candidates = [
+                c.invoiceEmail,
+                c.billingEmail,
+                c.billing && c.billing.email,
+                c.invoiceContact && c.invoiceContact.email,
+                c.extraFields && c.extraFields['Facturatie email']
+                    && c.extraFields['Facturatie email'].stringValue,
+                c.extraFields && c.extraFields['facturatieEmail']
+                    && c.extraFields['facturatieEmail'].stringValue,
+                c.extraFields && c.extraFields['Facturatie e-mail']
+                    && c.extraFields['Facturatie e-mail'].stringValue,
+                c.email,                          // fallback laatste optie
+            ];
+
+            const found = candidates.find(v => {
+                if (!v || typeof v !== 'string') return false;
+                const t = v.trim();
+                return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
+            });
+
+            if (!found) {
+                this.toast('Geen email gevonden bij deze klant');
+                return;
+            }
+
+            inputEl.value = found.trim();
+            this.toast('📋 Email ingevuld: ' + inputEl.value);
+        } catch (e) {
+            console.warn('[fillKlantEmail] fout:', e && e.message);
+            this.toast('Kon email niet ophalen');
+        } finally {
+            if (btnEl) { btnEl.textContent = origBtn || '📋'; btnEl.disabled = false; }
+        }
     },
 
     clearSignature() {
@@ -4925,6 +5327,52 @@ const app = {
             // (zonder articleId — Felicity corrigeert later naar het echte artikel).
             const customArticlesForInvoice = (data.materials || []).filter(m => m.isCustom);
             const invoiceId = (invoiceResult && invoiceResult.invoice && invoiceResult.invoice.id) || null;
+
+            // v170: Transactiekost 1.5% voor card payments toevoegen aan factuur.
+            // Math: gross = net / (1 - 0.015), fee = gross - net. Zo ontvangt QE
+            // netto exact het originele factuurbedrag nadat Mollie z'n 1.5%
+            // afhoudt. Robaws verwacht `price` excl. BTW → we delen door
+            // (1 + btw-rate). VatTariffId-map: 1=21%, 2=12%, 3=0%, 4=6%.
+            let transactionFeeAdded = false;
+            const CARD_PAYMENT_METHODS = ['Mollie Tap', 'Viva wallet'];
+            if (invoiceId && CARD_PAYMENT_METHODS.includes(paymentMethod)) {
+                const originalTotal = parseFloat(invoiceResult.invoice.totalInclVat || 0);
+                if (originalTotal > 0) {
+                    const FEE_RATE = 0.015;
+                    const grossTotal = originalTotal / (1 - FEE_RATE);
+                    const feeInclVat = grossTotal - originalTotal;
+
+                    const vatTariffId = String(this.currentWO.vatTariffId || '4');
+                    const vatRateMap = { '1': 0.21, '2': 0.00, '3': 0.00, '4': 0.06 };  // v182: id 2 = Verlegd (0%)
+                    const vatRate = vatRateMap[vatTariffId] || 0;
+                    const feeExclVat = feeInclVat / (1 + vatRate);
+                    const roundedFeeExclVat = Math.round(feeExclVat * 100) / 100;
+
+                    try {
+                        const li = {
+                            type: 'LINE',
+                            description: `Transactiekosten ${paymentMethod} (1,5%)`,
+                            quantity: 1,
+                            price: roundedFeeExclVat,
+                            vatTariffId,
+                        };
+                        if (this.currentWO.salesOrderId) li.orderId = String(this.currentWO.salesOrderId);
+                        const r = await RobawsAPI.post(`sales-invoices/${invoiceId}/line-items`, li);
+                        if (r.code === 200 || r.code === 201) {
+                            console.log('[transactiekosten] +€' + feeInclVat.toFixed(4) +
+                                ' (incl BTW) = €' + roundedFeeExclVat.toFixed(2) +
+                                ' excl × ' + (vatRate * 100).toFixed(0) + '% toegevoegd aan factuur',
+                                invoiceId, '(' + paymentMethod + ')');
+                            transactionFeeAdded = true;
+                        } else {
+                            console.warn('[transactiekosten] POST faalde:', r.code, r.data);
+                        }
+                    } catch (e) {
+                        console.warn('[transactiekosten] exception:', e && e.message);
+                    }
+                }
+            }
+
             if (customArticlesForInvoice.length > 0 && invoiceId) {
                 const vatTariffId = this.currentWO.vatTariffId || '4';
                 for (const m of customArticlesForInvoice) {
@@ -4948,15 +5396,16 @@ const app = {
                     }
                 }
 
-                // v109: nu er line-items zijn bijgekomen klopt het oude `totalInclVat`
-                // uit `invoiceResult` niet meer met de werkelijke factuur in Robaws.
-                // Refetch de factuur zodat het betaalscherm het juiste bedrag toont
-                // (anders mist de eenmalige-artikel-prijs uit de Viva/Overschrijving
-                // betaling). De factuur in Robaws zelf is wel correct.
+            }
+
+            // v109/v170: factuur ververst na elk type bijkomende line-items.
+            // Triggers wanneer: custom articles toegevoegd, OF transactiekost toegevoegd.
+            // De factuur in Robaws is altijd correct; deze refetch is om
+            // het lokale invoiceResult-object in sync te brengen voor het betaalscherm.
+            if (invoiceId && (customArticlesForInvoice.length > 0 || transactionFeeAdded)) {
                 try {
                     const refreshed = await RobawsAPI.get(`sales-invoices/${invoiceId}`);
                     if (refreshed.code === 200 && refreshed.data) {
-                        // Merge bijgewerkte bedragen-velden over het bestaande invoice-object
                         const fresh = refreshed.data;
                         const merged = { ...invoiceResult.invoice };
                         for (const k of ['totalInclVat', 'totalExclVat', 'totalVat',
@@ -4965,11 +5414,12 @@ const app = {
                             if (fresh[k] !== undefined) merged[k] = fresh[k];
                         }
                         invoiceResult.invoice = merged;
-                        console.log('[App] Factuur ververst na eenmalige artikels — nieuw totaal:',
-                            merged.totalInclVat);
+                        const reason = transactionFeeAdded
+                            ? (customArticlesForInvoice.length > 0 ? 'eenmalige artikels + transactiekost' : 'transactiekost')
+                            : 'eenmalige artikels';
+                        console.log(`[App] Factuur ververst na ${reason} — nieuw totaal:`, merged.totalInclVat);
                     } else {
-                        console.warn('[App] Refetch factuur na eenmalige artikels gaf code',
-                            refreshed.code);
+                        console.warn('[App] Refetch factuur gaf code', refreshed.code);
                     }
                 } catch (e) {
                     console.warn('[App] Refetch factuur faalde:', e && e.message);
@@ -4989,6 +5439,24 @@ const app = {
 
             this._markWOSubmitted(data);
 
+            // v169: Werkbon PDF mailen naar klant indien email-veld ingevuld
+            // bij de handtekening. Fire-and-forget — blokkeert de betaalflow niet.
+            // Robaws-template: zie RobawsAPI.EMAIL_TEMPLATE_WERKBON (default "Werkbon naar klant")
+            const klantEmail = document.getElementById('wbSignatureEmail')?.value?.trim() || '';
+            if (klantEmail && workOrderId) {
+                RobawsAPI.sendWorkOrderByEmail(workOrderId, klantEmail).then(r => {
+                    if (r.ok) {
+                        console.log('[werkbon-email] verstuurd naar', klantEmail, '(id ' + r.emailId + ')');
+                        this.toast('📧 Werkbon gemaild naar ' + klantEmail);
+                    } else {
+                        console.warn('[werkbon-email] faalde:', r.error);
+                        this.toast('⚠️ Mail niet verstuurd: ' + (r.error || 'onbekend'));
+                    }
+                }).catch(e => {
+                    console.warn('[werkbon-email] exception:', e && e.message);
+                });
+            }
+
             // v88: Sla "laatste betaling" context op zodat Olivier op de Uitgevoerd-tab
             // de methode kan switchen als de Viva-terminal faalt.
             try {
@@ -5005,7 +5473,14 @@ const app = {
             } catch(e) { /* localStorage quota — niet kritiek */ }
 
             // === STAP 4: Betaalmethode-specifieke afhandeling ===
-            if (paymentMethod === 'Viva wallet') {
+            if (paymentMethod === 'Mollie Tap') {
+                // v139: direct Mollie payment aanmaken + Tap app launchen
+                this.payWithMollieTap(invoiceResult).catch(e => {
+                    console.warn('[Mollie] flow faalde:', e);
+                    this.toast('Mollie betaling kon niet starten: ' + (e && e.message || e));
+                    this.showPaymentScreen(invoiceResult);  // fallback naar manueel
+                });
+            } else if (paymentMethod === 'Viva wallet') {
                 // Viva Wallet → toon betaalscherm met terminal/QR
                 this.showPaymentScreen(invoiceResult);
             } else if (paymentMethod === 'Overschrijving' || paymentMethod === 'Overschrijving ter plaatse') {
@@ -5425,7 +5900,8 @@ const app = {
                 '<div style="font-size:14px;color:#666;margin-bottom:6px">Factuur <strong>' + (ctx.invoiceLogicId || inv.logicId || '') + '</strong></div>' +
                 '<div style="font-size:18px;color:#1A237E;font-weight:700;margin-bottom:18px">€ ' + amount + '</div>' +
                 '<div style="font-size:13px;color:#666;margin-bottom:14px">Kies een methode hieronder:</div>' +
-                mkBtnHtml('Viva wallet',   '💳', 'Viva Wallet (terminal)') +
+                mkBtnHtml('Mollie Tap',    '💳', 'Bancontact / kaart (Mollie Tap)') +
+                mkBtnHtml('Viva wallet',   '💳', 'Viva Wallet (legacy)') +
                 mkBtnHtml('Cash',          '💵', 'Cash') +
                 mkBtnHtml('Overschrijving','🏦', 'Overschrijving ter plaatse') +
                 mkBtnHtml('Via factuur',   '📋', 'Via factuur') +
@@ -5469,7 +5945,12 @@ const app = {
 
         if (sameMethod) {
             // Zelfde methode → gewoon het oude betaalscherm openen (als er één is)
-            if (newMethod === 'Viva wallet' && ctx.invoiceResult) {
+            if (newMethod === 'Mollie Tap' && ctx.invoiceResult) {
+                // v141: retry de Mollie Tap betaling
+                this.payWithMollieTap(ctx.invoiceResult).catch(e => {
+                    this.toast('Mollie retry faalde: ' + (e && e.message || e));
+                });
+            } else if (newMethod === 'Viva wallet' && ctx.invoiceResult) {
                 this.showPaymentScreen(ctx.invoiceResult);
             } else if (newMethod === 'Overschrijving' && ctx.invoiceResult) {
                 this.showOverschrijvingScreen(ctx.invoiceResult);
@@ -5515,7 +5996,12 @@ const app = {
             this.toast('Betaalmethode → ' + newMethod);
 
             // Open nieuw betaalscherm waar relevant — anders terug naar Uitgevoerd
-            if (newMethod === 'Viva wallet' && ctx.invoiceResult) {
+            if (newMethod === 'Mollie Tap' && ctx.invoiceResult) {
+                // v141: start direct de Mollie Tap betaling
+                this.payWithMollieTap(ctx.invoiceResult).catch(e => {
+                    this.toast('Mollie betaling kon niet starten: ' + (e && e.message || e));
+                });
+            } else if (newMethod === 'Viva wallet' && ctx.invoiceResult) {
                 this.showPaymentScreen(ctx.invoiceResult);
             } else if (newMethod === 'Overschrijving' && ctx.invoiceResult) {
                 this.showOverschrijvingScreen(ctx.invoiceResult);
@@ -6090,6 +6576,603 @@ const app = {
         }
     },
 
+    // =====================================================================
+    // v142: MOLLIE TAP-TO-PAY (app-to-app intent flow)
+    // =====================================================================
+
+    /** Start de Mollie Tap-to-Pay flow: bouw payload + launch via Java bridge. */
+    async payWithMollieTap(invoiceResult) {
+        if (typeof MollieAPI === 'undefined') {
+            this.toast('Mollie module niet geladen');
+            this.showPaymentScreen(invoiceResult);
+            return;
+        }
+        if (typeof QEBridge === 'undefined' || !QEBridge.openMollieTap) {
+            this.toast('Mollie bridge niet beschikbaar — APK update nodig');
+            this.showPaymentScreen(invoiceResult);
+            return;
+        }
+        const inv = invoiceResult.invoice;
+        const amountCents = Math.round(parseFloat(inv.totalInclVat) * 100);
+        // v143: description = ENKEL factuur-logicId (bv "F20252853") zodat
+        // de Mollie ↔ Robaws auto-koppeling de factuur automatisch op
+        // "betaald" zet (Robaws matcht op factuurnummer in description).
+        const description = inv.logicId || inv.id || 'QE Werkbon';
+        const workOrderId = this.currentWO ? this.currentWO.id : null;
+
+        // Bouw payload (vóór context-bewaren zodat we de referenceId mee kunnen pakken)
+        const payload = MollieAPI.buildPaymentRequest({
+            amountCents,
+            description,
+            workOrderId,
+            invoiceId: inv.id,
+        });
+        console.log('[Mollie] payload:', payload);
+
+        // Context bewaren voor de result-handler (intent kan onze app kill'en)
+        this._mollieContext = {
+            invoiceId: inv.id,
+            amount: parseFloat(inv.totalInclVat),
+            invoiceLogicId: inv.logicId || '',
+            ogm: inv.paymentInstruction || '',
+            // v155: bewaar referenceId + description voor Worker-polling
+            referenceId: payload.referenceId,
+            description: payload.description,
+        };
+        try { localStorage.setItem('qe_mollie_pending', JSON.stringify(this._mollieContext)); } catch(_) {}
+        this._mollieHandled = false;
+        // v154: auto-return tracking — reset bij elke nieuwe launch
+        this._mollieAutoReturnAttempted = false;
+        this._mollieManualFallbackShown = false;
+        this._mollieBounceAttempted = false;   // v161
+        this._mollieLaunchedAt = Date.now();
+
+        if (typeof this.showScanLoading === 'function') {
+            this.showScanLoading('Mollie Tap openen…');
+        }
+
+        // Launch via Java bridge — Java doet de HMAC-signing + intent
+        let launched = false;
+        try {
+            launched = QEBridge.openMollieTap(JSON.stringify(payload));
+        } catch (e) {
+            console.warn('[Mollie] bridge openMollieTap gooi-fout:', e && e.message);
+        }
+        if (!launched) {
+            if (typeof this.hideScanLoading === 'function') this.hideScanLoading();
+            this.showPaymentFailed('Mollie Tap app niet gevonden of niet geïnstalleerd');
+            setTimeout(() => this.showPaymentScreen(invoiceResult), 5000);
+            return;
+        }
+
+        // v155: start Worker-polling — vangt het scenario op waarin Mollie Tap
+        // de intent NIET terugstuurt (gedocumenteerd: "intent might not return
+        // if the payment process is interrupted"). Mollie pingt onze Worker met
+        // de webhook, Worker bewaart status in KV, app polled die KV.
+        this._startMolliePolling();
+    },
+
+    /** v159: ULTRA-PERSISTENT POLLING.
+     *  Gebruikt setInterval (niet recursief setTimeout) zodat zelfs als
+     *  Android throttling toeslaat tijdens de Tap-betaling, de polling op
+     *  onze "1 seconde"-cadans hervat zodra de WebView weer mag draaien.
+     *  Geen max-duration meer — stopt alleen bij _mollieHandled of expliciete
+     *  _stopMolliePolling(). De manuele "Annuleer"-knop blijft als noodrem. */
+    _startMolliePolling() {
+        // Stop een eventueel lopende polling
+        this._stopMolliePolling();
+        const ctx = this._mollieContext;
+        if (!ctx || !ctx.referenceId) {
+            console.warn('[Mollie poll] geen context/referenceId — skip polling');
+            return;
+        }
+        console.log('[Mollie poll] START continue polling (1s) voor', ctx.referenceId);
+        this._molliePollStartedAt = Date.now();
+        this._molliePollTickCount = 0;
+        // setInterval — Android pause't dit in background; bij resume blijft
+        // het op z'n 1s-ritme tikken. Veel betrouwbaarder dan recursief
+        // setTimeout dat moeten worden bijgehouden.
+        this._molliePollTimer = setInterval(() => this._molliePollTick(), 1000);
+        // Eerste tick onmiddellijk (niet wachten op interval)
+        this._molliePollTick();
+    },
+
+    async _molliePollTick() {
+        const ctx = this._mollieContext;
+        if (!ctx || !ctx.referenceId) {
+            this._stopMolliePolling();
+            return;
+        }
+        if (this._mollieHandled) {
+            this._stopMolliePolling();
+            return;
+        }
+        this._molliePollTickCount = (this._molliePollTickCount || 0) + 1;
+        const elapsed = ((Date.now() - this._molliePollStartedAt) / 1000).toFixed(1);
+        // Heartbeat-log elke 5 ticks zodat we kunnen zien of polling daadwerkelijk draait
+        if (this._molliePollTickCount % 5 === 1) {
+            console.log('[Mollie poll] tick #' + this._molliePollTickCount + ' (' + elapsed + 's)');
+        }
+        let data = null;
+        try {
+            data = await MollieAPI.fetchPaymentStatus({
+                referenceId: ctx.referenceId,
+                description: ctx.description,
+            });
+        } catch (e) {
+            console.warn('[Mollie poll] fetch fout:', e && e.message);
+        }
+        if (this._mollieHandled) {
+            this._stopMolliePolling();
+            return;
+        }
+        if (data && data.found && (data.status === 'paid' || data.status === 'failed')) {
+            console.log('[Mollie poll] webhook-status binnen na tick #' + this._molliePollTickCount + ':', data.status, 'robawsMarked:', data.robawsMarked);
+            this.onMollieTapResult({
+                status:             data.status,
+                paymentId:          data.paymentId || ('webhook_' + Date.now()),
+                referenceId:        data.referenceId || ctx.referenceId,
+                failureMessage:     data.failureMessage || null,
+                failureSupportCode: data.failureSupportCode || null,
+                signatureValid:     true,
+                robawsMarked:       data.robawsMarked === true,
+                robawsError:        data.robawsError || null,
+                _source:            'webhook-poll',
+            });
+        }
+    },
+
+    /** Stop polling — aangeroepen wanneer een ander pad de betaling afhandelt. */
+    _stopMolliePolling() {
+        if (this._molliePollTimer) {
+            clearInterval(this._molliePollTimer);
+            this._molliePollTimer = null;
+            console.log('[Mollie poll] STOP polling');
+        }
+    },
+
+    /** v151: simpele, eerlijke intent-based detection.
+     *  Mollie Tap onActivityResult geeft ons via Java een result-object met:
+     *    { status, paymentId, referenceId, failureMessage, failureSupportCode,
+     *      signatureValid, canceled, hasData, resultCode, extrasKeys }
+     *  We vertrouwen daar 100% op — geen API check meer.
+     *
+     *  Statuswaarden volgens Mollie Tap docs:
+     *    - "paid"     → SUCCES + factuur op betaald in Robaws
+     *    - "failed"   → MISLUKT met failureMessage / supportCode
+     *    - geen status → user heeft Tap-app afgesloten zonder te betalen
+     */
+    onMollieTapResult(result) {
+        console.log('[Mollie intent result]', JSON.stringify(result));
+        if (this._mollieHandled) return;
+        this._mollieHandled = true;
+
+        // v155: stop Worker-polling — andere paden hebben de betaling al af
+        if (typeof this._stopMolliePolling === 'function') this._stopMolliePolling();
+        // v160: stop ook de Java-side polling timer
+        try {
+            if (typeof QEBridge !== 'undefined' && QEBridge.stopMolliePolling) {
+                QEBridge.stopMolliePolling();
+            }
+        } catch(_) {}
+
+        // v154: opruim de manuele fallback-knoppen (als die er stonden) — die
+        // zitten in de scan-loading card en worden hieronder met hideScanLoading
+        // verborgen, maar voor de zekerheid expliciet verwijderen.
+        try {
+            const stray = document.querySelectorAll('.mollie-manual-fallback');
+            stray.forEach(n => n.remove());
+        } catch(_) {}
+
+        if (typeof this.hideScanLoading === 'function') this.hideScanLoading();
+
+        // Context ophalen die we vóór de Tap-launch bewaarden
+        const ctx = this._mollieContext
+            || (() => { try { return JSON.parse(localStorage.getItem('qe_mollie_pending') || 'null'); } catch(_) { return null; } })()
+            || {};
+        try { localStorage.removeItem('qe_mollie_pending'); } catch(_) {}
+        if (this._removePendingPayment && ctx.invoiceId) {
+            this._removePendingPayment(ctx.invoiceId);
+        }
+
+        const status   = result && result.status;
+        const paymentId = result && result.paymentId;
+        const sigOk    = !(result && result.signatureValid === false);   // null/undefined/true = OK
+        const canceled = result && (result.canceled === true || result.resultCode === 0);
+
+        // ── 1. SUCCES (status = paid) ──────────────────────────────────
+        if (status === 'paid') {
+            console.log('[Mollie] PAID:', paymentId, 'signature valid:', sigOk);
+
+            // Signature warning maar niet blokkerend — Mollie Tap heeft 'paid' al
+            // gerapporteerd, en de gebruiker ziet ook zelf de success-melding in de
+            // Tap app. Voor de admin loggen we het en zetten een toast achteraan.
+            if (!sigOk) {
+                console.warn('[Mollie] paid met ongeldige signature — toch verwerken');
+            }
+
+            // Toon SUCCES card (v130 design via showPaymentSuccess)
+            this.showPaymentSuccess(ctx.amount || 0, ctx.invoiceLogicId || '');
+
+            // v155: als het result via de Worker-poll kwam EN de Worker heeft
+            // de factuur al gemarkeerd, kunnen we de app's Robaws-call skippen.
+            // Anders (intent result, OF Worker faalde op Robaws): app doet het zelf.
+            const fromWebhook    = result && result._source === 'webhook-poll';
+            const workerMarked   = !!(result && result.robawsMarked);
+            const skipAppRobaws  = fromWebhook && workerMarked;
+
+            // Idempotency-check: schrijf maar één keer naar Robaws per paymentId
+            const dedupKey = 'qe_mollie_processed_' + paymentId;
+            const already = (() => { try { return !!localStorage.getItem(dedupKey); } catch(_) { return false; } })();
+            if (!already && ctx.invoiceId && !skipAppRobaws) {
+                if (fromWebhook && !workerMarked) {
+                    console.log('[Mollie] Worker heeft Robaws niet kunnen markeren — app doet het alsnog', result.robawsError);
+                }
+                this._registerMolliePaymentInRobaws({
+                    invoiceId:      ctx.invoiceId,
+                    invoiceLogicId: ctx.invoiceLogicId,
+                    amount:         ctx.amount,
+                    paymentId:      paymentId,
+                    referenceId:    result && result.referenceId,
+                    dedupKey:       dedupKey,
+                });
+            } else if (skipAppRobaws) {
+                console.log('[Mollie] success via Worker-poll — Robaws-update al door Worker gedaan');
+                try { localStorage.setItem(dedupKey, String(Date.now())); } catch(_) {}
+                setTimeout(() => this.toast('✓ Factuur ' + (ctx.invoiceLogicId || '') + ' op betaald'), 1200);
+            }
+            if (!sigOk) {
+                setTimeout(() => this.toast(
+                    '⚠️ Signature mismatch op deze betaling — controleer in Mollie dashboard'
+                ), 2500);
+            }
+            return;
+        }
+
+        // ── 2. MISLUKT (status = failed) ───────────────────────────────
+        if (status === 'failed') {
+            const reason = result.failureMessage || 'Betaling geweigerd';
+            const code   = result.failureSupportCode ? ' (' + result.failureSupportCode + ')' : '';
+            console.log('[Mollie] FAILED:', reason, code);
+            this.showPaymentFailed('Betaling mislukt: ' + reason + code);
+            return;
+        }
+
+        // ── 3. GEANNULEERD (geen status, user heeft Tap-app gesloten) ─
+        if (canceled || !status) {
+            console.log('[Mollie] CANCELED of geen status — gebruiker heeft Tap afgesloten');
+            this.showPaymentFailed(
+                'Betaling geannuleerd. De klant heeft de Mollie Tap-app afgesloten zonder te betalen.'
+            );
+            return;
+        }
+
+        // ── 4. ONBEKENDE STATUS (theoretisch onbereikbaar, maar veilig) ─
+        console.warn('[Mollie] onbekende status:', status, '— raw:', result);
+        this.showPaymentFailed(
+            'Onverwachte status van Mollie Tap: "' + status + '". Controleer in Mollie dashboard.'
+        );
+    },
+
+    // =====================================================================
+    // v154: AUTO-RETURN naar Mollie Tap wanneer onze app voorgrond komt
+    // zonder dat de intent-result is binnengekomen. Mollie Tap finish()'t
+    // soms niet correct → onze WebView blijft hangen op de spinner. Door
+    // Tap automatisch terug naar voren te brengen (FLAG_REORDER_TO_FRONT)
+    // krijgt Tap een nieuwe kans z'n setResult+finish() uit te voeren.
+    //
+    // Flow:
+    //   1. payWithMollieTap zet _mollieAutoReturnAttempted=false
+    //   2. Java onResume → app.onAppResumed()
+    //   3. Wacht 1.5s (geef intent result alsnog kans)
+    //   4. Nog niets? → bringMollieTapToFront() + flag op true
+    //   5. Wacht 3s extra
+    //   6. Nog steeds niets? → Manuele Bevestig/Annuleer knoppen in spinner
+    // =====================================================================
+    onAppResumed() {
+        // Geen actieve Mollie betaling → niets te doen
+        if (!this._mollieContext) return;
+        if (this._mollieHandled) return;
+
+        // Onmiddellijk na launch (< 2s) genegeerd — we krijgen 'n onResume bij
+        // onze eigen launch waarna Tap pas naar voren komt
+        const sinceLaunch = Date.now() - (this._mollieLaunchedAt || 0);
+        if (sinceLaunch < 2000) {
+            console.log('[Mollie] onAppResumed te vroeg (' + sinceLaunch + 'ms na launch) — skip');
+            return;
+        }
+
+        // v158: debounce — Java onResume + visibilitychange + focus kunnen
+        // alle drie in dezelfde 100-500ms firen. We willen maar 1 immediate
+        // poll per "echte" resume.
+        if (this._mollieResumeInFlight) {
+            console.log('[Mollie] onAppResumed al in-flight — skip duplicate');
+            return;
+        }
+        const now = Date.now();
+        if (this._mollieLastResumeAt && (now - this._mollieLastResumeAt) < 500) {
+            console.log('[Mollie] onAppResumed binnen 500ms na vorige — skip duplicate');
+            return;
+        }
+        this._mollieLastResumeAt = now;
+        this._mollieResumeInFlight = true;
+
+        // v159: bij resume triggeren we direct een snelle burst van polls
+        // (0, 0.5s, 1.5s, 3s) zodat we de KV-write 100% zeker oppikken zelfs
+        // als de WebView net wakker is. De continue setInterval-poll loopt
+        // verder als de burst niets vindt.
+        console.log('[Mollie] onAppResumed → burst poll');
+        const burst = async () => {
+            for (const delay of [0, 500, 1500, 3000]) {
+                if (delay) await new Promise(r => setTimeout(r, delay));
+                if (this._mollieHandled) return true;
+                const found = await this._pollMollieStatusNow();
+                if (found) return true;
+            }
+            return false;
+        };
+        burst().then(found => {
+            this._mollieResumeInFlight = false;
+            if (found || this._mollieHandled) return;
+            console.log('[Mollie] burst klaar, geen status — start ontdooi-bounce');
+            // v161: Als continue polling om wat voor reden gestopt was, herstart 'm.
+            if (!this._molliePollTimer) {
+                this._startMolliePolling();
+            }
+            // v161: WAKE-UP BOUNCE — 1× per Mollie-flow.
+            // De user heeft bewezen dat manueel minimize+heropen de bevroren
+            // WebView ontdooit. We simuleren dat programmatisch: korte flits
+            // naar home, dan automatisch terug. Triggert volledige lifecycle.
+            if (!this._mollieBounceAttempted) {
+                this._mollieBounceAttempted = true;
+                setTimeout(() => {
+                    if (this._mollieHandled) return;
+                    try {
+                        if (typeof QEBridge !== 'undefined' && QEBridge.bounceTaskToWakeUp) {
+                            console.log('[Mollie] → bounceTaskToWakeUp');
+                            QEBridge.bounceTaskToWakeUp();
+                        }
+                    } catch (e) {
+                        console.warn('[Mollie] bounce fout:', e && e.message);
+                    }
+                }, 1000);  // 1s zodat een laat-arriverende status nog vóór de bounce binnen kan komen
+            }
+            // Manuele fallback alleen na lange wachttijd zodat alles z'n kans krijgt.
+            this._scheduleMollieManualFallback();
+        }).catch(() => { this._mollieResumeInFlight = false; });
+    },
+
+    /** v157: éénmalige Worker-status-check, los van de polling-loop. Wordt
+     *  gebruikt vanuit onAppResumed zodat we niet hoeven te wachten op de
+     *  volgende timer-tick. Returnt true als status binnen was en
+     *  onMollieTapResult is gefired. */
+    async _pollMollieStatusNow() {
+        const ctx = this._mollieContext;
+        if (!ctx || !ctx.referenceId) return false;
+        if (this._mollieHandled) return false;
+        try {
+            const data = await MollieAPI.fetchPaymentStatus({
+                referenceId: ctx.referenceId,
+                description: ctx.description,
+            });
+            if (this._mollieHandled) return false;
+            if (data && data.found && (data.status === 'paid' || data.status === 'failed')) {
+                console.log('[Mollie immediate poll] status binnen:', data.status, 'robawsMarked:', data.robawsMarked);
+                this.onMollieTapResult({
+                    status:             data.status,
+                    paymentId:          data.paymentId || ('webhook_' + Date.now()),
+                    referenceId:        data.referenceId || ctx.referenceId,
+                    failureMessage:     data.failureMessage || null,
+                    failureSupportCode: data.failureSupportCode || null,
+                    signatureValid:     true,
+                    robawsMarked:       data.robawsMarked === true,
+                    robawsError:        data.robawsError || null,
+                    _source:            'webhook-poll',
+                });
+                return true;
+            }
+        } catch (e) {
+            console.warn('[Mollie immediate poll] fout:', e && e.message);
+        }
+        return false;
+    },
+
+    /** Plan de manuele bevestig/annuleer knoppen wanneer auto-return geen
+     *  resultaat oplevert binnen 3 seconden. Wordt 1× geplaatst per flow. */
+    _scheduleMollieManualFallback() {
+        if (this._mollieManualFallbackShown) return;
+        this._mollieManualFallbackShown = true;
+        setTimeout(() => {
+            if (this._mollieHandled) return;
+            this._showMollieManualFallback();
+        }, 3000);
+    },
+
+    /** Toon manuele Bevestig/Annuleer knoppen in de scan-loading overlay,
+     *  voor het geval Mollie Tap nooit een result intent terugstuurt. */
+    _showMollieManualFallback() {
+        if (this._mollieHandled) return;
+        console.log('[Mollie] manuele fallback knoppen tonen');
+
+        const overlay = document.getElementById('scanLoading');
+        const card = overlay && overlay.querySelector('.qe-scan-card');
+        if (card) {
+            // Update bestaande titel/melding zodat 't duidelijk is dat er iets mis is
+            const title = card.querySelector('.qe-scan-title');
+            if (title) { title.textContent = 'Geen antwoord van Mollie Tap'; title.classList.remove('loading'); }
+            const msg = card.querySelector('.qe-scan-msg');
+            if (msg) msg.textContent = 'Was de betaling gelukt?';
+            const sub = card.querySelector('.qe-scan-sub');
+            if (sub) sub.textContent = 'Bevestig hieronder of annuleer';
+            const iconWrap = card.querySelector('.qe-scan-icon-wrap');
+            if (iconWrap) iconWrap.classList.remove('loading');
+
+            // Zoek bestaand fallback-blok om dubbele toevoeging te vermijden
+            let block = card.querySelector('.mollie-manual-fallback');
+            if (!block) {
+                block = document.createElement('div');
+                block.className = 'mollie-manual-fallback';
+                block.style.cssText = 'margin-top:18px;display:flex;gap:10px;justify-content:center;width:100%';
+                block.innerHTML =
+                    '<button id="mollieManualOk" type="button" style="flex:1;padding:12px;background:#10b981;color:#fff;border:none;border-radius:10px;font-weight:600;font-size:15px;cursor:pointer">✓ Ja, gelukt</button>'
+                    + '<button id="mollieManualFail" type="button" style="flex:1;padding:12px;background:#ef4444;color:#fff;border:none;border-radius:10px;font-weight:600;font-size:15px;cursor:pointer">✕ Nee, annuleren</button>';
+                card.appendChild(block);
+                const okBtn = block.querySelector('#mollieManualOk');
+                const failBtn = block.querySelector('#mollieManualFail');
+                if (okBtn) okBtn.addEventListener('click', () => this._handleMollieManualConfirm());
+                if (failBtn) failBtn.addEventListener('click', () => this._handleMollieManualCancel());
+            }
+            return;
+        }
+        // Geen overlay gevonden → native fallback
+        if (confirm('Mollie Tap geeft geen antwoord.\nWas de betaling gelukt?')) {
+            this._handleMollieManualConfirm();
+        } else {
+            this._handleMollieManualCancel();
+        }
+    },
+
+    /** Manuele bevestiging: behandel alsof status='paid' met enkel referenceId
+     *  (we hebben geen paymentId omdat Mollie Tap nooit antwoordde). */
+    _handleMollieManualConfirm() {
+        if (this._mollieHandled) return;
+        console.log('[Mollie] MANUELE BEVESTIGING — geen paymentId, alleen referenceId');
+        // Bouw een synthetisch result dat onMollieTapResult begrijpt
+        const refId = 'manual_' + Date.now();
+        this.onMollieTapResult({
+            status: 'paid',
+            paymentId: refId,        // gebruikt voor dedup en Robaws-referentie
+            referenceId: refId,
+            signatureValid: true,
+            _manual: true,
+        });
+    },
+
+    /** Manuele annulering: toon failed-card met duidelijke uitleg. */
+    _handleMollieManualCancel() {
+        if (this._mollieHandled) return;
+        console.log('[Mollie] MANUELE ANNULERING');
+        this._mollieHandled = true;
+        if (typeof this.hideScanLoading === 'function') this.hideScanLoading();
+        try { localStorage.removeItem('qe_mollie_pending'); } catch(_) {}
+        if (this._removePendingPayment && this._mollieContext && this._mollieContext.invoiceId) {
+            this._removePendingPayment(this._mollieContext.invoiceId);
+        }
+        this.showPaymentFailed(
+            'Geen antwoord van Mollie Tap. Controleer in Mollie dashboard of de betaling toch is doorgekomen.'
+        );
+    },
+
+    // =====================================================================
+    // v151: VERIFIER-OVERLAY VOLLEDIG VERWIJDERD
+    // We vertrouwen 100% op de intent return van Mollie Tap (zie
+    // onMollieTapResult hierboven). Geen Mollie API check meer.
+    // =====================================================================
+
+    // v146: localStorage key voor de retry-queue van mislukte Robaws-updates.
+    _MOLLIE_RETRY_KEY: 'qe_mollie_retry_queue',
+
+    /** Stuur de Robaws factuur-betaling registratie naar Robaws. Bij failure:
+     *  bewaar in retry-queue + toon waarschuwing zodat admin weet dat hij
+     *  handmatig moet ingrijpen. Bij success: markeer dedup zodat retry niet
+     *  opnieuw probeert. */
+    async _registerMolliePaymentInRobaws({ invoiceId, invoiceLogicId, amount, paymentId, referenceId, dedupKey }) {
+        if (!invoiceId) {
+            console.warn('[Mollie→Robaws] geen invoiceId — skip');
+            return;
+        }
+        console.log('[Mollie→Robaws] register payment', { invoiceId, amount, paymentId });
+        try {
+            const res = await RobawsAPI.registerInvoicePayment({
+                invoiceId,
+                amount,
+                paymentMethod: 'Bancontact',  // Mollie Tap = Bancontact in Robaws-terminologie
+                reference: paymentId || referenceId || '',
+            });
+            if (res.success) {
+                console.log('[Mollie→Robaws] factuur op betaald gezet (variant ' + (res.variant || '?') + ')');
+                try { localStorage.setItem(dedupKey, String(Date.now())); } catch(_) {}
+                setTimeout(() => this.toast('✓ Factuur ' + (invoiceLogicId || invoiceId) + ' op betaald'), 1200);
+                return;
+            }
+            // Niet gelukt → naar retry-queue
+            console.warn('[Mollie→Robaws] Robaws weigerde:', res.error);
+            this._enqueueMollieRetry({ invoiceId, invoiceLogicId, amount, paymentId, referenceId, dedupKey });
+            setTimeout(() => this.toast(
+                '⚠️ Factuur niet op betaald (Robaws-fout) — wordt later opnieuw geprobeerd'
+            ), 1500);
+        } catch (e) {
+            console.warn('[Mollie→Robaws] gooi-fout:', e && e.message);
+            this._enqueueMollieRetry({ invoiceId, invoiceLogicId, amount, paymentId, referenceId, dedupKey });
+            setTimeout(() => this.toast(
+                '⚠️ Netwerkfout — factuur wordt later opnieuw op betaald gezet'
+            ), 1500);
+        }
+    },
+
+    /** Voeg een mislukte Robaws-update toe aan de retry-queue (localStorage). */
+    _enqueueMollieRetry(entry) {
+        try {
+            const raw = localStorage.getItem(this._MOLLIE_RETRY_KEY);
+            const list = raw ? JSON.parse(raw) : [];
+            // Voorkom duplicaten op paymentId
+            if (entry.paymentId && list.some(e => e.paymentId === entry.paymentId)) return;
+            entry.queuedAt = Date.now();
+            entry.attempts = 0;
+            list.push(entry);
+            localStorage.setItem(this._MOLLIE_RETRY_KEY, JSON.stringify(list));
+            console.log('[Mollie→Robaws] queued for retry — queue size:', list.length);
+        } catch (e) {
+            console.warn('[Mollie→Robaws] kon queue niet schrijven:', e);
+        }
+    },
+
+    /** Loop de retry-queue af en probeer elke pending entry opnieuw.
+     *  Wordt aangeroepen bij app-start + online-event + na elke succesvolle login. */
+    async processMollieRetryQueue() {
+        if (!navigator.onLine) return;
+        let list;
+        try {
+            const raw = localStorage.getItem(this._MOLLIE_RETRY_KEY);
+            list = raw ? JSON.parse(raw) : [];
+        } catch (_) { return; }
+        if (!list || list.length === 0) return;
+        console.log('[Mollie→Robaws] retry queue size:', list.length);
+        const remaining = [];
+        for (const entry of list) {
+            entry.attempts = (entry.attempts || 0) + 1;
+            // Geef op na 10 pogingen — admin moet dan handmatig in Robaws aanpassen
+            if (entry.attempts > 10) {
+                console.warn('[Mollie→Robaws] entry opgegeven na 10 pogingen:', entry.paymentId);
+                continue;
+            }
+            try {
+                const res = await RobawsAPI.registerInvoicePayment({
+                    invoiceId: entry.invoiceId,
+                    amount: entry.amount,
+                    paymentMethod: 'Bancontact',
+                    reference: entry.paymentId || entry.referenceId || '',
+                });
+                if (res.success) {
+                    console.log('[Mollie→Robaws] retry success voor', entry.paymentId);
+                    if (entry.dedupKey) {
+                        try { localStorage.setItem(entry.dedupKey, String(Date.now())); } catch(_) {}
+                    }
+                    // niet meer in queue
+                    continue;
+                }
+                remaining.push(entry);
+            } catch (e) {
+                console.warn('[Mollie→Robaws] retry gooi-fout:', e && e.message);
+                remaining.push(entry);
+            }
+        }
+        try { localStorage.setItem(this._MOLLIE_RETRY_KEY, JSON.stringify(remaining)); } catch(_) {}
+        if (remaining.length === 0 && list.length > 0) {
+            this.toast('✓ Alle wachtende Mollie-betalingen op betaald gezet');
+        }
+    },
+
     // Gebruiker bevestigt handmatig dat de betaling gelukt is.
     // BUG-fix (mogelijke fraude): voorheen werd de factuur direct als
     // betaald gemarkeerd zonder enige Viva-verificatie. Nu doen we eerst
@@ -6196,62 +7279,121 @@ const app = {
         this.showPaymentFailed('Handmatig geannuleerd');
     },
 
-    // Volledig-scherm succes-overlay na betaling
+    // v151: Card-stijl succes-overlay (consistent met v130 SUCCES/MISLUKT scan-cards).
+    // Witte card op blurred backdrop, geanimeerde groene check, bedrag + factuur,
+    // OK-knop om terug naar planning.
     showPaymentSuccess(amount, invoiceLogicId) {
-        // Verwijder eventueel bestaande overlay
+        if (typeof this._ensureScanOverlayStyles === 'function') this._ensureScanOverlayStyles();
         const existing = document.getElementById('paymentOverlay');
         if (existing) existing.remove();
 
         const overlay = document.createElement('div');
         overlay.id = 'paymentOverlay';
-        overlay.style.cssText = 'position:fixed;inset:0;background:#2e7d32;color:#fff;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center';
+        overlay.className = 'qe-scan-backdrop';
+
+        const amountHtml = amount > 0
+            ? `<div style="font-size:30px;font-weight:700;color:#2e7d32;margin:6px 0 2px">€ ${Number(amount).toFixed(2)}</div>`
+            : '';
+        const invHtml = invoiceLogicId
+            ? `<div style="font-size:13px;color:#90a4ae;margin-bottom:4px">Factuur ${this._escapeHtml(invoiceLogicId)}</div>`
+            : '';
+
         overlay.innerHTML = `
-            <div style="font-size:96px;margin-bottom:16px">✅</div>
-            <div style="font-size:32px;font-weight:700;margin-bottom:8px">Betaling gelukt!</div>
-            ${amount > 0 ? `<div style="font-size:22px;opacity:0.9;margin-bottom:4px">€ ${Number(amount).toFixed(2)}</div>` : ''}
-            ${invoiceLogicId ? `<div style="font-size:14px;opacity:0.8;margin-bottom:32px">Factuur ${this.escapeHtml(invoiceLogicId)}</div>` : '<div style="margin-bottom:32px"></div>'}
-            <button id="paymentOverlayOk" style="background:#fff;color:#2e7d32;border:none;border-radius:12px;padding:16px 48px;font-size:18px;font-weight:600;cursor:pointer">OK — Terug naar planning</button>
-        `;
+            <div class="qe-scan-card">
+                <div class="qe-scan-icon-wrap success">
+                    <svg viewBox="0 0 52 52" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+                        <circle class="qe-circle-path" cx="26" cy="26" r="22" />
+                        <path class="qe-check-path" d="M14 27 l8 8 l16 -16" />
+                    </svg>
+                </div>
+                <h3 class="qe-scan-title success">Betaling gelukt</h3>
+                ${amountHtml}
+                ${invHtml}
+                <button id="paymentOverlayOk"
+                    style="margin-top:18px;width:100%;padding:13px;background:#2e7d32;color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer">
+                    Terug naar planning
+                </button>
+            </div>`;
         document.body.appendChild(overlay);
+        // eslint-disable-next-line no-unused-expressions
+        overlay.offsetWidth;
+        overlay.classList.add('qe-show');
+
+        try { if (navigator.vibrate) navigator.vibrate(120); } catch(_) {}
+
         document.getElementById('paymentOverlayOk').onclick = () => {
-            overlay.remove();
-            this.navigate('screenPlanning', false);
-            this.screenHistory = [];
-            this.loadPlanning();
+            overlay.classList.remove('qe-show');
+            overlay.classList.add('qe-hiding');
+            setTimeout(() => {
+                try { overlay.remove(); } catch(_) {}
+                this.navigate('screenPlanning', false);
+                this.screenHistory = [];
+                this.loadPlanning();
+            }, 200);
         };
     },
 
-    // Volledig-scherm fout-overlay met retry-optie
+    // v151: Card-stijl fout-overlay — zelfde design-taal als success.
     showPaymentFailed(reason) {
+        if (typeof this._ensureScanOverlayStyles === 'function') this._ensureScanOverlayStyles();
         const existing = document.getElementById('paymentOverlay');
         if (existing) existing.remove();
 
         const overlay = document.createElement('div');
         overlay.id = 'paymentOverlay';
-        overlay.style.cssText = 'position:fixed;inset:0;background:#c62828;color:#fff;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center';
+        overlay.className = 'qe-scan-backdrop';
+
         overlay.innerHTML = `
-            <div style="font-size:96px;margin-bottom:16px">⚠️</div>
-            <div style="font-size:28px;font-weight:700;margin-bottom:8px">Betaling niet gelukt</div>
-            <div style="font-size:15px;opacity:0.9;max-width:320px;margin-bottom:8px">${this.escapeHtml(reason || '')}</div>
-            <div style="font-size:13px;opacity:0.85;max-width:340px;margin-bottom:32px">De factuur is bewaard. Je kan de betaling opnieuw proberen vanuit de dagplanning.</div>
-            <div style="display:flex;gap:12px;flex-direction:column;width:100%;max-width:300px">
-                <button id="paymentRetryBtn" style="background:#fff;color:#c62828;border:none;border-radius:12px;padding:14px;font-size:16px;font-weight:600;cursor:pointer">🔄 Opnieuw proberen</button>
-                <button id="paymentLaterBtn" style="background:transparent;color:#fff;border:2px solid #fff;border-radius:12px;padding:14px;font-size:15px;font-weight:500;cursor:pointer">Later betalen</button>
-            </div>
-        `;
+            <div class="qe-scan-card">
+                <div class="qe-scan-icon-wrap error">
+                    <svg viewBox="0 0 52 52" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+                        <circle class="qe-circle-path" cx="26" cy="26" r="22" />
+                        <path class="qe-cross-path" d="M18 18 l16 16" />
+                        <path class="qe-cross-path" d="M34 18 l-16 16" />
+                    </svg>
+                </div>
+                <h3 class="qe-scan-title error">Betaling niet gelukt</h3>
+                <p class="qe-scan-msg">${this._escapeHtml(reason || 'Onbekende fout')}</p>
+                <div style="font-size:12px;color:#90a4ae;margin-top:8px">
+                    De factuur is bewaard. Je kan de betaling opnieuw proberen vanuit Uitgevoerd.
+                </div>
+                <div style="display:flex;flex-direction:column;gap:8px;margin-top:18px">
+                    <button id="paymentRetryBtn"
+                        style="width:100%;padding:13px;background:#c62828;color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer">
+                        🔄 Opnieuw proberen
+                    </button>
+                    <button id="paymentLaterBtn"
+                        style="width:100%;padding:13px;background:#fff;color:#c62828;border:2px solid #ffcdd2;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer">
+                        Later betalen
+                    </button>
+                </div>
+            </div>`;
         document.body.appendChild(overlay);
+        // eslint-disable-next-line no-unused-expressions
+        overlay.offsetWidth;
+        overlay.classList.add('qe-show');
+
+        try { if (navigator.vibrate) navigator.vibrate([80, 60, 80]); } catch(_) {}
+
+        const closeWithAnim = (cb) => {
+            overlay.classList.remove('qe-show');
+            overlay.classList.add('qe-hiding');
+            setTimeout(() => { try { overlay.remove(); } catch(_) {} if (cb) cb(); }, 200);
+        };
         document.getElementById('paymentRetryBtn').onclick = () => {
-            overlay.remove();
-            const pp = this._pendingPayment;
-            if (pp && pp.invoiceId) {
-                this.startTerminalPayment(pp.invoiceId, pp.amount, pp.ogm, pp.invoiceLogicId);
-            }
+            closeWithAnim(() => {
+                const pp = this._pendingPayment;
+                if (pp && pp.invoiceId) {
+                    this.startTerminalPayment(pp.invoiceId, pp.amount, pp.ogm, pp.invoiceLogicId);
+                }
+            });
         };
         document.getElementById('paymentLaterBtn').onclick = () => {
-            overlay.remove();
-            this.navigate('screenPlanning', false);
-            this.screenHistory = [];
-            this.loadPlanning();
+            closeWithAnim(() => {
+                this.navigate('screenPlanning', false);
+                this.screenHistory = [];
+                this.loadPlanning();
+            });
         };
     },
 
@@ -6450,6 +7592,8 @@ const app = {
     // INSTALLATIE HISTORIEK
     // ========================================
     async openInstallationHistory(installationId) {
+        // v176: bewaar ID zodat refreshCurrentScreen() deze opnieuw kan laden.
+        this._lastInstHistoryId = installationId;
         // Zoek installatie-info uit geladen data
         const inst = (this._loadedInstallations || []).find(i => String(i.id) === String(installationId));
         const instName = inst ? (inst.name || inst.brand || 'Installatie') : 'Installatie';
@@ -6475,68 +7619,176 @@ const app = {
         this.navigate('screenInstHistory');
 
         try {
-            const res = await fetch(`api/installation-history.php?installationId=${installationId}`);
-            const data = await res.json();
-            const orders = data.items || [];
-
-            if (orders.length === 0) {
+            // v168: directe Robaws API ipv PHP-backend.
+            // 1) Resolve klant-ID via installatie (kan al gecached zijn)
+            let assignedClientId = inst && inst.assignedClientId;
+            if (!assignedClientId) {
+                const instRes = await RobawsAPI.get(`installations/${installationId}`);
+                if (instRes.code === 200 && instRes.data) {
+                    assignedClientId = instRes.data.assignedClientId;
+                }
+            }
+            if (!assignedClientId) {
                 list.innerHTML = `
                     <div class="empty-state">
-                        <div class="empty-icon">📋</div>
-                        <h3>Geen historiek</h3>
-                        <p>Geen orders gevonden voor deze installatie</p>
+                        <div class="empty-icon">⚠️</div>
+                        <h3>Klant niet gevonden</h3>
+                        <p>Deze installatie heeft geen gekoppelde klant.</p>
                     </div>`;
                 return;
             }
 
+            // 2) Paginate work-orders voor deze klant (sort=date:desc, include=timeEntries
+            //    om N+1 calls te vermijden — zie ROBAWS_API_HANDLEIDING §2.16).
+            //    Filter client-side op installationIds.
+            const installationIdStr = String(installationId);
+            const matchingOrders = [];
+            const seenIds = new Set();   // dedup voor §2.17 paginated-werkbon-sort issue
+            let offset = 0;
+            const MAX_PAGES = 30;        // veiligheid voor klanten met heel veel werkbons
+            for (let page = 0; page < MAX_PAGES; page++) {
+                const r = await RobawsAPI.get(
+                    `work-orders?clientId=${assignedClientId}&limit=100&offset=${offset}&sort=date:desc&include=timeEntries`
+                );
+                if (r.code !== 200 || !r.data || !r.data.items) break;
+                const items = r.data.items;
+                if (items.length === 0) break;
+                for (const wo of items) {
+                    if (seenIds.has(wo.id)) continue;
+                    seenIds.add(wo.id);
+                    const ids = (wo.installationIds || []).map(String);
+                    if (ids.includes(installationIdStr)) {
+                        matchingOrders.push(wo);
+                    }
+                }
+                if (items.length < 100) break;
+                offset += 100;
+            }
+
+            if (matchingOrders.length === 0) {
+                list.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-icon">📋</div>
+                        <h3>Geen historiek</h3>
+                        <p>Geen werkbons gevonden voor deze installatie.</p>
+                    </div>`;
+                return;
+            }
+
+            // 3) Sorteer nogmaals (Robaws' date:desc is niet altijd consistent over pagina's, §2.17)
+            matchingOrders.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+            // 4) Render
             const days = ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'];
             const months = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
 
-            list.innerHTML = orders.map(order => {
-                const d = order.date ? new Date(order.date + 'T12:00:00') : null;
+            list.innerHTML = matchingOrders.map(wo => {
+                const d = wo.date ? new Date(wo.date + 'T12:00:00') : null;
                 const dateLabel = d ? `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}` : 'Onbekend';
-                const statusClass = order.status === 'COMPLETED' ? 'type-onderhoud' : (order.status === 'IN_PROGRESS' ? 'type-plaatsing' : 'type-diversen');
-                const statusLabel = order.status === 'COMPLETED' ? 'Afgerond' : (order.status === 'IN_PROGRESS' ? 'In uitvoering' : (order.status || 'Onbekend'));
+
+                // Status-label naar Robaws's eigen vocabularium
+                // Zie ROBAWS_API_HANDLEIDING §6.4 voor mogelijke waarden
+                const status = wo.status || 'Onbekend';
+                let statusClass = 'type-diversen';
+                if (/betaald/i.test(status)) statusClass = 'type-onderhoud';
+                else if (/peppol|verzonden|gecontroleerd/i.test(status)) statusClass = 'type-plaatsing';
+
+                // Time-entries via ?include (geen N+1)
+                const timeCount = (wo.timeEntries || []).length;
+                const summary = wo.title || (wo.extraFields && wo.extraFields.Reden && wo.extraFields.Reden.stringValue) || '';
 
                 return `
-                    <div class="card card-clickable" onclick="app.openOrderDetail(${order.id})" style="margin:0 16px 8px;cursor:pointer">
+                    <div class="card card-clickable" onclick="app.openOrderDetail('${wo.id}')" style="margin:0 16px 8px;cursor:pointer">
                         <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:4px">
                             <div>
-                                <div style="font-size:15px;font-weight:500">${this.escapeHtml(order.logicId || `#${order.id}`)}</div>
+                                <div style="font-size:15px;font-weight:500">${this.escapeHtml(wo.logicId || `#${wo.id}`)}</div>
                                 <div style="font-size:12px;color:var(--qe-grey);margin-top:2px">📅 ${dateLabel}</div>
                             </div>
-                            <span class="wo-type ${statusClass}" style="font-size:11px">${statusLabel}</span>
+                            <span class="wo-type ${statusClass}" style="font-size:11px">${this.escapeHtml(status)}</span>
                         </div>
-                        ${order.summary ? `<div style="font-size:13px;color:var(--qe-grey);margin-top:4px">${this.escapeHtml(order.summary)}</div>` : ''}
-                        ${order.hourEntries > 0 || order.materialEntries > 0 ? `
-                        <div style="font-size:12px;color:var(--qe-grey);margin-top:6px;display:flex;gap:12px">
-                            ${order.hourEntries > 0 ? `<span>🕐 ${order.hourEntries} uren</span>` : ''}
-                            ${order.materialEntries > 0 ? `<span>🔧 ${order.materialEntries} materialen</span>` : ''}
+                        ${summary ? `<div style="font-size:13px;color:var(--qe-grey);margin-top:4px">${this.escapeHtml(summary)}</div>` : ''}
+                        ${timeCount > 0 ? `
+                        <div style="font-size:12px;color:var(--qe-grey);margin-top:6px">
+                            <span>🕐 ${timeCount} ${timeCount === 1 ? 'tijdsregistratie' : 'tijdsregistraties'}</span>
                         </div>` : ''}
                     </div>`;
             }).join('');
 
         } catch (err) {
-            list.innerHTML = '<p class="text-grey text-sm text-center" style="padding:16px">Kon historiek niet laden</p>';
+            console.warn('[InstHistory] fout:', err);
+            list.innerHTML = `<p class="text-grey text-sm text-center" style="padding:16px">Kon historiek niet laden: ${this.escapeHtml(err.message || '')}</p>`;
         }
     },
 
     async openOrderDetail(workOrderId) {
         const content = document.getElementById('orderDetailContent');
         content.innerHTML = '<div class="spinner"></div>';
+        // v176: bewaar ID zodat refreshCurrentScreen() deze opnieuw kan laden.
+        this._lastOrderDetailId = workOrderId;
 
         this.navigate('screenOrderDetail');
 
         try {
-            const res = await fetch(`api/installation-history.php?action=detail&workOrderId=${workOrderId}`);
-            const data = await res.json();
+            // v168: directe Robaws calls ipv PHP backend.
+            // Parallel 2 calls: work-order (met timeEntries + client inline) + line-items.
+            // v173: include=client toegevoegd zodat de fallback clients/{id} call
+            // (zie regel ~7522) vrijwel altijd kan worden overgeslagen.
+            // Robaws spec bevestigt: "client only present if requested via include".
+            const [woRes, lineRes] = await Promise.all([
+                RobawsAPI.get(`work-orders/${workOrderId}?include=timeEntries,client`),
+                RobawsAPI.get(`work-orders/${workOrderId}/line-items?limit=100`),
+            ]);
 
-            if (data.error) {
-                content.innerHTML = `<p class="text-grey text-sm text-center" style="padding:16px">${this.escapeHtml(data.error)}</p>`;
+            if (woRes.code !== 200 || !woRes.data) {
+                content.innerHTML = `<p class="text-grey text-sm text-center" style="padding:16px">Werkbon niet gevonden</p>`;
                 return;
             }
 
-            const wo = data;
+            const woRaw = woRes.data;
+
+            // Strip "- id" suffix (zie ROBAWS_API_HANDLEIDING §3.3).
+            // Robaws levert client.name als "Naam - 12345" terug — overal stripppen.
+            const stripClientSuffix = (raw, id) => {
+                if (!raw || !id) return raw || '';
+                const suffix = ` - ${id}`;
+                return raw.endsWith(suffix) ? raw.slice(0, -suffix.length) : raw;
+            };
+
+            // v173: client komt nu inline mee via ?include=client (zie call hierboven),
+            // dus de fallback clients/{id} call is in ~99% gevallen niet meer nodig.
+            let clientName = '';
+            if (woRaw.client && woRaw.client.name) {
+                clientName = stripClientSuffix(woRaw.client.name, woRaw.client.id);
+            } else if (woRaw.clientId) {
+                // Fallback: alleen als include=client onverwacht niets opleverde.
+                try {
+                    const cRes = await RobawsAPI.get(`clients/${woRaw.clientId}`);
+                    if (cRes.code === 200 && cRes.data) {
+                        clientName = stripClientSuffix(cRes.data.name, cRes.data.id);
+                    }
+                } catch(_) {}
+            }
+
+            // Mappen naar dezelfde shape als de oude PHP-response
+            const wo = {
+                id:         woRaw.id,
+                logicId:    woRaw.logicId,
+                date:       woRaw.date,
+                status:     woRaw.status,
+                clientName: clientName,
+                summary:    woRaw.title || '',
+                notes:      woRaw.remark || '',
+                hours:      (woRaw.timeEntries || []).map(te => ({
+                    hourTypeName: (te.hourType && te.hourType.name) || te.hourTypeId || 'Uren',
+                    employeeName: (te.employee && te.employee.name) || null,
+                    amount:       te.hours || te.billableHours || 0,
+                })),
+                materials:  ((lineRes.code === 200 && lineRes.data && lineRes.data.items) || []).map(li => ({
+                    articleName: (li.article && li.article.name) || li.description || 'Artikel',
+                    amount:      li.quantity || 0,
+                })),
+            };
+
             const d = wo.date ? new Date(wo.date + 'T12:00:00') : null;
             const days = ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'];
             const months = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
@@ -6624,7 +7876,13 @@ const app = {
     // ========================================
     // DAGOVERZICHT
     // ========================================
-    async loadDagoverzicht() {
+    // v179: monthOffset 0 = huidige maand, -1 = vorige maand, enz. Zonder
+    // argument wordt de laatst bekeken maand behouden (refresh-knop +
+    // pull-to-refresh verversen dus de bekeken maand i.p.v. terug te springen).
+    async loadDagoverzicht(monthOffset) {
+        if (typeof monthOffset === 'number') this._dagoverzichtMonthOffset = monthOffset;
+        const offset = this._dagoverzichtMonthOffset || 0;
+
         const container = document.getElementById('dagoverzichtContent');
         container.innerHTML = '<div class="spinner"></div>';
 
@@ -6638,12 +7896,15 @@ const app = {
             // v58: Tijdsregistratie-werkbonnen i.p.v. time-registrations
             const today = new Date();
             today.setHours(12, 0, 0, 0);
-            const yyyy = today.getFullYear();
-            const mm = String(today.getMonth() + 1).padStart(2, '0');
+            // v179: doelmaand = huidige maand + offset (offset <= 0).
+            const target = new Date(today.getFullYear(), today.getMonth() + offset, 1, 12, 0, 0);
+            const isCurrentMonth = (offset === 0);
+            const yyyy = target.getFullYear();
+            const mm = String(target.getMonth() + 1).padStart(2, '0');
             const monthPrefix = `${yyyy}-${mm}`;
             const monthNames = ['januari','februari','maart','april','mei','juni',
                 'juli','augustus','september','oktober','november','december'];
-            const monthLabel = `${monthNames[today.getMonth()].toUpperCase()} ${yyyy}`;
+            const monthLabel = `${monthNames[target.getMonth()].toUpperCase()} ${yyyy}`;
 
             const userId = user.robawsUserId || user.userId;
             const workOrders = await RobawsAPI.getMyTimeRegistrationWorkOrders(userId, monthPrefix);
@@ -6674,17 +7935,17 @@ const app = {
             // v68: gepresteerde uren = (entry_eind − entry_start) − pauze.
             // entry_start = max(Ingeklokt, startuur werknemer) afgerond op 5min als te laat.
             // entry_eind = Uitgeklokt afgerond op 5min. Pauze = werknemer-veld.
-            // Geen per-werkbon time-entries fetch (zou rate-limit triggeren).
             // v76: fetch time-entries per werkbon (max 31 dagen × ~1 werkbon = haalbaar
             // binnen rate-limit). Resultaat cached in teByWoId. Toont L&L cycli + uren.
+            // v173: parallelliseren met Promise.all i.p.v. sequentiële await-loop.
+            // Voorheen: 30 werkbonnen × ~250ms = 7-8 sec blokkerend. Nu: ~500ms parallel.
+            // v178: time-entries komen nu INLINE mee via ?include=timeEntries in
+            // getMyTimeRegistrationWorkOrders (zie HANDLEIDING 2.16). Geen aparte
+            // GET /work-orders/{id}/time-entries per werkbon meer (was N+1 -> bij
+            // ~30 werkbonnen 30 extra calls). teByWoId behoudt dezelfde shape.
             const teByWoId = {};
             for (const wo of workOrders) {
-                try {
-                    const teRes = await RobawsAPI.get(`work-orders/${wo.id}/time-entries?limit=100`);
-                    if (teRes.code === 200 && teRes.data && teRes.data.items) {
-                        teByWoId[wo.id] = teRes.data.items;
-                    }
-                } catch(_) { /* skip */ }
+                teByWoId[wo.id] = wo.timeEntries || [];
             }
             const m = (s) => { const x = String(s||'').match(/^(\d{1,2}):(\d{1,2})/); return x ? (+x[1])*60 + (+x[2]) : 0; };
             // v74: kwartier-afronding (in=up, uit=down)
@@ -6702,25 +7963,15 @@ const app = {
                 if (distUpper > 0 && distUpper <= TOLERANCE) return mins + distUpper;
                 return Math.floor(mins / 15) * 15;
             };
-            // Haal pauze + startuur 1x van ingelogde user
-            let userStartuurMin = 7 * 60;  // 07:00 default
+            // v178: employee startuur/pauze-fetch VERWIJDERD (scheelt 1 API-call
+            // per keer dat de Uren-tab opent). Deze waarden voedden enkel
+            // computeHours() -- de legacy v68 uren-berekening die sinds v83 niet
+            // meer wordt aangeroepen (de totalen komen nu rechtstreeks uit de
+            // time-entries hieronder). De twee defaults blijven staan zodat de
+            // (dode) computeHours nog geldig refereert; mag in een latere
+            // cosmetische pass volledig weg.
+            let userStartuurMin = 7 * 60;  // default (enkel nog door dode computeHours)
             let userPauze = 60;
-            try {
-                const empRes = await RobawsAPI.get(`employees/${user.robawsEmployeeId}`);
-                if (empRes.code === 200 && empRes.data && empRes.data.extraFields) {
-                    for (const [name, fdata] of Object.entries(empRes.data.extraFields)) {
-                        const low = name.toLowerCase();
-                        if (low.includes('startuur')) {
-                            const v = RobawsAPI._extractFieldVal(fdata);
-                            if (v && /^\d{1,2}:\d{2}/.test(v)) userStartuurMin = m(v);
-                        } else if (low.includes('pauze')) {
-                            const v = RobawsAPI._extractFieldVal(fdata);
-                            const num = String(v).match(/(\d+)/);
-                            if (num) userPauze = parseInt(num[1], 10) || 60;
-                        }
-                    }
-                }
-            } catch(_) {}
 
             const computeHours = (wo) => {
                 const ef = wo.extraFields || {};
@@ -6778,6 +8029,17 @@ const app = {
             //   - Overuren = som hourTypeId=2 entries (incl. negatieve compensatie-entries)
             const HT_WERKUREN = String(RobawsAPI.HOUR_TYPE_IDS.werkuren);
             const HT_OVERUREN = String(RobawsAPI.HOUR_TYPE_IDS.overuren);
+            // v180: een entry telt als OVERUREN als z'n hourType-NAAM "overuren"
+            // bevat (dekt ook "Overuren zaterdag/zondag"). Voorheen werd enkel
+            // id===2 herkend, waardoor weekend-overuren in de werkuren-bak vielen
+            // (werkuren te hoog, overuren te laag). Fallback op id===2 als de naam
+            // onbekend is (bv. hour-types call faalde) -> geen regressie.
+            const htNameMap = await RobawsAPI.getHourTypeNameMap();
+            const isOverurenHt = (ht) => {
+                const n = (htNameMap[String(ht)] || '').toLowerCase();
+                if (n) return n.includes('overuren');
+                return String(ht) === HT_OVERUREN;
+            };
             let totalHours = 0;
             let werkurenTotal = 0;
             let overurenTotal = 0;
@@ -6787,8 +8049,8 @@ const app = {
                     const h = parseFloat(te.hours || te.billableHours || 0) || 0;
                     totalHours += h;
                     const ht = String(te.hourTypeId || (te.hourType && te.hourType.id) || '');
-                    if (ht === HT_OVERUREN) overurenTotal += h;
-                    else werkurenTotal += h;  // default = werkuren (incl. legacy entries zonder hourTypeId)
+                    if (isOverurenHt(ht)) overurenTotal += h;
+                    else werkurenTotal += h;
                 }
             }
             // v87: 2 decimalen voor uren-stats (zoals Robaws ze toont)
@@ -6797,39 +8059,52 @@ const app = {
 
             let html = '';
 
+            // v179: maand-navigatie. "Volgende" is uitgeschakeld op de huidige
+            // maand (geen toekomst). Knoppen herladen met de nieuwe offset.
+            html += `
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px">
+                    <button class="btn btn-outline btn-sm" onclick="app.loadDagoverzicht(${offset - 1})" style="font-size:13px;padding:6px 12px">◀ Vorige maand</button>
+                    <span style="font-size:13px;font-weight:600;color:var(--qe-darkblue);flex:1;text-align:center">${monthLabel}</span>
+                    <button class="btn btn-outline btn-sm" onclick="app.loadDagoverzicht(${offset + 1})" ${isCurrentMonth ? 'disabled' : ''} style="font-size:13px;padding:6px 12px;${isCurrentMonth ? 'opacity:0.4;pointer-events:none' : ''}">Volgende ▶</button>
+                </div>`;
+
             // Samenvatting kaart — v83: Totaal, Werkuren, Overuren, Werkdagen, Te laat
             html += `
-                <div class="card" style="margin-bottom:16px;padding:20px;background:linear-gradient(135deg, var(--qe-darkblue), var(--qe-purple));color:#fff;border-radius:16px">
+                <div class="card" style="margin-bottom:16px;padding:20px;background:var(--qe-darkblue);color:#fff;border-radius:16px;border:none">
                     <div style="font-size:13px;opacity:0.8;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">${monthLabel}</div>
                     <div style="display:grid;grid-template-columns:repeat(5, 1fr);gap:8px">
                         <div>
-                            <div style="font-size:20px;font-weight:700">${fmt2(totalHours)}</div>
+                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${totalHours}" data-dec="2">${fmt2(totalHours)}</span></div>
                             <div style="font-size:10px;opacity:0.8">Totaal</div>
                         </div>
                         <div>
-                            <div style="font-size:20px;font-weight:700">${fmt2(werkurenTotal)}</div>
+                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${werkurenTotal}" data-dec="2">${fmt2(werkurenTotal)}</span></div>
                             <div style="font-size:10px;opacity:0.8">Werkuren</div>
                         </div>
                         <div>
-                            <div style="font-size:20px;font-weight:700">${fmt2(overurenTotal)}</div>
+                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${overurenTotal}" data-dec="2">${fmt2(overurenTotal)}</span></div>
                             <div style="font-size:10px;opacity:0.8">Overuren</div>
                         </div>
                         <div>
-                            <div style="font-size:20px;font-weight:700">${totalDays}</div>
+                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${totalDays}" data-dec="0">${totalDays}</span></div>
                             <div style="font-size:10px;opacity:0.8">Werkdagen</div>
                         </div>
                         <div>
-                            <div style="font-size:20px;font-weight:700">${lateCount}</div>
+                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${lateCount}" data-dec="0">${lateCount}</span></div>
                             <div style="font-size:10px;opacity:0.8">Te laat</div>
                         </div>
                     </div>
                 </div>`;
 
-            // Per dag: alle dagen van huidige maand t/m vandaag
+            // Per dag: huidige maand t/m vandaag; een vorige maand = volledige
+            // maand (laatste dag t/m de 1e). v179.
             const days = ['Zo','Ma','Di','Wo','Do','Vr','Za'];
             const allDates = [];
-            for (let day = today.getDate(); day >= 1; day--) {
-                const d = new Date(yyyy, today.getMonth(), day, 12, 0, 0);
+            const lastDay = isCurrentMonth
+                ? today.getDate()
+                : new Date(yyyy, target.getMonth() + 1, 0).getDate();
+            for (let day = lastDay; day >= 1; day--) {
+                const d = new Date(yyyy, target.getMonth(), day, 12, 0, 0);
                 const ddStr = String(d.getDate()).padStart(2, '0');
                 allDates.push(`${yyyy}-${mm}-${ddStr}`);
             }
@@ -6864,12 +8139,10 @@ const app = {
 
                     for (const wo of wos) {
                         const tijd = getField(wo, 'Tijd') || 'Op tijd';
-                        const tijdColor = (tijd === 'Te laat') ? '#e65100'
-                            : (tijd === 'Ziek') ? '#b71c1c'
-                            : '#2e7d32';
-                        const tijdIcon = (tijd === 'Te laat') ? '⚠️'
-                            : (tijd === 'Ziek') ? '🤒'
-                            : '';
+                        const tijdStyle = this._getTijdStyle(tijd);
+                        const tijdColor = tijdStyle.color;
+                        const tijdIcon  = tijdStyle.icon;
+                        const isAbsence = this._isAbsenceTijd(tijd);
                         const teList = (teByWoId[wo.id] || []).slice().sort((a, b) => {
                             // Sort: entries met startTime eerst (chronologisch), dan no-time entries
                             const aMin = a.startTime ? (a.startTime.hour * 60 + a.startTime.minute) : 9999;
@@ -6882,7 +8155,7 @@ const app = {
                             const ingeklokt = getField(wo, 'Ingeklokt') || '?';
                             html += `<div class="card" style="padding:12px 14px;margin-bottom:6px;background:#f1f8e9;cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
                                 <div style="display:flex;align-items:center;gap:10px">
-                                    <span style="font-size:18px">⏱️</span>
+                                    <span style="font-size:18px;color:${tijdColor};display:inline-flex">${this.icon('clock', { size: 18 })}</span>
                                     <div style="flex:1">
                                         <div style="font-size:14px;font-weight:500">${ingeklokt} → ...</div>
                                         <div style="font-size:11px;color:${tijdColor}">${tijdIcon} ${tijd} — nog ingeklokt</div>
@@ -6896,8 +8169,9 @@ const app = {
                             const aId = String(te.articleId || (te.article && te.article.id) || '');
                             const ht = String(te.hourTypeId || (te.hourType && te.hourType.id) || '');
                             const hours = parseFloat(te.hours || te.billableHours || 0) || 0;
+                            const htName = htNameMap[ht] || '';   // v180: echte Robaws hourType-naam
                             const isLL = (aId === llArtId);
-                            const isOveruren = (ht === HT_OVERUREN);
+                            const isOveruren = isOverurenHt(ht);
                             const isCompensatie = (hours < 0);
                             const sStr = te.startTime
                                 ? String(te.startTime.hour).padStart(2, '0') + ':' + String(te.startTime.minute).padStart(2, '0')
@@ -6908,21 +8182,28 @@ const app = {
                             const timeBlockTxt = (sStr && eStr) ? (sStr + ' → ' + eStr) : null;
 
                             // v87: Styling per type — compensatie duidelijker als "overuren aftrek"
+                            // v166: bij afwezigheidstype (Ziek / Verlof / Feestdag / Inhaal / Sociaal verlof)
+                            // wordt de werkuren-styling overruled door de afwezigheids-kleur
                             let icon, bg, fg, label;
-                            if (isCompensatie) {
+                            if (isAbsence) {
+                                icon = tijdStyle.icon || '📅';
+                                bg = tijdStyle.bg;
+                                fg = tijdStyle.color;
+                                label = tijdStyle.label;
+                            } else if (isCompensatie) {
                                 // Negatieve overuren — wordt afgetrokken van overuren-bank
                                 // omdat L&L gebruikt is om de 8u-baseline te vullen.
-                                icon = '➖'; bg = '#ffebee'; fg = '#c62828';
+                                icon = this.icon('minus', { size: 18 }); bg = '#ffebee'; fg = '#c62828';
                                 label = 'Overuren aftrek';
                             } else if (isLL) {
-                                icon = '📦'; bg = '#fff3e0'; fg = '#e65100';
+                                icon = this.icon('package', { size: 18 }); bg = '#fff3e0'; fg = '#e65100';
                                 label = 'Laden & lossen';
                             } else if (isOveruren) {
-                                icon = '⏰'; bg = '#fff8e1'; fg = '#ef6c00';
-                                label = 'Overuren';
+                                icon = this.icon('clock', { size: 18 }); bg = '#fff8e1'; fg = '#ef6c00';
+                                label = htName || 'Overuren';   // v180: toon echte tag (bv "Overuren zaterdag")
                             } else {
-                                icon = '✅'; bg = '#f1f8e9'; fg = '#2e7d32';
-                                label = 'Werkuren';
+                                icon = this.icon('check-circle', { size: 18 }); bg = '#f1f8e9'; fg = '#2e7d32';
+                                label = htName || 'Werkuren';
                             }
                             const absHrs = Math.abs(hours).toFixed(2);
                             const headerLine = timeBlockTxt
@@ -6936,7 +8217,7 @@ const app = {
                             html += `<div class="card" style="padding:10px 14px;margin-bottom:6px;background:${bg};cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
                                 <div style="display:flex;align-items:center;justify-content:space-between">
                                     <div style="display:flex;align-items:center;gap:10px;flex:1">
-                                        <span style="font-size:18px">${icon}</span>
+                                        <span style="font-size:18px;color:${fg};display:inline-flex;align-items:center">${icon}</span>
                                         <div>
                                             <div style="font-size:14px;font-weight:500">${headerLine}</div>
                                             <div style="font-size:11px;color:${fg}">${subLine}</div>
@@ -6958,6 +8239,7 @@ const app = {
             }
 
             container.innerHTML = html;
+            this._animateCountUps(container);
         } catch (e) {
             container.innerHTML = `<p class="text-grey text-sm text-center">Fout bij laden: ${e.message}</p>`;
         }
@@ -6988,12 +8270,10 @@ const app = {
                 ? new Date(dateOnly + 'T12:00:00').toLocaleDateString('nl-BE', { weekday: 'long', day: 'numeric', month: 'long' })
                 : '';
 
-            let typeIcon;
-            switch (tijd) {
-                case 'Te laat': typeIcon = '⚠️'; break;
-                case 'Ziek':    typeIcon = '🤒'; break;
-                default:        typeIcon = '✅'; break;
-            }
+            // v166: helper gebruikt ipv hardcoded switch — dekt ook Verlof,
+            // Betaalde feestdag, Inhaal rustdag, Sociaal verlof.
+            const _tijdStyle = this._getTijdStyle(tijd);
+            const typeIcon = _tijdStyle.icon || '✅';
 
             // Haal time-entries op voor totaal-uren weergave
             let totalHours = 0;
@@ -7178,7 +8458,8 @@ const app = {
                         localStorage.setItem('qe_last_payment_context', JSON.stringify(ctx));
                     } catch(_) {}
 
-                    const methodIcon = method === 'Viva wallet' ? '💳'
+                    const methodIcon = method === 'Mollie Tap' ? '💳'
+                        : method === 'Viva wallet' ? '💳'
                         : method === 'Cash' ? '💵'
                         : method.startsWith('Overschrijving') ? '🏦'
                         : method === 'Via factuur' ? '📋'
@@ -7201,7 +8482,8 @@ const app = {
                         const cInv = (ctx.invoiceResult && ctx.invoiceResult.invoice) || {};
                         const amount = parseFloat(cInv.totalInclVat || 0).toFixed(2);
                         const method = ctx.paymentMethod || '?';
-                        const methodIcon = method === 'Viva wallet' ? '💳'
+                        const methodIcon = method === 'Mollie Tap' ? '💳'
+                            : method === 'Viva wallet' ? '💳'
                             : method === 'Cash' ? '💵'
                             : method.startsWith('Overschrijving') ? '🏦'
                             : '📋';
@@ -8245,6 +9527,252 @@ const app = {
         });
     },
 
+    // =====================================================================
+    // v137: NIEUWE WERKBON (ad-hoc, voor techniekers wanneer klant belt)
+    // =====================================================================
+
+    /** State voor de "+ Nieuwe werkbon" modal. */
+    _newWo: null,
+
+    openNewWorkOrderModal() {
+        if (!this.currentUser || this._activeRole() === 'monteur') {
+            this.toast('Niet beschikbaar voor monteurs');
+            return;
+        }
+        this._newWo = {
+            selectedClient: null,
+            useNewClient: false,
+            searchTimer: null,
+        };
+        const m = document.getElementById('newWoModal');
+        if (!m) return;
+        document.getElementById('newWoClientStep').style.display = '';
+        document.getElementById('newWoSelectedStep').style.display = 'none';
+        document.getElementById('newWoNewClientFields').style.display = 'none';
+        document.getElementById('newWoClientSearch').value = '';
+        document.getElementById('newWoClientResults').style.display = 'none';
+        document.getElementById('newWoClientResults').innerHTML = '';
+        document.getElementById('newWoNewClientPrompt').style.display = 'none';
+        document.getElementById('newWoNewClientName').value = '';
+        document.getElementById('newWoNewClientStreet').value = '';
+        document.getElementById('newWoNewClientZip').value = '';
+        document.getElementById('newWoNewClientCity').value = '';
+        document.getElementById('newWoNewClientTel').value = '';
+        document.getElementById('newWoReason').value = '';
+        document.getElementById('newWoStatus').textContent = '';
+        document.getElementById('newWoStatus').className = 'qe-newwo-status';
+        document.getElementById('newWoSubmitBtn').disabled = true;
+
+        const sIn = document.getElementById('newWoClientSearch');
+        sIn.oninput = () => this._newWoOnSearchInput();
+        document.getElementById('newWoReason').oninput = () => this._newWoUpdateSubmitState();
+        ['newWoNewClientName', 'newWoNewClientStreet', 'newWoNewClientZip', 'newWoNewClientCity'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.oninput = () => this._newWoUpdateSubmitState();
+        });
+
+        m.style.display = 'flex';
+        // eslint-disable-next-line no-unused-expressions
+        m.offsetWidth;
+        m.classList.add('qe-show');
+        setTimeout(() => sIn.focus(), 200);
+    },
+
+    closeNewWorkOrderModal() {
+        const m = document.getElementById('newWoModal');
+        if (!m) return;
+        m.classList.remove('qe-show');
+        setTimeout(() => { m.style.display = 'none'; }, 220);
+        if (this._newWo && this._newWo.searchTimer) clearTimeout(this._newWo.searchTimer);
+        this._newWo = null;
+    },
+
+    _newWoOnSearchInput() {
+        if (!this._newWo) return;
+        if (this._newWo.searchTimer) clearTimeout(this._newWo.searchTimer);
+        const q = document.getElementById('newWoClientSearch').value.trim();
+        const resultsEl = document.getElementById('newWoClientResults');
+        const promptEl  = document.getElementById('newWoNewClientPrompt');
+        if (q.length < 2) {
+            resultsEl.style.display = 'none';
+            resultsEl.innerHTML = '';
+            promptEl.style.display = 'none';
+            return;
+        }
+        this._newWo.searchTimer = setTimeout(async () => {
+            resultsEl.innerHTML = '<div style="padding:10px;font-size:13px;color:#90a4ae;text-align:center">Zoeken…</div>';
+            resultsEl.style.display = 'block';
+            promptEl.style.display = 'none';
+            try {
+                const matches = await RobawsAPI.searchClients(q, 15);
+                this._newWoRenderResults(matches);
+            } catch (e) {
+                console.warn('[App] klant-zoek faalde:', e && e.message);
+                resultsEl.innerHTML = '<div style="padding:10px;font-size:13px;color:#c62828;text-align:center">Zoeken mislukt — probeer opnieuw</div>';
+                promptEl.style.display = 'block';
+            }
+        }, 300);
+    },
+
+    _newWoRenderResults(matches) {
+        const resultsEl = document.getElementById('newWoClientResults');
+        const promptEl  = document.getElementById('newWoNewClientPrompt');
+        if (!matches || matches.length === 0) {
+            resultsEl.innerHTML = '<div style="padding:10px;font-size:13px;color:#90a4ae;text-align:center">Geen klanten gevonden</div>';
+            resultsEl.style.display = 'block';
+            promptEl.style.display = 'block';
+            return;
+        }
+        resultsEl.innerHTML = matches.map((c, i) => `
+            <div class="qe-newwo-result" data-idx="${i}">
+                <div class="name">${this._escapeHtml(c.name)}</div>
+                ${c.address ? `<div class="addr">${this._escapeHtml(c.address)}</div>` : ''}
+            </div>
+        `).join('');
+        Array.from(resultsEl.querySelectorAll('.qe-newwo-result')).forEach((el, i) => {
+            el.addEventListener('click', () => this._newWoSelectClient(matches[i]));
+        });
+        resultsEl.style.display = 'block';
+        promptEl.style.display = 'block';
+    },
+
+    _newWoSelectClient(client) {
+        if (!this._newWo) return;
+        this._newWo.selectedClient = client;
+        this._newWo.useNewClient = false;
+        document.getElementById('newWoClientStep').style.display = 'none';
+        document.getElementById('newWoNewClientFields').style.display = 'none';
+        document.getElementById('newWoSelectedStep').style.display = '';
+        const pill = document.getElementById('newWoSelectedClient');
+        pill.innerHTML = '🏢 ' + this._escapeHtml(client.name)
+            + (client.address ? ' <span style="opacity:0.65;font-weight:400;font-size:12px">— ' + this._escapeHtml(client.address) + '</span>' : '')
+            + ' <span class="x" title="Wissen" onclick="app._newWoClearSelection()">✕</span>';
+        this._newWoUpdateSubmitState();
+        setTimeout(() => document.getElementById('newWoReason').focus(), 50);
+    },
+
+    _newWoClearSelection() {
+        if (!this._newWo) return;
+        this._newWo.selectedClient = null;
+        this._newWo.useNewClient = false;
+        document.getElementById('newWoClientStep').style.display = '';
+        document.getElementById('newWoSelectedStep').style.display = 'none';
+        document.getElementById('newWoNewClientFields').style.display = 'none';
+        document.getElementById('newWoClientSearch').value = '';
+        document.getElementById('newWoClientResults').style.display = 'none';
+        document.getElementById('newWoClientResults').innerHTML = '';
+        document.getElementById('newWoNewClientPrompt').style.display = 'none';
+        this._newWoUpdateSubmitState();
+        setTimeout(() => document.getElementById('newWoClientSearch').focus(), 50);
+    },
+
+    newWoSwitchToNewClient() {
+        if (!this._newWo) return;
+        this._newWo.useNewClient = true;
+        this._newWo.selectedClient = null;
+        document.getElementById('newWoClientStep').style.display = 'none';
+        document.getElementById('newWoSelectedStep').style.display = '';
+        document.getElementById('newWoNewClientFields').style.display = '';
+        const pill = document.getElementById('newWoSelectedClient');
+        pill.innerHTML = '＋ Nieuwe klant <span class="x" title="Wissen" onclick="app._newWoClearSelection()">✕</span>';
+        const q = document.getElementById('newWoClientSearch').value.trim();
+        if (q) document.getElementById('newWoNewClientName').value = q;
+        this._newWoUpdateSubmitState();
+        setTimeout(() => document.getElementById('newWoNewClientName').focus(), 50);
+    },
+
+    _newWoUpdateSubmitState() {
+        if (!this._newWo) return;
+        const btn = document.getElementById('newWoSubmitBtn');
+        const reason = document.getElementById('newWoReason').value.trim();
+        let ok = reason.length >= 3;
+        if (this._newWo.selectedClient) {
+            // OK
+        } else if (this._newWo.useNewClient) {
+            const n = document.getElementById('newWoNewClientName').value.trim();
+            const s = document.getElementById('newWoNewClientStreet').value.trim();
+            const z = document.getElementById('newWoNewClientZip').value.trim();
+            const c = document.getElementById('newWoNewClientCity').value.trim();
+            ok = ok && n.length >= 2 && s.length >= 2 && z.length >= 3 && c.length >= 2;
+        } else {
+            ok = false;
+        }
+        btn.disabled = !ok;
+    },
+
+    async submitNewWorkOrder() {
+        if (!this._newWo) return;
+        const statusEl = document.getElementById('newWoStatus');
+        const btn = document.getElementById('newWoSubmitBtn');
+        statusEl.className = 'qe-newwo-status';
+        statusEl.textContent = '';
+
+        const reason = document.getElementById('newWoReason').value.trim();
+        if (!reason) { statusEl.textContent = 'Vul een reden in'; return; }
+
+        btn.disabled = true;
+        const setStep = (txt) => { statusEl.textContent = txt; };
+
+        try {
+            let client = this._newWo.selectedClient;
+            let addressForOrder = null;
+            if (this._newWo.useNewClient) {
+                setStep('Klant aanmaken…');
+                const name   = document.getElementById('newWoNewClientName').value.trim();
+                const street = document.getElementById('newWoNewClientStreet').value.trim();
+                const zip    = document.getElementById('newWoNewClientZip').value.trim();
+                const city   = document.getElementById('newWoNewClientCity').value.trim();
+                const tel    = document.getElementById('newWoNewClientTel').value.trim();
+                const created = await RobawsAPI.createClient({
+                    name, addressLine1: street, postalCode: zip, city, country: 'België', tel,
+                });
+                client = { id: created.id, name: created.name, rawAddress: created.address };
+                addressForOrder = created.address || { addressLine1: street, postalCode: zip, city, country: 'België' };
+            } else if (client && client.rawAddress) {
+                addressForOrder = client.rawAddress;
+            }
+
+            if (!client || !client.id) throw new Error('Geen klant geselecteerd');
+
+            setStep('Order aanmaken…');
+            const order = await RobawsAPI.createSalesOrder({
+                clientId: client.id,
+                title: reason,
+                assignedUserId: this.currentUser.robawsUserId,
+                salesAgentUserId: this.currentUser.robawsUserId,
+                address: addressForOrder,
+            });
+            if (!order || !order.id) throw new Error('Order kreeg geen ID terug');
+
+            setStep('Dagplanning aanmaken…');
+            const now = new Date();
+            const end = new Date(now.getTime() + 60 * 60 * 1000);
+            const fmt = (d) => d.toISOString();
+            await RobawsAPI.createPlanningItem({
+                salesOrderId: order.id,
+                clientId: client.id,
+                employeeIds: [String(this.currentUser.robawsEmployeeId)],
+                startDate: fmt(now),
+                endDate:   fmt(end),
+                summary: reason,
+                description: reason,
+                address: addressForOrder,
+            });
+
+            statusEl.className = 'qe-newwo-status ok';
+            statusEl.textContent = '✓ Werkbon aangemaakt!';
+            setTimeout(() => {
+                this.closeNewWorkOrderModal();
+                this.toast('Werkbon aangemaakt: ' + reason);
+                try { this.loadPlanning(); } catch(_) {}
+            }, 600);
+        } catch (e) {
+            console.warn('[App] nieuwe werkbon maken faalde:', e);
+            statusEl.textContent = '✗ ' + (e && e.message || 'onbekende fout');
+            btn.disabled = false;
+        }
+    },
+
     /** v128: zorg dat de scan-overlay CSS-keyframes 1x geïnjecteerd zijn. */
     _ensureScanOverlayStyles() {
         if (document.getElementById('qeScanOverlayStyles')) return;
@@ -8531,6 +10059,10 @@ const app = {
             if (typeof QEClock !== 'undefined' && QEClock.syncPending) {
                 QEClock.syncPending().catch(e => console.warn('[App] Klok sync fout:', e));
             }
+            // v146: probeer wachtende Mollie→Robaws updates opnieuw
+            if (typeof this.processMollieRetryQueue === 'function') {
+                this.processMollieRetryQueue().catch(e => console.warn('[App] Mollie retry fout:', e));
+            }
         }
     },
 
@@ -8608,7 +10140,7 @@ const app = {
         const woId = this.currentWO.id;
         const saved = this.woData[woId]?.checklist || {};
 
-        document.getElementById('checklistTitle').textContent = '\u2705 ' + checklist.label;
+        document.getElementById('checklistTitle').textContent = '✅ ' + checklist.label;
         container.innerHTML = checklist.items.map(item => {
             const checked = saved[item.id] ? 'checked' : '';
             return `<label style="display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid var(--qe-grey-light);cursor:pointer">
@@ -8672,10 +10204,10 @@ const app = {
         if (!remark) return '';
         const cleanLine = (line) => {
             let s = String(line || '').replace(/^\s*klok-(in|uit):\s*/i, '');
-            const m = s.match(/^(.*?)\s+[\u2014-]\s+/);
+            const m = s.match(/^(.*?)\s+[—-]\s+/);
             if (m) return m[1].trim();
             const httpIdx = s.indexOf('http');
-            if (httpIdx > 0) return s.substring(0, httpIdx).replace(/[\s\-\u2014]+$/, '').trim();
+            if (httpIdx > 0) return s.substring(0, httpIdx).replace(/[\s\-—]+$/, '').trim();
             return s.trim();
         };
         const lines = String(remark).split(/\r?\n/).map(cleanLine).filter(Boolean);
