@@ -1719,36 +1719,94 @@ const RobawsAPI = {
     // ARTIKELEN ZOEKEN (materialen)
     // =============================================
     async searchArticles(query, limit = 20) {
-        // Probeer eerst op naam te zoeken via de API
-        const result = await this.get(`articles?name=${encodeURIComponent(query)}&limit=${limit}`);
-        let items = result.data.items || [];
+        const raw = (query || '').trim();
+        if (!raw) return [];
+        const ql = raw.toLowerCase();
+        const words = ql.split(/\s+/).filter(Boolean);
 
-        // Als query een nummer lijkt, ook op articleNumber zoeken
-        if (/^\d+/.test(query.trim())) {
-            try {
-                const numResult = await this.get(`articles?articleNumber=${encodeURIComponent(query.trim())}&limit=${limit}`);
-                const numItems = numResult.data.items || [];
-                // Merge zonder duplicaten
-                const existingIds = new Set(items.map(i => i.id));
-                numItems.forEach(i => { if (!existingIds.has(i.id)) items.push(i); });
-            } catch(e) {}
+        // Robaws zoekt server-side op naam, maar matcht meerdere woorden slecht.
+        // Daarom sturen we het meest onderscheidende (langste) woord naar Robaws
+        // en verfijnen we de rest client-side op de teruggekregen kandidaten.
+        const primary = words.reduce((a, b) => (b.length > a.length ? b : a), raw);
+
+        const byId = new Map();
+        const add = arr => {
+            for (const it of (arr || [])) {
+                if (it && it.id != null && !byId.has(String(it.id))) byId.set(String(it.id), it);
+            }
+        };
+
+        // 1) Op naam (ruime limit zodat client-side verfijnen materiaal heeft)
+        try {
+            const r = await this.get(`articles?name=${encodeURIComponent(primary)}&limit=50`);
+            add(r.data && r.data.items);
+        } catch (e) {}
+        // 2) Ook op artikelnummer (codes)
+        try {
+            const r2 = await this.get(`articles?articleNumber=${encodeURIComponent(raw)}&limit=20`);
+            add(r2.data && r2.data.items);
+        } catch (e) {}
+
+        let items = Array.from(byId.values());
+
+        // 3) Bij meerdere woorden: enkel artikels waar ALLE woorden in voorkomen
+        if (words.length > 1) {
+            const refined = items.filter(it => {
+                const hay = ((it.name || '') + ' ' + (it.articleNumber || '')).toLowerCase();
+                return words.every(w => hay.includes(w));
+            });
+            if (refined.length) items = refined;
         }
 
-        // Client-side fuzzy filter: als minder dan 3 resultaten, zoek ook door cache
-        if (items.length < 3 && this._articleCache && this._articleCache.length > 0) {
-            const q = query.toLowerCase().trim();
-            const words = q.split(/\s+/);
-            const fuzzyMatches = this._articleCache.filter(art => {
-                const name = (art.name || '').toLowerCase();
-                const nr = (art.articleNumber || '').toLowerCase();
-                // Elk woord moet voorkomen in naam of artikelnummer
-                return words.every(w => name.includes(w) || nr.includes(w));
-            }).slice(0, limit);
-            const existingIds = new Set(items.map(i => i.id));
-            fuzzyMatches.forEach(i => { if (!existingIds.has(i.id)) items.push(i); });
-        }
+        // 4) Rangschikken: artikelnr exact > naam begint met > naam bevat
+        const score = it => {
+            const name = (it.name || '').toLowerCase();
+            const nr = (it.articleNumber || '').toLowerCase();
+            if (nr && nr === ql) return 1000;
+            if (name === ql) return 950;
+            if (name.startsWith(ql)) return 850;
+            if (nr && nr.startsWith(ql)) return 800;
+            if (name.includes(ql)) return 700;
+            return 500;
+        };
+        items.sort((a, b) => score(b) - score(a) || (a.name || '').localeCompare(b.name || ''));
 
         return items.slice(0, limit);
+    },
+
+    // Client-side ranked matcher: artikelnr exact > naam start > bevat > alle woorden.
+    _rankArticles(cache, q, limit) {
+        const words = q.split(/\s+/).filter(Boolean);
+        const scored = [];
+        for (let i = 0; i < cache.length; i++) {
+            const art = cache[i];
+            const name = (art.name || '').toLowerCase();
+            const nr = (art.articleNumber || '').toLowerCase();
+            let score = 0;
+            if (nr && nr === q) score = 1000;
+            else if (name === q) score = 950;
+            else if (name.startsWith(q)) score = 850;
+            else if (nr && nr.startsWith(q)) score = 800;
+            else if (name.includes(q)) score = 700;
+            else if (nr && nr.includes(q)) score = 600;
+            else if (words.length > 0 && words.every(w => name.includes(w) || nr.includes(w))) score = 500;
+            if (score > 0) {
+                // Lichte voorkeur voor kortere (specifiekere) namen
+                score += Math.max(0, 80 - name.length) * 0.05;
+                scored.push({ art, score, idx: i });
+            }
+        }
+        scored.sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
+        return scored.slice(0, limit).map(s => s.art);
+    },
+
+    // Live verkoopprijs uit de artikel-cache op id (0 extra API-calls).
+    getCachedArticlePrice(id) {
+        if (!this._articleCache || id == null) return null;
+        const a = this._articleCache.find(x => String(x.id) === String(id));
+        if (!a) return null;
+        const p = (a.salePrice != null) ? a.salePrice : a.unitPrice;
+        return (p != null) ? p : null;
     },
 
     // =============================================
@@ -2323,26 +2381,49 @@ const RobawsAPI = {
         }
 
         this._articleCacheLoading = true;
+
+        // 0) Meegeleverde snapshot proberen (data/articles.json in de www-update) -> 0 API-calls.
+        //    Valt automatisch terug op live ophalen als het bestand er (nog) niet is of leeg is.
+        try {
+            const snapRes = await fetch('data/articles.json', { cache: 'no-store' });
+            if (snapRes.ok) {
+                const snap = await snapRes.json();
+                const snapItems = Array.isArray(snap) ? snap : (snap.items || snap.articles || []);
+                if (Array.isArray(snapItems) && snapItems.length > 0) {
+                    this._articleCache = snapItems;
+                    this._articleCacheLoading = false;
+                    if (onProgress) onProgress(snapItems.length, snapItems.length);
+                    return this._articleCache;
+                }
+            }
+        } catch (e) { /* geen snapshot -> live ophalen */ }
+
+        // Live ophalen — Robaws negeert ?page= op /articles (zelfde quirk als
+        // /work-orders, v83b), dus ?offset= gebruiken + dedup op id + stoppen
+        // zodra een pagina niets nieuws meer oplevert.
+        const LIMIT = 100;
         const allArticles = [];
-        let page = 0;
+        const seen = new Set();
 
         try {
-            // Eerst totaal opvragen
-            const first = await this.get('articles?limit=100&page=0');
-            const totalPages = first.data.totalPages || 1;
-            const totalItems = first.data.totalItems || 0;
-            const firstItems = first.data.items || [];
-            allArticles.push(...firstItems);
-
-            if (onProgress) onProgress(firstItems.length, totalItems);
-
-            // Rest ophalen
-            for (page = 1; page < totalPages; page++) {
-                const result = await this.get(`articles?limit=100&page=${page}`);
-                const items = result.data.items || [];
+            let totalItems = 0;
+            for (let p = 0; p < 1000; p++) {
+                const result = await this.get(`articles?limit=${LIMIT}&offset=${p * LIMIT}`);
+                if (result.code && result.code !== 200) break;
+                const items = (result.data && result.data.items) || [];
                 if (items.length === 0) break;
-                allArticles.push(...items);
-                if (onProgress) onProgress(allArticles.length, totalItems);
+                totalItems = result.data.totalItems || totalItems;
+                let added = 0;
+                for (const a of items) {
+                    const key = String(a && a.id);
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    allArticles.push(a);
+                    added++;
+                }
+                if (onProgress) onProgress(allArticles.length, totalItems || allArticles.length);
+                if (added === 0) break;          // paginatie-einde of -bug
+                if (items.length < LIMIT) break; // laatste pagina
             }
 
             this._articleCache = allArticles;
@@ -2357,20 +2438,35 @@ const RobawsAPI = {
     // ARTIKELGROEPEN
     // =============================================
     async getArticleGroups() {
+        // Robaws negeert ?page= -> ?offset= gebruiken + dedup + stoppen bij niets-nieuws
+        const GLIMIT = 100;
         const allGroups = [];
-        let page = 0;
-        do {
-            const result = await this.get(`article-groups?limit=100&page=${page}`);
-            const items = result.data.items || result.data || [];
+        const seenG = new Set();
+        for (let p = 0; p < 200; p++) {
+            const result = await this.get(`article-groups?limit=${GLIMIT}&offset=${p * GLIMIT}`);
+            const items = (result.data && (result.data.items || (Array.isArray(result.data) ? result.data : []))) || [];
             if (items.length === 0) break;
-            allGroups.push(...items);
-            const totalPages = result.data.totalPages || 1;
-            page++;
-            if (page >= totalPages) break;
-        } while (true);
+            let added = 0;
+            for (const g of items) {
+                const k = String(g && g.id);
+                if (seenG.has(k)) continue;
+                seenG.add(k);
+                allGroups.push(g);
+                added++;
+            }
+            if (added === 0) break;
+            if (items.length < GLIMIT) break;
+        }
+
+        // Dedupe op id (Robaws-paginatie kan dezelfde groep meermaals teruggeven -> dubbele tegels)
+        const _seen = new Set();
+        const uniqueGroups = [];
+        for (const g of allGroups) {
+            if (g && !_seen.has(g.id)) { _seen.add(g.id); uniqueGroups.push(g); }
+        }
 
         // Filter alleen wappy=true
-        const wappyGroups = allGroups.filter(g => g.wappy === true);
+        const wappyGroups = uniqueGroups.filter(g => g.wappy === true);
 
         // Boomstructuur
         const rootGroups = [];
