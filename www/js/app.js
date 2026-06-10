@@ -3660,9 +3660,10 @@ const app = {
             };
             const info = document.getElementById('onderhoudResultInfo');
             info.innerHTML = `<strong>${this.escapeHtml(this._ohArticle.name)}</strong>` +
-                (this._ohArticle.salePrice ? `<br><span class="monteur-hide">Prijs: ${this.formatPrice(this._ohArticle.salePrice)}</span>` : '');
+                `<br><span class="monteur-hide">Prijs: <span id="onderhoudResultPrice">${size.price ? this.formatPrice(size.price) : '…'}</span></span>`;
             document.getElementById('onderhoudStep2').style.display = 'none';
             document.getElementById('onderhoudResult').style.display = '';
+            this._ohPricePromise = this._ohApplyLivePrice(size.price);
             return;
         }
 
@@ -3728,22 +3729,22 @@ const app = {
         const zoneData = size.zones[zone];
         if (!zoneData) return;
         this._ohZone = zone;
-        const _livePrice = (window.RobawsAPI && RobawsAPI.getCachedArticlePrice) ? RobawsAPI.getCachedArticlePrice(zoneData.id) : null;
-        const _price = (_livePrice != null) ? _livePrice : zoneData.price;
+        // v199: start met de bekende prijs; de ACTUELE prijs wordt live uit Robaws gehaald (op id).
         this._ohArticle = {
             id: zoneData.id,
             name: `Onderhoud ${cat.label.replace(' (AG)', '')} ${size.label} - ZONE ${zone}`,
-            salePrice: _price,
-            unitPrice: _price,
+            salePrice: zoneData.price,
+            unitPrice: zoneData.price,
             unit: 'stuk'
         };
         const verpl = ONDERHOUD_DATA.ZONE_VERPLAATSING[zone] || '?';
         const info = document.getElementById('onderhoudResultInfo');
         info.innerHTML = `<strong>${this.escapeHtml(this._ohArticle.name)}</strong>` +
             `<br><span style="font-size:12px;color:var(--qe-grey)">Zone ${zone} — verplaatsing €${verpl}</span>` +
-            (this._ohArticle.salePrice ? `<br><span class="monteur-hide">Prijs: ${this.formatPrice(this._ohArticle.salePrice)}</span>` : '');
+            `<br><span class="monteur-hide">Prijs: <span id="onderhoudResultPrice">${zoneData.price ? this.formatPrice(zoneData.price) : '…'}</span></span>`;
         document.getElementById('onderhoudStep3').style.display = 'none';
         document.getElementById('onderhoudResult').style.display = '';
+        this._ohPricePromise = this._ohApplyLivePrice(zoneData.price);
     },
 
     onderhoudBack(toStep) {
@@ -3754,8 +3755,10 @@ const app = {
         this._ohArticle = null;
     },
 
-    onderhoudAddToMaterials() {
+    async onderhoudAddToMaterials() {
         if (!this._ohArticle || !this.currentWO) return;
+        // v199: wacht op de live prijs uit Robaws zodat de ACTUELE prijs wordt toegevoegd
+        try { if (this._ohPricePromise) await this._ohPricePromise; } catch (e) {}
         this.addMaterial(this._ohArticle);
 
         // Verplaatsingskosten worden NIET apart toegevoegd bij onderhoud —
@@ -3763,6 +3766,28 @@ const app = {
 
         // Reset naar stap 1
         this.initOnderhoudPicker();
+    },
+
+    // v199: haalt de ACTUELE onderhoudsprijs op uit Robaws (op artikel-id) i.p.v. de
+    // opgeslagen statische prijs. Werkt async: werkt het scherm bij zodra de prijs binnen is.
+    async _ohApplyLivePrice(fallback) {
+        const art = this._ohArticle;
+        if (!art || art.id == null) return;
+        let price = fallback;
+        try {
+            if (window.RobawsAPI && RobawsAPI.get) {
+                const r = await RobawsAPI.get('articles/' + art.id);
+                const a = (r && r.data) ? r.data : null;
+                const p = a ? (a.salePrice != null ? a.salePrice : a.unitPrice) : null;
+                if (p != null) price = p;
+            }
+        } catch (e) {}
+        if (this._ohArticle && String(this._ohArticle.id) === String(art.id)) {
+            this._ohArticle.salePrice = price;
+            this._ohArticle.unitPrice = price;
+            const el = document.getElementById('onderhoudResultPrice');
+            if (el) el.textContent = this.formatPrice(price);
+        }
     },
 
     // ========================================
@@ -4663,6 +4688,19 @@ const app = {
         const vatName = client.vatTariffName || null;
         const btwRowsEl = document.getElementById('wbBtwRows');
 
+        // v198: apart "tabje" met de transactiekost (1,5% bij kaartbetaling) + totaal incl. transactiekost
+        const FEE_RATE = 0.015;
+        const txBox = (totalIncl, btwLabel) => {
+            const gross = totalIncl / (1 - FEE_RATE);
+            const fee = gross - totalIncl;
+            return `
+                <div style="margin-top:10px;padding:10px 12px;background:#fff3e0;border-radius:10px">
+                    <div style="font-size:11px;color:#e65100;font-weight:600;margin-bottom:4px">Bij kaartbetaling (Viva)${btwLabel ? ' — ' + btwLabel : ''}</div>
+                    <div class="total-row"><span>Transactiekosten (1,5%)</span><span>${this.formatPrice(fee)}</span></div>
+                    <div class="total-row subtotal" style="font-weight:700;color:#e65100"><span>Totaal incl. transactiekosten</span><span>${this.formatPrice(gross)}</span></div>
+                </div>`;
+        };
+
         if (vatPct !== null && vatName) {
             // Klant heeft een bekend BTW tarief — toon alleen dat tarief
             clientBtwInfo.innerHTML = `<span style="font-weight:600;color:var(--qe-purple)">Klant BTW: ${this.escapeHtml(vatName)}</span>`;
@@ -4679,7 +4717,7 @@ const app = {
                 <div class="total-row subtotal" style="font-weight:700;color:var(--qe-purple)">
                     <span>Totaal incl. ${vatPct}% BTW</span>
                     <span>${this.formatPrice(subtotal + btwBedrag)}</span>
-                </div>`;
+                </div>` + txBox(subtotal + btwBedrag, '');
         } else {
             // Onbekend BTW tarief — toon beide zodat technieker kan vergelijken
             clientBtwInfo.innerHTML = '<span style="color:var(--qe-orange);font-weight:600">Klant BTW: niet ingesteld in Robaws</span>';
@@ -4692,7 +4730,7 @@ const app = {
                 <div class="total-row"><span>BTW 6%</span><span>${this.formatPrice(btw6)}</span></div>
                 <div class="total-row"><span>BTW 21%</span><span>${this.formatPrice(btw21)}</span></div>
                 <div class="total-row subtotal"><span>Totaal incl. 6% BTW</span><span style="font-weight:500">${this.formatPrice(subtotal + btw6)}</span></div>
-                <div class="total-row subtotal"><span>Totaal incl. 21% BTW</span><span style="font-weight:500">${this.formatPrice(subtotal + btw21)}</span></div>`;
+                <div class="total-row subtotal"><span>Totaal incl. 21% BTW</span><span style="font-weight:500">${this.formatPrice(subtotal + btw21)}</span></div>` + txBox(subtotal + btw6, '6% BTW') + txBox(subtotal + btw21, '21% BTW');
         }
 
         // Opmerkingen & foto's
