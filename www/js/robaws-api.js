@@ -14,6 +14,26 @@ const RobawsAPI = {
     _articleCacheLoading: false,
     API_KEY: 'KBM8UEKYPLHIXDHIQ1IL',
     API_SECRET: 'xmFYgMmDi4xFLiPZy8qCslSKbCmSDIgIErmTWJZ5',
+
+    // Eén gedeelde API-key voor de hele app (per-werknemer keys teruggedraaid).
+    USER_API_KEYS: {},
+    _activeKey: null,
+    _activeSecret: null,
+    setActiveCredentialsFor(email) {
+        const c = this.USER_API_KEYS[String(email || '').toLowerCase().trim()] || null;
+        this._activeKey = (c && c.key) || null;
+        this._activeSecret = (c && c.secret) || null;
+    },
+    clearActiveCredentials() {
+        this._activeKey = null;
+        this._activeSecret = null;
+    },
+    _authPair() {
+        return {
+            key: this._activeKey || this.API_KEY,
+            secret: this._activeSecret || this.API_SECRET,
+        };
+    },
     TENANT: 'qualityenvironment',
 
     // === MEDEWERKERS MAPPING ===
@@ -45,9 +65,23 @@ const RobawsAPI = {
         'els@qe.be':                 { employeeId: 23, userId: 3,     name: 'Els',        role: 'bureel' },
     },
 
+    // v219: Tijd-types die een AFWEZIGHEID zijn (de Robaws-keuzelijst minus
+    // "Op tijd"/"Te laat"). Eén bron voor klok, aanwezigheid en dagoverzicht.
+    ABSENCE_TIJD: ['Ziek', 'Betaalde feestdag', 'Inhaal rustdag', 'Verlof', 'Sociaal verlof'],
+
+    // v222b: vaste ontvangers voor automatische taken — één plek i.p.v.
+    // losse hardcoded id's. Facturen & betalingen → Els (boekhouding),
+    // werkbon-opvolging → Vince, artikel-aanmaak → Felicity.
+    TASK_USERS: {
+        FACTUREN:  '3',  // Els
+        OPVOLGING: '5',  // Vince
+        ARTIKELS:  '6',  // Felicity
+    },
+
     // === AUTH HEADERS ===
     getHeaders() {
-        const auth = btoa(this.API_KEY + ':' + this.API_SECRET);
+        const _ap = this._authPair();
+        const auth = btoa(_ap.key + ':' + _ap.secret);
         return {
             'Authorization': 'Basic ' + auth,
             'X-Tenant': this.TENANT,
@@ -115,10 +149,34 @@ const RobawsAPI = {
         }
     },
 
+    // v207: fetch met harde timeout. In de Android-WebView kan een fetch op
+    // "dode" wifi (verbonden maar geen internet, vliegtuigmodus-randgevallen)
+    // MINUTENLANG hangen — en navigator.onLine zegt dan ook nog true. Eén
+    // centrale timeout maakt elke Robaws-call eindig; de foutmelding bevat
+    // "timeout" zodat de netwerkfout-detectie in app.js hem herkent en de
+    // werkbon alsnog netjes de offline-wachtrij in gaat.
+    _TIMEOUT_MS: 20000,          // get/post/put
+    _TIMEOUT_UPLOAD_MS: 90000,   // uploads (foto's op traag 4G)
+    async _fetchWithTimeout(url, opts, timeoutMs) {
+        const ms = timeoutMs || this._TIMEOUT_MS;
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), ms);
+        try {
+            return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+        } catch (e) {
+            if (e && (e.name === 'AbortError' || /abort/i.test(String(e && e.message)))) {
+                throw new Error('Netwerk-timeout na ' + Math.round(ms / 1000) + 's (geen verbinding?)');
+            }
+            throw e;
+        } finally {
+            clearTimeout(timer);
+        }
+    },
+
     /** Rauwe fetch zonder cache (interne helper). */
     async _rawGet(key) {
         const url = this.BASE_URL + '/' + key;
-        const res = await fetch(url, { headers: this.getHeaders() });
+        const res = await this._fetchWithTimeout(url, { headers: this.getHeaders() });
         if (res.status === 204) return { code: 204, data: null };
         const txt = await res.text();
         if (!txt) return { code: res.status, data: null };
@@ -167,7 +225,7 @@ const RobawsAPI = {
     async post(endpoint, body) {
         this._invalidateCache(endpoint);   // v184: cache van het betrokken record wissen
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
-        const res = await fetch(url, {
+        const res = await this._fetchWithTimeout(url, {   // v207: timeout
             method: 'POST',
             headers: this.getHeaders(),
             body: JSON.stringify(body),
@@ -186,7 +244,7 @@ const RobawsAPI = {
     async put(endpoint, body) {
         this._invalidateCache(endpoint);   // v184: cache van het betrokken record wissen
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
-        const res = await fetch(url, {
+        const res = await this._fetchWithTimeout(url, {   // v207: timeout
             method: 'PUT',
             headers: this.getHeaders(),
             body: JSON.stringify(body),
@@ -204,14 +262,33 @@ const RobawsAPI = {
         }
     },
 
+    // v211: DELETE-wrapper — nodig voor rollback van half-aangemaakte records
+    // (bv. een werkbon waarvan de veld-PUT faalde).
+    async del(endpoint) {
+        this._invalidateCache(endpoint);
+        const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
+        const res = await this._fetchWithTimeout(url, {
+            method: 'DELETE',
+            headers: this.getHeaders(),
+        });
+        if (res.status === 204) return { code: 204, data: null };
+        const txt = await res.text();
+        try {
+            return { code: res.status, data: txt ? JSON.parse(txt) : null };
+        } catch (e) {
+            return { code: res.status, data: { raw: txt } };
+        }
+    },
+
     async uploadFile(endpoint, file, fileName) {
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
-        const auth = btoa(this.API_KEY + ':' + this.API_SECRET);
+        const _ap = this._authPair();  // v231: per-werknemer key indien aanwezig
+        const auth = btoa(_ap.key + ':' + _ap.secret);
 
         const formData = new FormData();
         formData.append('file', file, fileName);
 
-        const res = await fetch(url, {
+        const res = await this._fetchWithTimeout(url, {   // v207: ruime upload-timeout
             method: 'POST',
             headers: {
                 'Authorization': 'Basic ' + auth,
@@ -220,7 +297,7 @@ const RobawsAPI = {
                 // Geen Content-Type — browser zet multipart boundary automatisch
             },
             body: formData,
-        });
+        }, this._TIMEOUT_UPLOAD_MS);
         // BUG-fix: zelfde JSON-parse safety als bij put().
         const txt = await res.text();
         try {
@@ -237,7 +314,7 @@ const RobawsAPI = {
         if (typeof QEBridge !== 'undefined' && QEBridge.downloadRobawsDocument) {
             try {
                 const result = QEBridge.downloadRobawsDocument(
-                    String(documentId), this.API_KEY, this.API_SECRET, this.TENANT
+                    String(documentId), this._authPair().key, this._authPair().secret, this.TENANT
                 );
                 if (result && result.length > 0) {
                     // Format: "contentType|base64data"
@@ -541,6 +618,26 @@ const RobawsAPI = {
             } catch (_) {}
         }
 
+        // v231: werknemers met status "stopgezet" mogen NIET meer inloggen.
+        // De status kan top-level op de fiche staan of als extra-veld.
+        const _statusRaw = String(
+            employee.status ||
+            (employee.extraFields && employee.extraFields['Status'] &&
+                (employee.extraFields['Status'].stringValue ?? employee.extraFields['Status'].value)) ||
+            ''
+        ).toLowerCase();
+        if (_statusRaw.includes('stopgezet')) {
+            console.warn('[RobawsAPI] Login geweigerd — status stopgezet:', emailLower);
+            // Lokale login-sporen wissen zodat ook de offline-fallback
+            // (7-dagen grace) voor dit account niet meer werkt.
+            try {
+                localStorage.removeItem('qe_last_online_login_' + emailLower);
+                localStorage.removeItem('qe_emp_cache_' + emailLower);
+                localStorage.removeItem('qe_login_emp_cache_' + emailLower);
+            } catch (_) {}
+            return { success: false, error: 'Dit account is stopgezet. Neem contact op met kantoor.' };
+        }
+
         // PIN checken via extra veld "Pincode" (groep "QE Werkbon app", type TEXT).
         // v132: ook andere veld-naam-varianten + value-types proberen voor het geval
         // de PIN handmatig in Robaws onder een afwijkende key is gezet.
@@ -660,7 +757,7 @@ const RobawsAPI = {
 
     // PIN opslaan in Robaws (extra veld "Pincode" op werknemer, type TEXT)
     async _savePinToRobaws(employeeId, pin) {
-        const empRes = await this.get(`employees/${employeeId}`);
+        const empRes = await this.get(`employees/${employeeId}`, { bypassCache: true });  // v223: vers vóór full-replace-PUT
         if (empRes.code !== 200 || !empRes.data) throw new Error('Werknemer niet gevonden');
         const empData = empRes.data;
         empData.extraFields = empData.extraFields || {};
@@ -700,6 +797,110 @@ const RobawsAPI = {
         // Update lokaal
         await this.setPin(email, newPin);
         return { success: true };
+    },
+
+    // ================================================================
+    // v233: ADMIN — werknemersbeheer (bureel-only; UI gate't in app.js).
+    // Alles via full-replace PUT /employees/{id}: vers ophalen → muteren → PUT
+    // (zoals _savePinToRobaws). LET OP: de Robaws LOGIN-gebruiker kan NIET via
+    // de API aangemaakt worden — dat blijft een handmatige stap in Robaws-web.
+    // ================================================================
+    ADMIN_ROLE_MAP: {
+        technieker: { employeeRoleId: '34', planningGroup: '1. Technieker' },
+        monteur:    { employeeRoleId: '1',  planningGroup: '3. Monteur' },
+        bureel:     { employeeRoleId: '42', planningGroup: '9. Bureel' },
+    },
+
+    /** Alle werknemers (incl. stopgezet) voor de admin-lijst. */
+    async adminListEmployees() {
+        const out = [];
+        let page = 0;
+        do {
+            const res = await this.get(`employees?limit=100&offset=${page * 100}`, { bypassCache: true });
+            const items = (res.data && res.data.items) || [];
+            if (items.length === 0) break;
+            for (const e of items) {
+                const ef = e.extraFields || {};
+                let hasPin = false;
+                for (const k of Object.keys(ef)) {
+                    if (!/pin/i.test(k)) continue;
+                    const pf = ef[k];
+                    const v = pf && (pf.stringValue ?? pf.intValue ?? pf.value ?? pf.numberValue);
+                    if (v != null && String(v).trim()) { hasPin = true; break; }
+                }
+                const status = String(e.status || (ef['Status'] && ef['Status'].stringValue) || '').trim();
+                out.push({
+                    id: e.id,
+                    name: [e.firstName, e.lastName].filter(Boolean).join(' ') || e.fullName || e.name || e.email || '(naamloos)',
+                    email: e.email || '',
+                    employeeRoleId: e.employeeRoleId != null ? String(e.employeeRoleId) : '',
+                    planningGroup: e.planningGroupName || e.planningGroup || '',
+                    status,
+                    stopgezet: status.toLowerCase().includes('stopgezet'),
+                    hasPin,
+                });
+            }
+            page++;
+            if (page >= ((res.data && res.data.totalPages) || 1)) break;
+        } while (page < 10);
+        out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        return out;
+    },
+
+    /** Vers ophalen → muteer → full-replace PUT. */
+    async _adminMutateEmployee(employeeId, mutate) {
+        const res = await this.get(`employees/${employeeId}`, { bypassCache: true });
+        if (res.code !== 200 || !res.data) throw new Error('Werknemer niet gevonden (' + res.code + ')');
+        const emp = res.data;
+        mutate(emp);
+        const put = await this.put(`employees/${employeeId}`, emp);
+        if (put.code !== 200 && put.code !== 204) throw new Error('Opslaan mislukt (' + put.code + ')');
+        return true;
+    },
+
+    /** PIN resetten: Pincode-veld leegmaken → werknemer stelt bij volgende login zelf in. */
+    async adminResetPin(employeeId) {
+        return this._adminMutateEmployee(employeeId, (emp) => {
+            emp.extraFields = emp.extraFields || {};
+            emp.extraFields['Pincode'] = { type: 'TEXT', group: 'QE Werkbon app', stringValue: '' };
+        });
+    },
+
+    /** Status: 'stopgezet' (blokkeert login) of 'actief'. */
+    async adminSetStatus(employeeId, status) {
+        const s = (status === 'stopgezet') ? 'stopgezet' : 'actief';
+        return this._adminMutateEmployee(employeeId, (emp) => {
+            emp.status = s;
+            if (emp.extraFields && emp.extraFields['Status']) emp.extraFields['Status'].stringValue = s;
+        });
+    },
+
+    /** Rol: zet employeeRoleId én planningGroup (login leest eerst employeeRoleId). */
+    async adminSetRole(employeeId, role) {
+        const m = this.ADMIN_ROLE_MAP[role];
+        if (!m) throw new Error('Onbekende rol: ' + role);
+        return this._adminMutateEmployee(employeeId, (emp) => {
+            emp.employeeRoleId = m.employeeRoleId;
+            emp.planningGroup = m.planningGroup;
+        });
+    },
+
+    /** Nieuwe werknemerfiche (POST minimaal → PUT volledig). LOGIN-gebruiker = handmatig in Robaws-web. */
+    async adminCreateEmployee({ firstName, lastName, email, role, pin }) {
+        const m = this.ADMIN_ROLE_MAP[role] || this.ADMIN_ROLE_MAP.monteur;
+        const createRes = await this.post('employees', { name: firstName || '', surname: lastName || '', email });
+        if (createRes.code !== 200 && createRes.code !== 201) throw new Error('Aanmaken mislukt (' + createRes.code + ')');
+        const newId = createRes.data && createRes.data.id;
+        if (!newId) throw new Error('Geen ID teruggekregen');
+        await this._adminMutateEmployee(newId, (emp) => {
+            emp.email = email;
+            emp.status = 'actief';
+            emp.employeeRoleId = m.employeeRoleId;
+            emp.planningGroup = m.planningGroup;
+            emp.extraFields = emp.extraFields || {};
+            if (pin) emp.extraFields['Pincode'] = { type: 'TEXT', group: 'QE Werkbon app', stringValue: String(pin) };
+        });
+        return { id: newId };
     },
 
     // Fallback login als Robaws onbereikbaar is.
@@ -861,7 +1062,7 @@ const RobawsAPI = {
         if (typeof QEBridge !== 'undefined' && QEBridge.downloadRobawsDocument) {
             try {
                 const result = QEBridge.downloadRobawsDocument(
-                    String(doc.id), this.API_KEY, this.API_SECRET, this.TENANT
+                    String(doc.id), this._authPair().key, this._authPair().secret, this.TENANT
                 );
                 if (result && result.length > 0) {
                     const pipeIdx = result.indexOf('|');
@@ -1070,7 +1271,7 @@ const RobawsAPI = {
      */
     async updateTimeRegistration(id, updates) {
         // Haal eerst de volledige registratie op om niets te overschrijven
-        const existing = await this.get(`time-registrations/${id}`);
+        const existing = await this.get(`time-registrations/${id}`, { bypassCache: true });  // v223
         if (existing.code !== 200 || !existing.data) {
             throw new Error('Tijdsregistratie niet gevonden: ' + id);
         }
@@ -1175,6 +1376,37 @@ const RobawsAPI = {
             const itemDate = (item.startDate || '').substring(0, 10);
             return itemDate === today;
         });
+    },
+
+    /** v217: alle tijdsregistratie-WERKBONNEN van vandaag (alle werknemers) —
+     *  voor de Team-aanwezigheid van bureel. Registraties worden altijd op de
+     *  dag zelf aangemaakt, dus de createdAt-stop maakt dit 1 pagina werk. */
+    async getTeamTimeRegistrationsToday() {
+        const today = this._localDateStr();
+        const out = [];
+        const seen = new Set();
+        for (let p = 0; p < 10; p++) {
+            const res = await this.get(`work-orders?limit=100&offset=${p * 100}&sort=createdAt:desc`);
+            if (res.code !== 200) break;
+            const items = (res.data && res.data.items) || [];
+            if (items.length === 0) break;
+            let stop = false;
+            for (const wo of items) {
+                const k = String(wo.id);
+                if (seen.has(k)) continue;
+                seen.add(k);
+                const created = ((wo.createdAt || wo.date || '') + '').split('T')[0];
+                if (created && created < today) { stop = true; break; }
+                const d = ((wo.date || '') + '').split('T')[0];
+                if (d !== today) continue;
+                const isTR = String(wo.status || '').toLowerCase() === 'tijdsregistratie' ||
+                             /^tijdsregistratie/i.test(String(wo.title || ''));
+                if (!isTR) continue;
+                out.push(wo);
+            }
+            if (stop || items.length < 100) break;
+        }
+        return out;
     },
 
     /**
@@ -1314,7 +1546,7 @@ const RobawsAPI = {
      * @param {string} tagId - de NFC tag ID
      */
     async saveNfcTagId(fieldName, tagId) {
-        const empRes = await this.get('employees/1');
+        const empRes = await this.get('employees/1', { bypassCache: true });  // v223: vers vóór full-replace-PUT
         if (empRes.code !== 200 || !empRes.data) throw new Error('Kon werknemer niet ophalen');
         const empData = empRes.data;
         empData.extraFields = empData.extraFields || {};
@@ -1648,8 +1880,14 @@ const RobawsAPI = {
                         seenWoIds.add(String(wo.id));
                     }
                     added++;
+                    // v213: stop op createdAt (waarop gesorteerd wordt) — een
+                    // teruggedateerde recente werkbon stopte de lus voorheen
+                    // te vroeg → hasWerkbon vals-negatief → planning-item
+                    // bleef "open" en kon dubbel ingediend worden.
+                    const woCreated = ((wo.createdAt || wo.date || '') + '').split('T')[0];
+                    if (woCreated && woCreated < sinceDate) { stop = true; break; }
                     const woDate = wo.date || '';
-                    if (woDate && woDate < sinceDate) { stop = true; break; }
+                    if (woDate && woDate < sinceDate) continue;  // oud: overslaan, niet stoppen
                     if (wo.planningItemId) {
                         // Als we een currentUserId hebben, alleen werkbonnen van deze gebruiker tellen
                         if (currentUserId) {
@@ -1835,6 +2073,46 @@ const RobawsAPI = {
     },
 
     // Live verkoopprijs uit de artikel-cache op id (0 extra API-calls).
+    /** v209: DE prijs-autoriteit. Haalt een artikel LIVE uit Robaws op
+     *  (60-min TTL-cache via get() dempt het verkeer). Aanleiding: het
+     *  onderhoud-snelmenu factureerde €102 i.p.v. €120 (doorstromer) omdat
+     *  de oude live-patch fouten stil wegslikte en terugviel op de
+     *  prijslijst-2023. Retourneert:
+     *    { ok:true, article:{id,name,salePrice,unitPrice,unit} }
+     *    { ok:false, notFound:true, error }   → artikel-id bestaat niet (meer)
+     *    { ok:false, network:true,  error }   → geen verbinding/timeout
+     *    { ok:false, error }                  → andere fout (HTTP-code)
+     *  Callers mogen bij ok:false NOOIT stil een oude prijs gebruiken. */
+    async resolveArticle(articleId) {
+        if (articleId == null || articleId === '') {
+            return { ok: false, error: 'geen artikel-id' };
+        }
+        try {
+            const r = await this.get('articles/' + articleId);
+            if (r && r.code === 200 && r.data && r.data.id != null) {
+                const a = r.data;
+                return {
+                    ok: true,
+                    article: {
+                        id: a.id,
+                        name: a.name || ('Artikel ' + a.id),
+                        salePrice: (a.salePrice != null) ? a.salePrice : (a.unitPrice != null ? a.unitPrice : null),
+                        unitPrice: (a.unitPrice != null) ? a.unitPrice : (a.salePrice != null ? a.salePrice : null),
+                        unit: a.unitType || a.unit || 'stuk',
+                    },
+                };
+            }
+            if (r && r.code === 404) {
+                return { ok: false, notFound: true, error: 'Artikel ' + articleId + ' bestaat niet (meer) in Robaws' };
+            }
+            return { ok: false, error: 'HTTP ' + (r && r.code) };
+        } catch (e) {
+            const msg = String((e && e.message) || e || '');
+            const network = /failed to fetch|net::err|networkerror|timeout/i.test(msg);
+            return { ok: false, network, error: msg };
+        }
+    },
+
     getCachedArticlePrice(id) {
         if (!this._articleCache || id == null) return null;
         const a = this._articleCache.find(x => String(x.id) === String(id));
@@ -1972,7 +2250,36 @@ const RobawsAPI = {
             log.push('PUT werkbon exception: ' + e.message);
         }
 
+        // v211: een werkbon zónder velden (PUT mislukt) is een onbruikbaar
+        // spook-record — geen titel/klant/datum/verantwoordelijke, onvindbaar
+        // in elke filter, en de uren zouden eraan blijven hangen. Voorheen
+        // ging de flow gewoon door en kreeg de gebruiker "verstuurd ✓".
+        // Nu: lege werkbon direct opruimen en een ECHTE fout teruggeven,
+        // zodat de app veilig opnieuw kan proberen.
+        const putOk = !!(putResult && (putResult.code === 200 || putResult.code === 201 || putResult.code === 204));
+        if (!putOk) {
+            try {
+                const delRes = await this.del(`work-orders/${workOrderId}`);
+                log.push('Rollback lege werkbon: DELETE → ' + (delRes && delRes.code));
+            } catch (e) {
+                log.push('Rollback mislukt: ' + (e && e.message));
+            }
+            try { localStorage.setItem('qe_last_wo_verify', JSON.stringify({ putFailed: true, log })); } catch(e){}
+            return {
+                success: false,
+                error: 'Werkbon-velden konden niet weggeschreven worden (code ' + (putResult && putResult.code) + ') — er is niets verstuurd, probeer opnieuw',
+                workOrderId: null,
+                log,
+            };
+        }
+
         // Stap 2: POST elke time-entry naar /work-orders/{id}/time-entries
+        // v212: als de app de uren al op totaalniveau heeft afgerond
+        // (hoursPrerounded via _roundHoursForSubmit), dan ronden we billable
+        // hier NIET nog eens per entry op. Voorheen stapelde dat: 25+35 min
+        // (totaal al afgerond op 60) werd per entry 0,5u + 1,0u = 1,5u
+        // billable voor 1,0u werk.
+        const prerounded = !!data.hoursPrerounded;
         let timeSuccess = 0;
         const timeErrors = [];
         const timeRequests = [];
@@ -1987,7 +2294,9 @@ const RobawsAPI = {
             const te = {
                 employeeId: entryEmployeeId,
                 hours: hrs,
-                billableHours: (onderhoud && isKlant) ? 0 : this._roundUpHalfHour(hrs),
+                // v212: klant-uren met prerounded vlag = exact overnemen
+                billableHours: (onderhoud && isKlant) ? 0
+                    : ((prerounded && isKlant) ? hrs : this._roundUpHalfHour(hrs)),
             };
             if (code && code.id) te.articleId = toStr(code.id);
             // v108: Robaws v2 wil 'breakMinutes' (was 'breakDuration' — die werd
@@ -2133,12 +2442,21 @@ const RobawsAPI = {
             ...Object.keys(newHoursPerArticle),
             ...Object.keys(oldHoursPerArticle),
         ]);
-        const deltaHours = []; // [{articleId, deltaHours}]
+        const deltaHours = []; // [{articleId, deltaHours, billableDelta}]
         for (const aId of allArticleIds) {
             const oldH = parseFloat(oldHoursPerArticle[aId] || 0);
             const newH = parseFloat(newHoursPerArticle[aId] || 0);
             const diff = Math.round((newH - oldH) * 100) / 100;
-            if (diff !== 0) deltaHours.push({ articleId: aId, deltaHours: diff });
+            // v213: billable-delta = verschil van de AFGERONDE totalen.
+            // Voorheen werd de delta zélf opgerond: -0,25u werd billable -0,0
+            // (ceil richting nul) → een correctie omlaag verlaagde de
+            // factureerbare uren nooit; en kleine plus-delta's bliezen op.
+            const billableDelta = Math.round(
+                (this._roundUpHalfHour(newH) - this._roundUpHalfHour(oldH)) * 100
+            ) / 100;
+            if (diff !== 0 || billableDelta !== 0) {
+                deltaHours.push({ articleId: aId, deltaHours: diff, billableDelta });
+            }
         }
 
         // 2) Bereken delta materialen per (articleId|description)
@@ -2266,7 +2584,22 @@ const RobawsAPI = {
         }
         const putResult = await this.put(`work-orders/${workOrderId}`, putBody);
         if (putResult.code !== 200 && putResult.code !== 201 && putResult.code !== 204) {
-            log.push('PUT correctie fout: ' + putResult.code);
+            // v213: voorheen ging de flow gewoon door en kwamen de delta-
+            // entries op een ANONIEME werkbon terecht (geen titel/klant/datum):
+            // niet herkenbaar als correctie en buiten het cumulatief, waardoor
+            // een volgende correctie de delta verdubbelde. Nu: opruimen + fout.
+            log.push('PUT correctie fout: ' + putResult.code + ' — rollback');
+            try {
+                const delRes = await this.del(`work-orders/${workOrderId}`);
+                log.push('Rollback correctie-werkbon: DELETE → ' + (delRes && delRes.code));
+            } catch (e) {
+                log.push('Rollback mislukt: ' + (e && e.message));
+            }
+            return {
+                success: false,
+                error: 'Correctie-werkbon kon niet weggeschreven worden (code ' + putResult.code + ') — er is niets gecorrigeerd, probeer opnieuw',
+                log,
+            };
         }
 
         // 6) Delta uren posten
@@ -2276,7 +2609,8 @@ const RobawsAPI = {
             const te = {
                 employeeId: toStr(employeeId),
                 hours: dh.deltaHours,
-                billableHours: this._roundUpHalfHour(dh.deltaHours),
+                // v213: verschil-van-totalen (zie hierboven), niet de delta opronden
+                billableHours: dh.billableDelta,
             };
             if (dh.articleId) te.articleId = toStr(dh.articleId);
             const r = await this.post(`work-orders/${workOrderId}/time-entries`, te);
@@ -2411,7 +2745,7 @@ const RobawsAPI = {
             while (this._articleCacheLoading) {
                 await new Promise(r => setTimeout(r, 200));
             }
-            return this._articleCache;
+            return this._articleCache || [];  // v209: null-safe
         }
 
         this._articleCacheLoading = true;
@@ -2424,9 +2758,21 @@ const RobawsAPI = {
                 const snap = await snapRes.json();
                 const snapItems = Array.isArray(snap) ? snap : (snap.items || snap.articles || []);
                 if (Array.isArray(snapItems) && snapItems.length > 0) {
-                    this._articleCache = snapItems;
+                    // v209: snapshot dedupliceren op id — het meegeleverde
+                    // bestand bleek dezelfde artikelen tientallen keren te
+                    // bevatten (kapotte export), wat dubbele regels in de
+                    // groep-browser gaf.
+                    const seenSnap = new Set();
+                    const deduped = [];
+                    for (const a of snapItems) {
+                        const k = String(a && a.id);
+                        if (seenSnap.has(k)) continue;
+                        seenSnap.add(k);
+                        deduped.push(a);
+                    }
+                    this._articleCache = deduped;
                     this._articleCacheLoading = false;
-                    if (onProgress) onProgress(snapItems.length, snapItems.length);
+                    if (onProgress) onProgress(deduped.length, deduped.length);
                     return this._articleCache;
                 }
             }
@@ -2460,12 +2806,14 @@ const RobawsAPI = {
                 if (items.length < LIMIT) break; // laatste pagina
             }
 
-            this._articleCache = allArticles;
+            // v209: een LEGE lijst niet cachen — anders bleef de catalogus na
+            // één mislukte eerste pagina de hele sessie leeg zonder retry.
+            this._articleCache = allArticles.length > 0 ? allArticles : null;
         } finally {
             this._articleCacheLoading = false;
         }
 
-        return this._articleCache;
+        return this._articleCache || [];
     },
 
     // =============================================
@@ -2551,7 +2899,8 @@ const RobawsAPI = {
     // Image URL helper
     getImageUrl(imageId) {
         if (!imageId) return null;
-        const auth = btoa(this.API_KEY + ':' + this.API_SECRET);
+        const _ap = this._authPair();  // v231: per-werknemer key indien aanwezig
+        const auth = btoa(_ap.key + ':' + _ap.secret);
         return `${this.BASE_URL}/images/${imageId}?tenant=${this.TENANT}`;
     },
 
@@ -2619,8 +2968,23 @@ const RobawsAPI = {
                     if (seenWoIds.has(String(wo.id))) continue;
                     seenWoIds.add(String(wo.id));
                 }
+                // v213: stop-criterium op createdAt — de lijst is op createdAt
+                // gesorteerd; stoppen op wo.date brak de lus af bij één
+                // teruggedateerde recente werkbon → het cumulatief viel te
+                // laag uit en een correctie kon reeds gefactureerde uren
+                // OPNIEUW toevoegen (dubbele facturatie).
+                const created = ((wo.createdAt || wo.date || '') + '').split('T')[0];
+                if (created && created < sinceDate) { stop = true; break; }
+                // v213: oude werkbon (op datum) overslaan zonder te stoppen
                 const d = wo.date || '';
-                if (d && d < sinceDate) { stop = true; break; }
+                if (d && d < sinceDate) continue;
+                // v213: alleen werkbonnen van DEZE gebruiker — voorheen telde
+                // het cumulatief ook collega's op hetzelfde planning-item mee,
+                // waardoor een correctie van tech A de uren van tech B wegboekte.
+                if (userId != null && String(userId) !== '') {
+                    const woUser = wo.assignedUserId != null ? String(wo.assignedUserId) : null;
+                    if (woUser !== String(userId)) continue;
+                }
                 if (!wo.planningItemId) continue;
                 const key = String(wo.planningItemId);
                 if (!werkbonsPerPlanning[key]) werkbonsPerPlanning[key] = [];
@@ -2824,13 +3188,21 @@ const RobawsAPI = {
     // =============================================
     // FACTUUR AANMAKEN VANUIT WERKORDER
     // =============================================
-    async createInvoice({ workOrderId, paymentConditionId = '9', vatTariffId = '4',
+    async createInvoice({ workOrderId, paymentConditionId = '9', vatTariffId = null,
         clientId: passedClientId = null, companyId: passedCompanyId = null,
         salesOrderId = null, paymentMethod = null, notes = '',
-        materials = [], hours = [], onderhoud = false,
+        materials = [], hours = [], onderhoud = false, hoursPrerounded = false,
         userId = null, installationIds = [] }) {
 
         const toStr = v => (v == null || v === '') ? null : String(v);
+
+        // v210: GEEN stille BTW-default meer (was '4' = 6% — een klant zonder
+        // gekend tarief kreeg zo geruisloos 6% op de hele factuur). Zonder
+        // expliciet tarief wordt de factuur geweigerd; de app blokkeert dit
+        // al vóór de submit, dus dit is het laatste vangnet.
+        if (vatTariffId == null || String(vatTariffId) === '') {
+            return { success: false, error: 'Geen BTW-tarief meegegeven — factuur niet aangemaakt. Stel het BTW-tarief van de klant in (info-tab → BTW wijzigen).' };
+        }
 
         // v112: Postcode van de werf — bewaard in functie-scope. Wordt gevuld
         // wanneer we het installatie-adres ophalen voor `siteAddress`, en later
@@ -2840,6 +3212,10 @@ const RobawsAPI = {
         // i.p.v. enkel "2900".
         let invoicePostalCode = '';
         let invoiceCity       = '';
+        // v211: status-updates die falen horen zichtbaar te zijn, maar mogen
+        // de betaling NIET blokkeren (het factuurbedrag zelf klopt). Aparte
+        // lijst naast errors[] (die wél geld-fouten bevat).
+        const statusErrors = [];
 
         // Stap 1: Werkorder details
         const woResult = await this.get(`work-orders/${workOrderId}`);
@@ -2880,8 +3256,25 @@ const RobawsAPI = {
             const invFull = invGet.data;
             invFull.booked = false;
 
-            // Status "Technieker" — zodat kantoor facturen van de app kan nakijken
-            invFull.status = 'Technieker';
+            // v224: Oorsprong-extraveld i.p.v. status 'Technieker'.
+            // De status-aanpak blokkeerde de normale levenscyclus: de factuur
+            // kon nooit op 'betaald', dus klanten die ter plaatse betaalden
+            // kregen tóch aanmaningen zodra de vervaldatum verstreek. Nu
+            // blijft de status vrij voor de boekhouding en filtert Felicity
+            // de nakijklijst op Oorsprong = Technieker.
+            invFull.extraFields = invFull.extraFields || {};
+            const prevOorsprong = invFull.extraFields['Oorsprong'] || {};
+            invFull.extraFields['Oorsprong'] = Object.assign({}, prevOorsprong, {
+                stringValue: 'Technieker',
+            });
+            // v225: 'Nog te controleren'-vinkje standaard AAN — de
+            // boekhouding filtert hierop welke technieker-facturen nog
+            // nagekeken moeten worden, en vinkt het uit na controle.
+            // (Veldnaam exact zoals in Robaws — enkele l.)
+            const prevControle = invFull.extraFields['Nog te controleren'] || {};
+            invFull.extraFields['Nog te controleren'] = Object.assign({}, prevControle, {
+                booleanValue: true,
+            });
 
             // Verantwoordelijke = de ingelogde technieker (niet standaard Rolf).
             // Centrale helper gebruikt dezelfde fallback-strategie als submitWerkbon
@@ -2950,7 +3343,13 @@ const RobawsAPI = {
                     stringValue: paymentMethod,
                 };
             }
-            await this.put(`sales-invoices/${invoiceId}`, invFull);
+            // v211/v224: deze PUT was ongecontroleerd — faalde hij, dan had
+            // de factuur geen Oorsprong-veld en viel hij buiten Felicity's
+            // nakijkfilter (werd dus nooit gecontroleerd/verstuurd).
+            const statusPut = await this.put(`sales-invoices/${invoiceId}`, invFull);
+            if (statusPut.code !== 200 && statusPut.code !== 204) {
+                statusErrors.push('factuur Oorsprong/verantwoordelijke niet gezet (code ' + statusPut.code + ')');
+            }
         }
 
         // Stap 3: Line items toevoegen
@@ -3052,15 +3451,28 @@ const RobawsAPI = {
                 if (h.type && h.type !== 'klant') continue;
                 const dur = Number(h.duration || 0);
                 const salePrice = Number(h.salePrice || 0);
-                if (dur <= 0 || salePrice <= 0) continue;
+                if (dur <= 0) continue;
+                // v211: uren met prijs €0/null werden hier STIL overgeslagen —
+                // volledige arbeid ontbrak dan op de factuur zonder dat iemand
+                // het zag (bv. als de uurcode-prijs niet geladen was). Nu gaat
+                // dit in errors[] en blokkeert de app de betaling.
+                if (salePrice <= 0) {
+                    errors.push({ line: 'Werkuren (' + (dur / 60).toFixed(2) + 'u)', code: 'GEEN_PRIJS',
+                        error: 'Uurcode zonder verkoopprijs — uren NIET op de factuur gezet' });
+                    continue;
+                }
                 const artKey = h.articleId || '_default';
                 if (!hoursByArticle[artKey]) hoursByArticle[artKey] = { totalMinutes: 0, salePrice, articleId: h.articleId };
                 hoursByArticle[artKey].totalMinutes += dur;
             }
-            // Eén factuurregel per articleId, afgerond op totaal
+            // Eén factuurregel per articleId, afgerond op totaal.
+            // v212: als de app al afgerond aanlevert (hoursPrerounded — zelfde
+            // bron als werkbon en preview, incl. wacht=60min-regel) ronden we
+            // hier NIET nog eens — anders kon de factuur afwijken van wat de
+            // klant in de preview zag en tekende.
             for (const [artKey, group] of Object.entries(hoursByArticle)) {
                 const rawHrs = Math.round(group.totalMinutes / 60 * 100) / 100;
-                const billableHrs = this._roundUpHalfHour(rawHrs);
+                const billableHrs = hoursPrerounded ? rawHrs : this._roundUpHalfHour(rawHrs);
                 const desc = 'Werkuren';
                 const lineData = {
                     type: 'LINE',
@@ -3138,11 +3550,22 @@ const RobawsAPI = {
             // We ondersteunen nu zowel '1' als '5' als 21% (Robaws blijkt
             // historisch beide te gebruiken) en loggen een waarschuwing
             // i.p.v. stille foute berekening.
-            const vatRates = { '1': 0.21, '2': 0, '3': 0, '4': 0.06, '5': 0.21 };  // v182: id 2 = Verlegd (0%), niet 12%
+            // v210: percentages eerst uit de LIVE Robaws-tariefmap (één bron,
+            // dekt ook nieuwe/gewijzigde tarieven); de lokale tabel is enkel
+            // nog noodfallback als de map niet laadt.
+            let liveVatMap = null;
+            try { liveVatMap = await this.getVatTariffMap(); } catch (_) {}
+            const vatRates = { '1': 0.21, '2': 0, '3': 0, '4': 0.06, '5': 0.21 };  // noodfallback (id 2 = Verlegd, 0%)
             for (const l of lines) {
                 const lineExcl = (Number(l.quantity) || 0) * (Number(l.price) || 0) * (1 - (Number(l.discount) || 0) / 100);
                 const tariffKey = String(l.vatTariffId);
-                let vatRate = vatRates[tariffKey];
+                let vatRate;
+                const livePct = (liveVatMap && liveVatMap[tariffKey]) ? liveVatMap[tariffKey].percentage : null;
+                if (livePct != null && !isNaN(Number(livePct))) {
+                    vatRate = Number(livePct) / 100;
+                } else {
+                    vatRate = vatRates[tariffKey];
+                }
                 if (vatRate === undefined) {
                     console.warn('[Factuur] Onbekend vatTariffId:', tariffKey, '— gerekend met 0% (controleer in Robaws)');
                     vatRate = 0;
@@ -3196,11 +3619,19 @@ const RobawsAPI = {
                             stringValue: paymentMethod,
                         };
                     }
-                    await this.put(`work-orders/${workOrderId}`, woFull.data);
-                    console.log(`[RobawsAPI] Werkbon ${workOrderId} status → ${newStatus}, Betaling → ${paymentMethod}`);
+                    // v211: resultaat checken — een werkbon die níet op
+                    // 'gefactureerd' raakt, blijft op 'Uitgevoerd' staan en
+                    // kan later dubbel gefactureerd worden.
+                    const woPut = await this.put(`work-orders/${workOrderId}`, woFull.data);
+                    if (woPut.code === 200 || woPut.code === 204) {
+                        console.log(`[RobawsAPI] Werkbon ${workOrderId} status → ${newStatus}, Betaling → ${paymentMethod}`);
+                    } else {
+                        statusErrors.push('werkbon-status niet op gefactureerd (code ' + woPut.code + ')');
+                    }
                 }
             } catch(e) {
                 console.warn('[RobawsAPI] Werkbon status/Betaling updaten mislukt:', e);
+                statusErrors.push('werkbon-status niet op gefactureerd (' + (e && e.message) + ')');
             }
 
             // v88: Sales order status + Betaling extra-field updaten
@@ -3217,11 +3648,16 @@ const RobawsAPI = {
                                 stringValue: paymentMethod,
                             };
                         }
-                        await this.put(`sales-orders/${woSalesOrderId}`, soFull.data);
-                        console.log(`[RobawsAPI] Order ${woSalesOrderId} status → ${newStatus}, Betaling → ${paymentMethod}`);
+                        const soPut = await this.put(`sales-orders/${woSalesOrderId}`, soFull.data);
+                        if (soPut.code === 200 || soPut.code === 204) {
+                            console.log(`[RobawsAPI] Order ${woSalesOrderId} status → ${newStatus}, Betaling → ${paymentMethod}`);
+                        } else {
+                            statusErrors.push('order-status niet op gefactureerd (code ' + soPut.code + ')');  // v211
+                        }
                     }
                 } catch(e) {
                     console.warn('[RobawsAPI] Order status/Betaling updaten mislukt:', e);
+                    statusErrors.push('order-status niet op gefactureerd (' + (e && e.message) + ')');
                 }
             }
         }
@@ -3250,6 +3686,7 @@ const RobawsAPI = {
             },
             lineItemsAdded: addedLines,
             errors,
+            statusErrors,  // v211: niet-blokkerende status-fouten (apart van geld-fouten)
             paymentMethod,
             salesOrderId: woSalesOrderId,
             workOrder: {
@@ -3294,7 +3731,7 @@ const RobawsAPI = {
         // Robaws niet accepteert in een PUT verwijderen we expliciet.
         if (signatureName) {
             try {
-                const cur = await this.get(`work-orders/${workOrderId}`);
+                const cur = await this.get(`work-orders/${workOrderId}`, { bypassCache: true });  // v223
                 if (cur.code === 200 && cur.data) {
                     const body = { ...cur.data, signatureName };
                     // Robaws genereert deze velden zelf — niet meesturen in PUT
@@ -3416,6 +3853,59 @@ const RobawsAPI = {
      *  Moet exact matchen met de naam in Robaws Instellingen → e-mailtemplates.
      *  Bij wijziging in Robaws ook hier aanpassen. */
     EMAIL_TEMPLATE_WERKBON: 'Werkbon naar klant',
+
+    /** v222: is deze factuur al (volledig) betaald geregistreerd? Wordt
+     *  gebruikt als PRE-CHECK vóór elke betalings-POST, omdat de webhook-
+     *  Worker en de app dezelfde betaling allebei kunnen registreren
+     *  (factuur 2× betaald). true = zeker voldaan, false = nog open,
+     *  null = niet te bepalen (caller beslist zelf). */
+    /** v229: zet ALLEEN de status van een factuur ('betaald'/'opmaak'…).
+     *  Volledige GET→PUT (full replace) zodat geen velden verloren gaan;
+     *  het openstaande bedrag blijft onaangeroerd — er wordt géén betaling
+     *  geregistreerd. Gebruikt door overschrijving-ter-plaatse. */
+    async setInvoiceStatus(invoiceId, status) {
+        try {
+            const cur = await this.get(`sales-invoices/${invoiceId}`, { bypassCache: true });
+            if (cur.code !== 200 || !cur.data) {
+                return { ok: false, error: 'factuur niet leesbaar (code ' + cur.code + ')' };
+            }
+            const body = Object.assign({}, cur.data, { status: status });
+            // Robaws genereert deze velden zelf — niet meesturen in PUT
+            delete body.id;
+            delete body.createdAt;
+            delete body.updatedAt;
+            delete body.createdBy;
+            delete body.updatedBy;
+            delete body.logicId;
+            const put = await this.put(`sales-invoices/${invoiceId}`, body);
+            if (put.code !== 200 && put.code !== 204) {
+                return { ok: false, error: 'status-PUT faalde (code ' + put.code + ')' };
+            }
+            return { ok: true };
+        } catch (e) {
+            return { ok: false, error: (e && e.message) || String(e) };
+        }
+    },
+
+    async isInvoiceSettled(invoiceId) {
+        try {
+            const r = await this.get(`sales-invoices/${invoiceId}`, { bypassCache: true });
+            if (r.code !== 200 || !r.data) return null;
+            const inv = r.data;
+            const due = inv.amountDue ?? inv.openAmount ?? inv.outstandingAmount ?? null;
+            if (due != null && !isNaN(Number(due))) return Number(due) <= 0.005;
+            const paid = inv.paidAmount ?? inv.amountPaid ?? null;
+            const tot = inv.totalInclVat ?? inv.amountInclVat ?? null;
+            if (paid != null && tot != null && !isNaN(Number(paid)) && !isNaN(Number(tot))) {
+                return Number(paid) >= Number(tot) - 0.005;
+            }
+            const st = String(inv.status || '').toLowerCase();
+            if (st.includes('betaald') || st.includes('paid')) return true;
+            return null;
+        } catch (_) {
+            return null;
+        }
+    },
 
     async registerInvoicePayment({ invoiceId, amount, date, paymentMethod, reference }) {
         if (!invoiceId) return { success: false, error: 'invoiceId verplicht' };
@@ -3541,14 +4031,26 @@ const RobawsAPI = {
         } catch (e) {
             console.warn('[RobawsAPI] getVatTariffMap faalde:', e && e.message);
         }
-        this._vatTariffMapCache = map;
+        // v210: een LEGE map niet cachen — één mislukte fetch bij opstart
+        // betekende voorheen de hele sessie geen BTW-percentages (kaarten
+        // zonder %, fee-berekening op noodfallback). Nu wordt het bij de
+        // volgende aanroep gewoon opnieuw geprobeerd.
+        if (Object.keys(map).length > 0) {
+            this._vatTariffMapCache = map;
+        }
         return map;
     },
 
     _weekendHourTypesLoaded: false,
+    _weekendHourTypesLoading: false,
     async _loadWeekendHourTypeIds() {
-        if (this._weekendHourTypesLoaded) return;
-        this._weekendHourTypesLoaded = true;   // markeer direct om re-tries te vermijden
+        if (this._weekendHourTypesLoaded || this._weekendHourTypesLoading) return;
+        // v214: de loaded-vlag stond voorheen direct op true, óók bij een
+        // mislukte fetch — één hapering bij opstart en zaterdag-/zondaguren
+        // werden de hele sessie stil als weekdag geboekt. Nu: pas markeren
+        // ná een geslaagde load, zodat het bij de volgende klok-actie
+        // gewoon opnieuw geprobeerd wordt.
+        this._weekendHourTypesLoading = true;
         try {
             const res = await this.get('hour-types?limit=50');
             if (res.code !== 200) {
@@ -3566,8 +4068,11 @@ const RobawsAPI = {
             if (byName['overuren zaterdag']) this.HOUR_TYPE_IDS.overurenZaterdag = byName['overuren zaterdag'];
             if (byName['overuren zondag'])   this.HOUR_TYPE_IDS.overurenZondag   = byName['overuren zondag'];
             console.log('[RobawsAPI] weekend hourTypes:', this.HOUR_TYPE_IDS);
+            this._weekendHourTypesLoaded = true;  // v214: enkel bij succes
         } catch(e) {
             console.warn('[RobawsAPI] hour-types lookup faalde:', e && e.message);
+        } finally {
+            this._weekendHourTypesLoading = false;
         }
     },
 
@@ -3653,6 +4158,14 @@ const RobawsAPI = {
     async createTimeRegistrationWorkOrder(opts) {
         const { employeeId, employeeName, userId, dateStr, ingeklokt, tijdLabel, opmerking } = opts;
 
+        // v214: zonder userId géén tijdsregistratie aanmaken — zo'n werkbon
+        // zonder verantwoordelijke is onvindbaar voor getTodaysOpen... (dus
+        // dubbele inklok bij de volgende scan) en lekt in het dagoverzicht
+        // van álle gebruikers.
+        if (userId == null || String(userId) === '') {
+            throw new Error('Geen Robaws-gebruikers-id gekend — log opnieuw in (met internet) en probeer dan te klokken');
+        }
+
         // Stap 1: lege werkbon aanmaken
         const woRes = await this.post('work-orders', {});
         try { localStorage.setItem('qe_last_tr_post_res', JSON.stringify({code: woRes.code, data: woRes.data})); } catch(_) {}
@@ -3668,7 +4181,7 @@ const RobawsAPI = {
         // Stap 2: GET de werkbon zodat we het volledige object kunnen mergen
         let woFull;
         try {
-            const getRes = await this.get(`work-orders/${workOrderId}`);
+            const getRes = await this.get(`work-orders/${workOrderId}`, { bypassCache: true });  // v223: vers vóór full-replace-PUT
             if (getRes.code === 200 && getRes.data) {
                 woFull = getRes.data;
             }
@@ -3682,7 +4195,15 @@ const RobawsAPI = {
 
         // Stap 3: bouw merged body — bestaande velden behouden, onze velden toevoegen
         const dateLabel = this._formatDateLabel(dateStr);
-        woFull.title = `Tijdsregistratie ${employeeName || ''} - ${dateLabel}`.trim();
+        let trTitle = `Tijdsregistratie ${employeeName || ''} - ${dateLabel}`.trim();
+        // v221: bij een afwezigheid het type achter de titel — zo zie je in
+        // de Robaws-lijst meteen "... - Ziek" / "... - Verlof" zonder de
+        // registratie te moeten openen. Gewone klok-registraties (Op tijd /
+        // Te laat) blijven ongewijzigd.
+        if (tijdLabel && this.ABSENCE_TIJD.includes(String(tijdLabel).trim())) {
+            trTitle += ' - ' + String(tijdLabel).trim();
+        }
+        woFull.title = trTitle;
         woFull.date = dateStr;
         woFull.status = 'Tijdsregistratie';
         woFull.timeAndMaterial = false;
@@ -3716,7 +4237,7 @@ const RobawsAPI = {
      *      (gebruikt voor "klok-uit: ..." regel).
      */
     async setTimeRegistrationUitgeklokt(workOrderId, uitgeklokt, appendRemark) {
-        const getRes = await this.get(`work-orders/${workOrderId}`);
+        const getRes = await this.get(`work-orders/${workOrderId}`, { bypassCache: true });  // v223: vers vóór full-replace-PUT
         if (getRes.code !== 200 || !getRes.data) {
             throw new Error('GET /work-orders/' + workOrderId + ' faalde (' + getRes.code + ')');
         }
@@ -3735,7 +4256,7 @@ const RobawsAPI = {
 
     /** Update Tijd-keuze (bv. naar "Ziek"). v59: GET-then-PUT. */
     async setTimeRegistrationTijd(workOrderId, tijdLabel) {
-        const getRes = await this.get(`work-orders/${workOrderId}`);
+        const getRes = await this.get(`work-orders/${workOrderId}`, { bypassCache: true });  // v223: vers vóór full-replace-PUT
         if (getRes.code !== 200 || !getRes.data) {
             throw new Error('GET /work-orders/' + workOrderId + ' faalde (' + getRes.code + ')');
         }
@@ -3869,7 +4390,7 @@ const RobawsAPI = {
      */
     async updateBetalingField(resource, id, paymentMethod) {
         try {
-            const fullRes = await this.get(`${resource}/${id}`);
+            const fullRes = await this.get(`${resource}/${id}`, { bypassCache: true });  // v223: vers vóór full-replace-PUT
             if (fullRes.code !== 200 || !fullRes.data) {
                 return { ok: false, code: fullRes.code, error: 'GET faalde' };
             }
@@ -3924,6 +4445,9 @@ const RobawsAPI = {
      */
     async getLatestInvoiceForUser(userId, statusWhitelist) {
         if (!userId) return null;
+        // v224: app-facturen zijn voortaan herkenbaar aan het Oorsprong-
+        // extraveld (= 'Technieker'); de oude status-waarden blijven als
+        // fallback voor facturen van vóór de omschakeling.
         const whitelist = (statusWhitelist || ['Technieker', 'Gecontrolleerd']).map(s => s.toLowerCase());
         const LIMIT = 100;
         for (let p = 0; p < 5; p++) {
@@ -3933,10 +4457,12 @@ const RobawsAPI = {
             const items = (res.data && res.data.items) || [];
             if (!items.length) break;
             for (const inv of items) {
-                const st = String(inv.status || '').toLowerCase();
-                if (!whitelist.includes(st)) continue;
                 const aId = inv.assignedUserId || (inv.assignedUser && inv.assignedUser.id);
                 if (String(aId) !== String(userId)) continue;
+                const oorsprong = String((inv.extraFields && inv.extraFields.Oorsprong &&
+                    (inv.extraFields.Oorsprong.stringValue || '')) || '').toLowerCase();
+                const st = String(inv.status || '').toLowerCase();
+                if (oorsprong !== 'technieker' && !whitelist.includes(st)) continue;
                 return inv;
             }
             if (res.data.totalPages && p + 1 >= res.data.totalPages) break;
@@ -4253,6 +4779,12 @@ const RobawsAPI = {
             if ((wo.date || '').substring(0, 10) !== today) return false;
             const itemUserId = wo.assignedUserId || (wo.assignedUser && wo.assignedUser.id);
             if (!itemUserId || String(itemUserId) !== String(userId)) return false;
+            // v219: afwezigheids-registraties (Ziek/Verlof/...) zijn GEEN
+            // klok-sessies — anders toonde de telefoon van een ziekgemelde
+            // werknemer "ingeklokt" en blokkeerde inklokken bij latere komst.
+            const tijdVal = String((wo.extraFields && wo.extraFields.Tijd &&
+                (wo.extraFields.Tijd.stringValue || '')) || '').trim();
+            if (this.ABSENCE_TIJD.includes(tijdVal)) return false;
             if (onlyOpen) {
                 const uitg = (wo.extraFields && wo.extraFields.Uitgeklokt
                     && wo.extraFields.Uitgeklokt.stringValue || '').trim();
@@ -4265,7 +4797,9 @@ const RobawsAPI = {
             console.warn('[RobawsAPI] Meer dan 1 tijdsregistratie-werkbon vandaag voor user',
                 userId, '- nieuwste eerste; IDs:', items.map(i => i.id).join(','));
         }
-        items.sort((a, b) => String(b.id).localeCompare(String(a.id)));
+        // v214: numeriek sorteren — de string-sort koos rond een id-lengte-
+        // wissel ('9999' vs '10001') de verkeerde werkbon als "nieuwste".
+        items.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
         return items[0];
     },
 

@@ -909,6 +909,8 @@ textarea.form-input {
     transform: translateX(-50%) translateY(0);
     opacity: 1;
 }
+/* v205: fout-toast — rood, hoort bij toast(message, isError) in app.js */
+.toast.error { background: var(--qe-red); color: #fff; }
 
 /* ----- MODAL ----- */
 .modal-overlay {
@@ -1294,8 +1296,106 @@ body.dark-mode table th { background: #0D1117; color: #8B9AB0; }
 body.dark-mode table td { border-color: #2A3444; color: #C0CCDA; }
 body.dark-mode .offline-bar { background: #3A1A1A; }
 body.dark-mode .toast { background: #1A2332; color: #E8EDF2; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+body.dark-mode .toast.error { background: var(--qe-red); color: #fff; } /* v205 */
 body.dark-mode .day-hours-summary { background: #1A2332; border-color: #2A3444; }
 body.dark-mode #detailHeader { background: #1A2332 !important; }
 body.dark-mode .wo-card h3 { color: #E8EDF2; }
 body.dark-mode .search-box { background: #1A2332; }
 body.dark-mode .qty-btn { background: #2A3444; color: #C0CCDA; border-color: #3A4A5E; }
+
+/* =========================================================
+   LOGIN — LIQUID-ACHTERGROND  (uit Claude Design "Animated Login")
+   Twee zwevende, vervaagde merk-blobs (oranje + paars) die traag driften
+   achter het loginscherm. Puur decoratief: pointer-events:none, achter de
+   inhoud (z-index 0), en uit bij prefers-reduced-motion. Login-logica
+   (e-mail + PIN) blijft volledig onaangeroerd.
+   ========================================================= */
+.login-screen { overflow: hidden; }
+.login-screen > .login-logo,
+.login-screen > .login-subtitle,
+.login-screen > .login-card { position: relative; z-index: 1; }
+
+.login-blob {
+    position: absolute;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 0;
+    will-change: transform;
+}
+.login-blob-a {
+    width: 380px; height: 380px;
+    left: -120px; top: 60px;
+    background: radial-gradient(circle, var(--qe-orange), transparent 65%);
+    opacity: 0.14;
+    filter: blur(20px);
+    animation: qe-driftA 14s ease-in-out infinite;
+}
+.login-blob-b {
+    width: 420px; height: 420px;
+    right: -150px; bottom: -40px;
+    background: radial-gradient(circle, var(--qe-purple), transparent 65%);
+    opacity: 0.16;
+    filter: blur(22px);
+    animation: qe-driftB 17s ease-in-out infinite;
+}
+@keyframes qe-driftA {
+    0%   { transform: translate(0, 0) scale(1); }
+    50%  { transform: translate(40px, -30px) scale(1.12); }
+    100% { transform: translate(0, 0) scale(1); }
+}
+@keyframes qe-driftB {
+    0%   { transform: translate(0, 0) scale(1); }
+    50%  { transform: translate(-46px, 34px) scale(1.16); }
+    100% { transform: translate(0, 0) scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .login-blob { animation: none !important; }
+}
+
+/* ---- Vloeibaar logo (vervangt de PNG-login-logo) ---- */
+.login-logo-stage {
+    position: relative;
+    width: 168px;
+    height: 168px;
+    margin-bottom: 16px;
+    flex: none;
+}
+.login-logo-tile {
+    position: absolute;
+    inset: 0;
+    background: #fff;
+    border-radius: 34px;
+    box-shadow: 0 16px 40px rgba(0, 8, 26, 0.42);
+}
+.login-logo-mark {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+/* ---- Overlay voor de vloeibare login → app overgang (melt) ---- */
+.liquid-transition {
+    position: fixed;
+    inset: 0;
+    z-index: 300;
+    background: var(--qe-darkblue);
+    overflow: hidden;
+    display: none;
+    opacity: 0;
+    pointer-events: none;
+}
+.liquid-transition .login-logo-stage {
+    position: absolute;
+    left: calc(50% - 84px);
+    top: 160px;
+    margin: 0;
+}
+
+/* Begin-staat van de login-inhoud voor de intro-animatie. liquid-login.js
+   animeert ze in; showLogin() maakt ze sowieso zichtbaar als JS uitvalt —
+   de login mag nooit onzichtbaar blijven. */
+#loginScreen .login-logo-stage,
+#loginScreen #loginSubtitle,
+#loginScreen .login-card { opacity: 0; }
