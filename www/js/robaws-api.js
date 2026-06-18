@@ -526,6 +526,21 @@ const RobawsAPI = {
 
         console.log('[RobawsAPI] Werknemer gevonden:', employee.id, employee.firstName, employee.lastName);
 
+        // v232c: de zoek-/lijst-respons bevat soms de Werknemersrol
+        // (employeeRoleId) niet — dan viel de rol onterecht terug op de
+        // planning-groep (bv. Levi: rol Bureel, planning-groep "3. Monteur").
+        // Haal in dat geval de VOLLEDIGE fiche op zodat we de echte
+        // Werknemersrol lezen i.p.v. de planning-groep.
+        if (!employee.employeeRoleId && employee.id) {
+            try {
+                const _full = await this.get(`employees/${employee.id}`, { bypassCache: true });
+                if (_full.code === 200 && _full.data) {
+                    employee = _full.data;
+                    console.log('[RobawsAPI] Volledige fiche opgehaald — Werknemersrol-id:', employee.employeeRoleId);
+                }
+            } catch (_) {}
+        }
+
         // PIN checken via extra veld "Pincode" (groep "QE Werkbon app", type TEXT).
         // v132: ook andere veld-naam-varianten + value-types proberen voor het geval
         // de PIN handmatig in Robaws onder een afwijkende key is gezet.
