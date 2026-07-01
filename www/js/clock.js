@@ -645,12 +645,12 @@ window.QEClock = {
                     try { app.hideScanLoading(); } catch(_) {}
                 }
                 // Toon SUCCES/MISLUKT overlay als de scan-flow iets opleverde
-                if (scanResult && window.app && typeof app.showScanResult === 'function') {
+                if (scanResult && window.app) {
                     const refresh = !!scanResult.refresh;
                     const askKm = !!scanResult.askKilometers;
                     const woId = scanResult.workOrderId;
                     const empId = scanResult.employeeId;
-                    app.showScanResult(scanResult.ok, scanResult.message, async () => {
+                    const afterScan = async () => {
                         if (!refresh) return;
                         try { await this.syncWithRobaws(); } catch(_) {}
                         try { app.updateClockUI(); } catch(_) {}
@@ -662,7 +662,23 @@ window.QEClock = {
                                 console.warn('[Clock] km prompt fout:', e && e.message);
                             }
                         }
-                    });
+                    };
+                    // Uitklok-succes → geanimeerde celebratie (Claude Design "Uitklokken").
+                    // Clock-in en fouten houden de gewone SUCCES/MISLUKT-overlay.
+                    if (scanResult.ok && scanResult.celeb && window.QECeleb) {
+                        const _c = scanResult.celeb;
+                        const _nm = (user && user.name) ? String(user.name).split(' ')[0] : '';
+                        let _ht = '';
+                        if (_c.hours != null) {
+                            const _h = Number(_c.hours) || 0;
+                            _ht = Math.floor(_h) + 'u ' + Math.round((_h - Math.floor(_h)) * 60) + 'm vandaag';
+                        }
+                        QECeleb.clockOut({ weekend: !!_c.weekend, name: _nm, timeText: _c.time || '', hoursText: _ht, onDone: afterScan });
+                    } else if (typeof app.showScanResult === 'function') {
+                        app.showScanResult(scanResult.ok, scanResult.message, afterScan);
+                    } else {
+                        afterScan();
+                    }
                 }
             }
         } finally {
@@ -1026,13 +1042,20 @@ window.QEClock = {
         try {
             const exRes = await RobawsAPI.get(`work-orders/${session.workOrderId}/time-entries?limit=100`);
             const exItems = (exRes.data && (exRes.data.items || exRes.data)) || [];
+            // v245: idempotency PER TIJDSBLOK i.p.v. per werkbon. Sla enkel over
+            // als er al een getimede 185-entry bestaat die op DEZELFDE starttijd
+            // begint = een echte retry van net déze uitklok. Een TWEEDE sessie
+            // van de dag heeft een andere starttijd en moet wél geboekt worden.
+            // (Voorheen blokkeerde de entry van de 1e sessie de 2e → verloren uren.)
             alreadyPosted = exItems.some(te => {
                 const aId = te.articleId || (te.article && te.article.id);
-                return String(aId) === String(ART_MONTEUR) &&
-                       String(te.employeeId || '') === String(session.employeeId || '') &&
-                       te.startTime != null;
+                if (String(aId) !== String(ART_MONTEUR)) return false;
+                if (String(te.employeeId || '') !== String(session.employeeId || '')) return false;
+                if (te.startTime == null) return false;  // phantom/aanvul-entries hebben geen tijd → negeren
+                const sMin = (te.startTime.hour || 0) * 60 + (te.startTime.minute || 0);
+                return sMin === entryStartMin;
             });
-            if (alreadyPosted) console.log('[Clock] entries staan er al — posten overgeslagen (idempotency)');
+            if (alreadyPosted) console.log('[Clock] entry met deze starttijd staat er al — posten overgeslagen (idempotency v245)');
         } catch (_) { /* check faalt → normaal posten (oude gedrag) */ }
 
         let uitklokNote = '';
@@ -1238,6 +1261,8 @@ window.QEClock = {
 
         return {
             ok: true,
+            // Data voor de uitklok-celebratie (Claude Design "Uitklokken")
+            celeb: { weekend: isFridayParty, time: entryEnd, hours: payableHours },
             message: 'Uitgeklokt om ' + entryEnd + '\n' +
                 'Uren: ' + entryStart + ' - ' + entryEnd +
                 ' (' + pauseMinutes + 'min pauze)' + uitklokNote + openLLNote +
@@ -2019,9 +2044,11 @@ window.QEClock = {
                 return fd ? String(fd.stringValue ?? fd.value ?? '').trim() : '';
             } catch (_) { return ''; }
         };
-        // v219: ÁL het personeel tonen — bureel ziet van elkaar wie er is
-        // (was: bureel uitgefilterd).
-        const entries = Object.entries(RobawsAPI.EMPLOYEES);
+        // v219: ÁL het personeel tonen — bureel ziet van elkaar wie er is.
+        // v244: live ACTIEVE werknemers (stopgezette eruit, nieuwe erbij) i.p.v.
+        // de statische EMPLOYEES-map.
+        const activeEmps = await RobawsAPI.getActiveEmployees();
+        const entries = activeEmps.map(e => [e.email, e]);
         const out = await Promise.all(entries.map(async ([email, emp]) => {
             const wo = byUser[String(emp.userId)] || null;
             let startuur = '', pauze = null;

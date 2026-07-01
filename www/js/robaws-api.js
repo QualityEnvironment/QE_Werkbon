@@ -67,7 +67,7 @@ const RobawsAPI = {
 
     // v219: Tijd-types die een AFWEZIGHEID zijn (de Robaws-keuzelijst minus
     // "Op tijd"/"Te laat"). Eén bron voor klok, aanwezigheid en dagoverzicht.
-    ABSENCE_TIJD: ['Ziek', 'Betaalde feestdag', 'Inhaal rustdag', 'Verlof', 'Sociaal verlof'],
+    ABSENCE_TIJD: ['Ziek', 'Betaalde feestdag', 'Inhaal rustdag', 'Verlof', 'Sociaal verlof', 'Tijdelijke werkloosheid'],
 
     // v222b: vaste ontvangers voor automatische taken — één plek i.p.v.
     // losse hardcoded id's. Facturen & betalingen → Els (boekhouding),
@@ -845,6 +845,97 @@ const RobawsAPI = {
         } while (page < 10);
         out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
         return out;
+    },
+
+    /** v244: rol afleiden uit een Robaws-employee (zoals app._adminRoleKey). */
+    _roleFromEmployee(e) {
+        const id = String((e && e.employeeRoleId) || '');
+        if (id === '1') return 'monteur';
+        if (id === '34') return 'technieker';
+        if (id === '42' || id === '35') return 'bureel';
+        const pg = String((e && (e.planningGroupName || e.planningGroup)) || '').toLowerCase();
+        if (pg.includes('monteur')) return 'monteur';
+        if (pg.includes('bureel') || pg.includes('kantoor') || pg.includes('projectleider')) return 'bureel';
+        return 'technieker';
+    },
+
+    /**
+     * v244: LIVE lijst van ACTIEVE werknemers uit Robaws (stopgezette eruit,
+     * nieuwe automatisch erbij). Vervangt de statische EMPLOYEES-map voor
+     * team-aanwezigheid en "Afwezigheid melden". Vorm per item:
+     *   { email, employeeId, userId, name, role }  (zelfde als oude EMPLOYEES).
+     * 5-min cache (force:true ververst). Valt bij API-fout terug op de
+     * statische EMPLOYEES zodat de schermen nooit leeg blijven.
+     */
+    async getActiveEmployees({ force = false } = {}) {
+        const now = Date.now();
+        if (!force && this._activeEmpCache && (now - this._activeEmpCache.at) < 5 * 60 * 1000) {
+            return this._activeEmpCache.list;
+        }
+        try {
+            // 1) users → map employeeId/email → userId
+            const userByEmp = {}, userByEmail = {};
+            let up = 0;
+            do {
+                const r = await this.get(`users?limit=100&offset=${up * 100}`, { bypassCache: true });
+                if (r.code !== 200 || !r.data) break;
+                const list = r.data.items || (Array.isArray(r.data) ? r.data : []);
+                if (!list.length) break;
+                for (const u of list) {
+                    const uid = u.id;
+                    const eid = u.employeeId || (u.employee && u.employee.id);
+                    const em = String(u.email || u.emailAddress || u.username || '').toLowerCase();
+                    if (uid != null && eid != null) userByEmp[String(eid)] = uid;
+                    if (uid != null && em) userByEmail[em] = uid;
+                }
+                up++;
+                if (up >= (r.data.totalPages || 1)) break;
+            } while (up < 10);
+
+            // 2) employees → enkel ACTIEVE, verrijkt met userId + rol
+            const out = [];
+            let ep = 0;
+            do {
+                const res = await this.get(`employees?limit=100&offset=${ep * 100}`, { bypassCache: true });
+                const items = (res.data && res.data.items) || [];
+                if (!items.length) break;
+                for (const e of items) {
+                    const ef = e.extraFields || {};
+                    const status = String(e.status || (ef['Status'] && ef['Status'].stringValue) || '').trim();
+                    if (status.toLowerCase().includes('stopgezet')) continue;  // stopgezette overslaan
+                    const email = String(e.email || '').toLowerCase();
+                    const eid = e.id;
+                    const userId = userByEmp[String(eid)] || (email && userByEmail[email]) || null;
+                    out.push({
+                        email,
+                        employeeId: eid,
+                        userId,
+                        name: [e.firstName, e.lastName].filter(Boolean).join(' ') || e.fullName || e.name || e.email || '(naamloos)',
+                        role: this._roleFromEmployee(e),
+                    });
+                }
+                ep++;
+                if (ep >= ((res.data && res.data.totalPages) || 1)) break;
+            } while (ep < 10);
+
+            if (out.length) {
+                out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+                this._activeEmpCache = { at: now, list: out };
+                return out;
+            }
+        } catch (e) {
+            console.warn('[RobawsAPI] getActiveEmployees faalde — terugval op statische EMPLOYEES:', e && e.message);
+        }
+        // Fallback: statische map (zodat schermen niet leeg blijven)
+        return Object.entries(this.EMPLOYEES).map(([email, v]) => ({ email, ...v }));
+    },
+
+    /** v244: zelfde actieve lijst maar als email→record map (snelle lookup). */
+    async getActiveEmployeesMap() {
+        const list = await this.getActiveEmployees();
+        const map = {};
+        for (const e of list) if (e.email) map[e.email] = e;
+        return map;
     },
 
     /** Vers ophalen → muteer → full-replace PUT. */
@@ -2217,7 +2308,13 @@ const RobawsAPI = {
                 let addr = null;
                 if (planningItemId) {
                     const p = await this.get(`planning-items/${planningItemId}`);
-                    if (p.code === 200 && p.data && p.data.address) addr = p.data.address;
+                    if (p.code === 200 && p.data) {
+                        if (p.data.address) addr = p.data.address;
+                        // v243: project van de dagplanning overnemen op de werkbon
+                        // (Robaws DayPlanningItemReadDTO.projectId → WorkOrder.projectId).
+                        // Voorheen werd het project nooit mee overgenomen op de werkbon.
+                        if (p.data.projectId) body.projectId = toStr(p.data.projectId);
+                    }
                 }
                 if (!addr && clientId) {
                     const c = await this.get(`clients/${clientId}`);

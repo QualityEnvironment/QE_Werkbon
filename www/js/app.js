@@ -33,6 +33,7 @@ const app = {
         'Betaalde feestdag':    { color: '#b8860b', bg: '#fff8e1', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px"><rect x="4" y="9" width="16" height="11" rx="1"/><path d="M4 13h16M12 9v11"/><path d="M12 9C9 9 7.5 7.5 8 6s3-1 4 3c1-4 3.5-4.5 4-3s-1 3-4 3z"/></svg>', label: 'Betaalde feestdag' },
         'Inhaal rustdag':       { color: '#00695c', bg: '#e0f2f1', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px"><path d="M20 14A8 8 0 0 1 10 4a7 7 0 1 0 10 10z"/></svg>', label: 'Inhaal rustdag' },
         'Sociaal verlof':       { color: '#6a1b9a', bg: '#f3e5f5', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px"><circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0"/><path d="M16 5.2a3 3 0 0 1 0 5.6M21 20a6 6 0 0 0-4.5-5.8"/></svg>', label: 'Sociaal verlof' },
+        'Tijdelijke werkloosheid': { color: '#455a64', bg: '#eceff1', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px"><circle cx="12" cy="12" r="9"/><path d="M10 9v6M14 9v6"/></svg>', label: 'Tijdelijke werkloosheid' },
     },
 
     _getTijdStyle(tijd) {
@@ -45,7 +46,7 @@ const app = {
     _isAbsenceTijd(tijd) {
         return tijd === 'Ziek' || tijd === 'Verlof'
             || tijd === 'Betaalde feestdag' || tijd === 'Inhaal rustdag'
-            || tijd === 'Sociaal verlof';
+            || tijd === 'Sociaal verlof' || tijd === 'Tijdelijke werkloosheid';
     },
 
     _localDateStr(d, offsetDays) {
@@ -1188,7 +1189,7 @@ const app = {
     // ========================================
     // Wordt aangeroepen door clock.js vóór `_clockOut`. Gedrag:
     //  - Geen openstaande werkbons → laat uitklokken door (return true).
-    //  - Bureel + ≥1 openstaande → blokkeer (return false).
+    //  - Bureel + ≥1 openstaande → vraag bevestiging (mag dag eindigen, zoals technieker). (v165)
     //  - Technieker + ≥1 openstaande → vraag bevestiging:
     //        Ja → laat uitklokken door (return true). Werkbon blijft open.
     //        Nee → blokkeer (return false). (v167)
@@ -1234,20 +1235,12 @@ const app = {
         // Vanaf hier komen er modals — spinner verbergen zodat die zichtbaar zijn
         hideLoad();
 
-        // Bureel: altijd blokkeren bij open (geen werkbon-overname mogelijk)
         const activeRole = this._activeRole();
-        if (activeRole === 'bureel') {
-            await this._showMessageModal(
-                'Openstaande werkbon',
-                `Je hebt nog ${openItems.length} openstaande ${openItems.length === 1 ? 'werkbon' : 'werkbons'}. ` +
-                'Werk die eerst af voor je uitklokt.'
-            );
-            return false;
-        }
 
-        // v167: Technieker mag dag eindigen met open werkbons — via bevestigingsdialog.
-        // De werkbons blijven open zoals ze zijn; de technieker kan ze morgen verder afmaken.
-        if (activeRole === 'technieker') {
+        // v165: Bureel én technieker mogen de dag eindigen met open werkbons —
+        // via een bevestigingsdialog. De werkbons blijven open zoals ze zijn en
+        // kunnen later verder afgewerkt worden. (Voorheen blokkeerde bureel altijd.)
+        if (activeRole === 'technieker' || activeRole === 'bureel') {
             const accepted = await this._showTechniekerEndDayConfirm(openItems);
             return accepted;   // true = dag beëindigen, false = blijf ingeklokt
         }
@@ -6574,6 +6567,16 @@ const app = {
     },
 
     async _onQrBetaald(status, invoiceResult) {
+        // Geanimeerde 'Betaling geslaagd'-celebratie (Claude Design "Betaling").
+        try {
+            if (window.QECeleb) {
+                const _inv = (invoiceResult && invoiceResult.invoice) || {};
+                const _amt = (_inv.totalInclVat != null)
+                    ? this.formatPrice(parseFloat(_inv.totalInclVat))
+                    : (status && status.amount ? '€ ' + status.amount : '');
+                QECeleb.paymentSuccess({ amountText: _amt, methodLabel: 'Bancontact · QR code' });
+            }
+        } catch (e) { /* celebratie mag de betaling nooit breken */ }
         const container = document.getElementById('overschrijvingContent');
         if (container) {
             container.innerHTML =
@@ -7354,27 +7357,35 @@ const app = {
     // overgeslagen. Dankzij de absence-filter in getTodaysOpen... telt zo'n
     // registratie NIET als open klok-sessie op de telefoon van de werknemer.
     // ========================================
-    openAfwezigheid() {
+    async openAfwezigheid() {
         const user = RobawsAPI.getLoggedInUser();
         if (!user || user.role !== 'bureel') return;
         const vanEl = document.getElementById('afwVan');
         const totEl = document.getElementById('afwTot');
         if (vanEl && !vanEl.value) vanEl.value = this._localDateStr();
         if (totEl) totEl.value = '';
-        const cont = document.getElementById('afwWerknemers');
-        if (cont) {
-            cont.innerHTML = Object.entries(RobawsAPI.EMPLOYEES).map(([email, emp]) => {
-                const safe = String(email).replace(/[^\w@.-]/g, '');
-                return `
-                <label style="display:flex;align-items:center;gap:10px;padding:7px 2px;border-bottom:1px solid #f0f0f0;font-size:14px">
-                    <input type="checkbox" class="afw-emp" value="${safe}" style="width:18px;height:18px">
-                    <span>${this.escapeHtml(emp.name)} <span style="font-size:11px;color:var(--qe-grey)">(${this.escapeHtml(emp.role)})</span></span>
-                </label>`;
-            }).join('');
-        }
         const res = document.getElementById('afwResult');
         if (res) res.style.display = 'none';
+        const cont = document.getElementById('afwWerknemers');
+        if (cont) cont.innerHTML = '<div class="spinner"></div>';
         this.navigate('screenAfwezigheid');
+        // v244: live ACTIEVE werknemers (stopgezette eruit, nieuwe erbij)
+        if (cont) {
+            try {
+                const emps = await RobawsAPI.getActiveEmployees();
+                cont.innerHTML = emps.map(emp => {
+                    // v245: identificeer op employeeId i.p.v. e-mail (e-mail is in
+                    // Robaws niet altijd ingevuld → gaf 'onbekend' bij opslaan).
+                    return `
+                <label style="display:flex;align-items:center;gap:10px;padding:7px 2px;border-bottom:1px solid #f0f0f0;font-size:14px">
+                    <input type="checkbox" class="afw-emp" value="${this.escapeHtml(String(emp.employeeId))}" style="width:18px;height:18px">
+                    <span>${this.escapeHtml(emp.name)} <span style="font-size:11px;color:var(--qe-grey)">(${this.escapeHtml(emp.role)})</span></span>
+                </label>`;
+                }).join('');
+            } catch (e) {
+                cont.innerHTML = '<p class="text-grey text-sm text-center">Werknemers laden mislukt — sleep omlaag of probeer opnieuw</p>';
+            }
+        }
     },
 
     afwToggleAll() {
@@ -7390,12 +7401,12 @@ const app = {
         const type = document.getElementById('afwType')?.value || '';
         const van = document.getElementById('afwVan')?.value || '';
         const tot = document.getElementById('afwTot')?.value || van;
-        const emails = Array.from(document.querySelectorAll('.afw-emp:checked')).map(b => b.value);
+        const ids = Array.from(document.querySelectorAll('.afw-emp:checked')).map(b => b.value);
         const resEl = document.getElementById('afwResult');
         const show = (html) => { if (resEl) { resEl.style.display = 'block'; resEl.style.padding = '12px'; resEl.innerHTML = html; } };
 
         if (!type || !van) { this.toast('Kies een type en een datum', true); return; }
-        if (emails.length === 0) { this.toast('Selecteer minstens één werknemer', true); return; }
+        if (ids.length === 0) { this.toast('Selecteer minstens één werknemer', true); return; }
         if (tot < van) { this.toast('"Tot en met" ligt vóór "Van"', true); return; }
 
         // Werkdagen opbouwen (za/zo overslaan), veiligheidscap 31 dagen
@@ -7411,19 +7422,26 @@ const app = {
         }
         if (dagen.length === 0) { this.toast('Geen werkdagen in de gekozen periode (za/zo worden overgeslagen)', true); return; }
 
-        const totaal = dagen.length * emails.length;
-        if (!confirm(type + ' registreren voor ' + emails.length + ' werknemer(s) × ' + dagen.length + ' werkdag(en) = ' + totaal + ' registratie(s)?')) return;
+        const totaal = dagen.length * ids.length;
+        if (!confirm(type + ' registreren voor ' + ids.length + ' werknemer(s) × ' + dagen.length + ' werkdag(en) = ' + totaal + ' registratie(s)?')) return;
 
         this._afwBusy = true;
         const btn = document.getElementById('btnAfwSubmit');
         if (btn) { btn.disabled = true; btn.textContent = 'Bezig...'; }
         let ok = 0;
         const fouten = [];
+        // v245: opzoeken op employeeId i.p.v. e-mail — een e-mailadres is in
+        // Robaws niet gegarandeerd ingevuld (daardoor kreeg je 'onbekend' voor
+        // wie geen/ander e-mailadres had, bv. Yassine).
+        const emps = await RobawsAPI.getActiveEmployees();
+        const byId = {};
+        for (const e of emps) byId[String(e.employeeId)] = e;
         try {
             show('Bezig: 0/' + totaal + '...');
-            for (const email of emails) {
-                const emp = RobawsAPI.EMPLOYEES[email];
-                if (!emp) { fouten.push(email + ': onbekende werknemer'); continue; }
+            for (const id of ids) {
+                const emp = byId[String(id)];
+                if (!emp) { fouten.push('werknemer #' + id + ': onbekend'); continue; }
+                if (!emp.userId) { fouten.push((emp.name || ('#' + id)) + ': geen Robaws-gebruiker gekoppeld'); continue; }
                 for (const dag of dagen) {
                     try {
                         // Géén ingeklokt-tijd en géén time-entries: afwezigheid
@@ -7715,47 +7733,18 @@ const app = {
     },
 
     async finishCashPayment() {
-        // v222: cash REGISTREREN in Robaws — contant geld komt nooit via de
-        // bank-OGM-matching binnen, dus zonder registratie bleef de factuur
-        // open staan en kreeg de klant later een aanmaning. Met saldo-
-        // precheck (dubbel boeken uitgesloten) en bureel-taak als vangnet.
-        const ctx = this._cashCtx;
+        // v243: cash NIET meer automatisch afpunten in Robaws. De boekhouder
+        // boekt de contante betaling zelf zodra ze het geld van de technieker
+        // ontvangt (manuele controle). De factuur blijft dus open tot zij ze
+        // afpunt — de app zet ze NIET op betaald. De betaalmethode 'Cash' staat
+        // al op de werkbon, dus de contante facturen blijven makkelijk
+        // terugvindbaar. (Was v222: registreerde de betaling automatisch, wat
+        // hier niet gewenst is.)
         this._cashCtx = null;
-        this.toast('Werkbon verstuurd — contant betaald');
+        this.toast('Werkbon verstuurd — contant');
         this.navigate('screenPlanning', false);
         this.screenHistory = [];
         this.loadPlanning();
-        if (!ctx || !ctx.invoiceId) return;
-        try {
-            const settled = await RobawsAPI.isInvoiceSettled(ctx.invoiceId);
-            if (settled === true) return;  // al geboekt
-            const res = await RobawsAPI.registerInvoicePayment({
-                invoiceId: ctx.invoiceId,
-                amount: ctx.amount,
-                paymentMethod: 'Cash',
-                reference: 'cash-' + Date.now(),
-            });
-            if (res && res.success) {
-                setTimeout(() => this.toast('Factuur ' + (ctx.logicId || ctx.invoiceId) + ' op betaald (cash)'), 1200);
-                return;
-            }
-            throw new Error((res && res.error) || 'registratie geweigerd');
-        } catch (e) {
-            console.warn('[Cash] registratie mislukt:', e && e.message);
-            try {
-                await RobawsAPI.post('tasks', {
-                    title: 'Cash ontvangen - betaling handmatig boeken',
-                    description: 'Contante betaling van €' + (ctx.amount || '?') + ' ontvangen voor factuur ' +
-                        (ctx.logicId || ctx.invoiceId) + ', maar de app kon de betaling niet registreren (' +
-                        ((e && e.message) || '?') + '). Gelieve handmatig op betaald te zetten.',
-                    status: 'Te doen',
-                    assignedUserId: RobawsAPI.TASK_USERS.FACTUREN,  // v222b: Els
-                });
-                setTimeout(() => this.toast('Cash genoteerd — bureel boekt de betaling (taak aangemaakt)', true), 1200);
-            } catch (e2) {
-                setTimeout(() => this.toast('Let op: cash-betaling NIET geregistreerd — meld aan bureel (factuur ' + (ctx.logicId || ctx.invoiceId) + ')', true), 1200);
-            }
-        }
     },
 
     async startTerminalPayment(invoiceId, amount, ogm, invoiceLogicId) {
