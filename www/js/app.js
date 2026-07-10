@@ -1,4 +1,4 @@
-/**
+﻿/**
  * QE Werkbon App — Main Application Logic
  * Quality Environment bvba
  */
@@ -141,6 +141,10 @@ const app = {
     // INITIALIZATION
     // ========================================
     async init() {
+        // Toegankelijkheid vroeg toepassen — ook op het login-scherm (v280).
+        try { this._migrateA11y(); this._applyA11y(); } catch (_e) {}
+        this._installPullRefreshGuard();
+
         // BUG-fix: globale handler voor unhandled promise-rejections.
         // Voorkomt dat fouten stilletjes verloren gaan en helpt bij debug.
         if (!window._qeRejectionHandlerInstalled) {
@@ -161,6 +165,14 @@ const app = {
         // de app naar het vorige scherm te navigeren.
         if (!window._qeBackHandlerInstalled) {
             window.addEventListener('popstate', () => {
+                // 0. Fullscreen PDF-overlay heeft voorrang: sluit hem + compenseer de pop
+                //    (v283 — anders navigeert de back-knop ONDER de overlay door).
+                const pdfOv = document.getElementById('pdfFullscreen');
+                if (pdfOv) {
+                    this._closePdfFullscreen();
+                    try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
+                    return;
+                }
                 // 1. Modal heeft prioriteit: sluit hem en compenseer de pop
                 const modal = document.getElementById('modalOverlay');
                 if (modal && modal.classList.contains('show')) {
@@ -482,6 +494,7 @@ const app = {
         // te wissen. Daardoor lekte woData/favorites/pending payments
         // van de vorige user naar de volgende op hetzelfde toestel.
         try { await fetch('api/auth.php?action=logout'); } catch(e) {}
+        try { if (window.QEBridge && QEBridge.setApprovalUser) QEBridge.setApprovalUser('', '', '', '', '', ''); } catch(_e) {}
 
         // Wis enkel sleutels die user-gebonden zijn. Sleutels die voor
         // het apparaat zelf bedoeld zijn (NFC-tag mappings, app versie
@@ -565,15 +578,12 @@ const app = {
             && (this._isDebugBuild() || this.ENABLE_MOLLIE_IN_RELEASE === true);
     },
     _applyCardPaymentMode() {
-        const on = this._mollieActive();   // v255: momenteel altijd false
-        const set = (id, show, flex) => {
-            const el = document.getElementById(id);
-            if (el) el.style.display = show ? (flex ? 'flex' : '') : 'none';
-        };
-        set('payMollieBtn', on, false);     // Mollie Tap actief (alleen na heractivering)
-        set('payMollieLocked', !on, true);  // Mollie Tap vergrendeld (huidige stand)
-        set('payVivaBtn', false, false);    // v255: Viva verwijderd uit de methodes
-        set('payVivaLocked', false, true);  // v255: ook de vergrendeld-kaart weg
+        // (v310 / 1.x v304) De Mollie Tap-methode ("Bancontact / kaart") is op
+        // vraag van Levi VERWIJDERD uit de werkbon-UI (de knoppen bestaan niet
+        // meer in index.html); de methode "Terminal" heet voortaan Bancontact.
+        // Deze functie blijft als no-op zodat bestaande aanroepen niet breken;
+        // de diepe Tap-code (payWithMollieTap e.d.) blijft slapend aanwezig,
+        // afgeschermd door ENABLE_MOLLIE_TAP:false (zelfde patroon als Viva).
     },
 
     // Login-succes → vloeibare overgang: het QE-logo smelt weg tot een draaiend
@@ -624,8 +634,18 @@ const app = {
         }
         // Start polling voor nieuwe planning-items
         this.startPlanningPoll();
-        // Dark mode herstellen
-        if (localStorage.getItem('qe_dark_mode') === '1') document.body.classList.add('dark-mode');
+        // Toegankelijkheid + thema herstellen (v280): schaal, vet, contrast,
+        // minder beweging, kleurenblind-correctie/-palet en donker thema.
+        this._migrateA11y();
+        this._applyA11y();
+
+        // v292: native poller weet wie is ingelogd + de key (voor de goedkeuringen-melding).
+        try {
+            const _apu = RobawsAPI.getLoggedInUser();
+            const _emp = (this.currentUser && this.currentUser.robawsEmployeeId) || '';
+            const _ap = RobawsAPI._authPair ? RobawsAPI._authPair() : {};
+            if (window.QEBridge && QEBridge.setApprovalUser) QEBridge.setApprovalUser(String(_emp), String((_apu && _apu.role) || ''), String((_ap && _ap.key) || ''), String((_ap && _ap.secret) || ''), String(RobawsAPI.TENANT || ''), String(this._myRobawsUserId() || ''));
+        } catch (_e) {}
     },
 
     // ========================================
@@ -711,9 +731,8 @@ const app = {
         });
         const msg = document.getElementById('profilePinMsg');
         if (msg) { msg.textContent = ''; msg.style.color = ''; }
-        // Dark mode toggle synchroniseren
-        const dmToggle = document.getElementById('darkModeToggle');
-        if (dmToggle) dmToggle.checked = document.body.classList.contains('dark-mode');
+        // Toegankelijkheid-bediening gelijkzetten met de bewaarde voorkeuren (v280)
+        this._syncA11yControls();
         // App-versie tonen — Web (= www/git versie uit version.json)
         // en APK-versie (uit native bridge, vereist v106+ APK; degradeert sierlijk).
         const versionEl = document.getElementById('appVersionInfo');
@@ -743,6 +762,21 @@ const app = {
         const updateStatus = document.getElementById('updateStatus');
         if (updateStatus) updateStatus.style.display = 'none';
 
+        // (v306 / 1.x v301) API-tegoed vandaag (bureel) — uit de laatst geziene
+        // rate-limit-headers (gratis meegelift, kost geen extra calls).
+        const quotaEl = document.getElementById('apiQuotaInfo');
+        if (quotaEl) {
+            const _qu = RobawsAPI.getLoggedInUser();
+            if (_qu && _qu.role === 'bureel' && RobawsAPI.getRateStats) {
+                const s = RobawsAPI.getRateStats();
+                const fmtP = (p) => p ? (p.remaining.toLocaleString('nl-BE') + ' / ' + p.limit.toLocaleString('nl-BE')) : '—';
+                quotaEl.textContent = 'API-tegoed vandaag — lezen (replica): ' + fmtP(s.replica) + ' · live: ' + fmtP(s.live);
+                quotaEl.style.display = 'block';
+            } else {
+                quotaEl.style.display = 'none';
+            }
+        }
+
         // v117: rol-switcher card vullen + tonen (alleen voor bureel/technieker)
         this.renderRoleSwitch();
 
@@ -753,84 +787,23 @@ const app = {
             adminCard.style.display = (_u && _u.role === 'bureel') ? 'block' : 'none';
         }
 
+        // v278: verlof-goedkeuren-ingang verhuisd naar de Aanvragen-tab
+
         // v247: Uren-analyse enkel voor geselecteerd bureel (Levi & Vince)
         const uaCard = document.getElementById('urenAnalyseCard');
         if (uaCard) uaCard.style.display = this._isUrenAnalyseAllowed() ? 'block' : 'none';
 
-        // === DEBUG NFC TESTER — verwijder dit blok na security audit ===
-        // Toont alleen een knop als debug-nfc.html bestaat (= debug-build).
-        // In de productie-versie bestaat die file niet en gebeurt er niets.
-        this._maybeShowNfcTesterButton();
-        // === EINDE DEBUG NFC TESTER ===
+        // v280: de "Werknemers"-sectie enkel tonen als er iets in staat
+        // (Beheer/Afwezigheid voor bureel, of Uren-analyse voor Levi & Vince).
+        const werknSection = document.getElementById('pgSectionWerknemers');
+        if (werknSection) {
+            const _wu = RobawsAPI.getLoggedInUser();
+            const _isBureel = !!(_wu && _wu.role === 'bureel');
+            werknSection.style.display = (_isBureel || this._isUrenAnalyseAllowed()) ? '' : 'none';
+        }
 
         this.navigate('screenProfile');
     },
-
-    // === DEBUG NFC TESTER — verwijder deze methode na security audit ===
-    _maybeShowNfcTesterButton() {
-        // Alleen voor Levi tonen — security audit is admin-only.
-        const email = (this.currentUser && this.currentUser.email || '').toLowerCase();
-        if (email !== 'levi@qe.be') {
-            const existing = document.getElementById('btnDebugNfcTester');
-            if (existing && existing.parentElement) existing.parentElement.remove();
-            this._nfcTesterChecked = true;
-            this._nfcTesterAvailable = false;
-            return;
-        }
-        if (this._nfcTesterChecked) {
-            const btn = document.getElementById('btnDebugNfcTester');
-            if (btn) btn.style.display = this._nfcTesterAvailable ? 'block' : 'none';
-            return;
-        }
-        let done = false;
-        const finish = (exists, why) => {
-            if (done) return;
-            done = true;
-            this._nfcTesterChecked = true;
-            this._nfcTesterAvailable = exists;
-            console.log('[DebugNFC] available=' + exists + ' (' + why + ')');
-            if (exists) this._injectNfcTesterButton();
-        };
-        try {
-            const xhr = new XMLHttpRequest();
-            xhr.open('GET', 'debug-nfc.html', true);
-            xhr.timeout = 5000;
-            xhr.onload = () => {
-                const text = xhr.responseText || '';
-                console.log('[DebugNFC] xhr.status=' + xhr.status + ' text.length=' + text.length);
-                const exists = text.length > 100 && text.indexOf('NFC Security Tester') !== -1;
-                finish(exists, exists ? 'xhr-found' : 'xhr-no-marker');
-            };
-            xhr.onerror = () => finish(false, 'xhr-error');
-            xhr.ontimeout = () => finish(false, 'xhr-timeout');
-            xhr.send();
-        } catch(e) {
-            finish(false, 'xhr-exception: ' + e.message);
-        }
-    },
-    _injectNfcTesterButton() {
-        const profile = document.getElementById('screenProfile');
-        if (!profile || document.getElementById('btnDebugNfcTester')) return;
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.style.cssText = 'margin-bottom:12px;background:rgba(198,40,40,0.08);border:2px solid #C62828';
-        card.innerHTML = `
-            <div style="font-size:14px;font-weight:600;color:#C62828">🔓 NFC Security Tester</div>
-            <div style="font-size:12px;color:var(--qe-grey);margin:4px 0 8px">Debug-tool om NFC-tags te scannen en kraakbaarheid te beoordelen.</div>
-            <button id="btnDebugNfcTester" class="btn btn-full"
-                style="background:#C62828;color:#fff;padding:12px"
-                onclick="window.location='debug-nfc.html'">🔓 Open NFC tester</button>
-        `;
-        // .card:has() werkt niet in oudere WebViews — gebruik manuele loop
-        let pinCard = null;
-        const cards = profile.querySelectorAll('.card');
-        for (const c of cards) {
-            if (c.querySelector('#profileOldPin')) { pinCard = c; break; }
-        }
-        if (pinCard) profile.insertBefore(card, pinCard);
-        else profile.appendChild(card);
-    },
-    // === EINDE DEBUG NFC TESTER ===
 
     // ================= v247: UREN-ANALYSE (bureel: Levi & Vince) =================
     UREN_ANALYSE_WHITELIST: ['levi@qe.be', 'vince@qe.be'],
@@ -1479,7 +1452,7 @@ const app = {
                 <p style="font-size:14px;color:var(--qe-grey);margin:8px 0 14px">
                     Je hebt nog ${count} openstaande ${woordvorm}:
                 </p>
-                <div style="background:#fff8e1;border-radius:10px;padding:14px;margin-bottom:14px;border-left:4px solid #f59e0b">
+                <div style="background:var(--awash);border-radius:10px;padding:14px;margin-bottom:14px;border-left:3px solid var(--amber)">
                     ${lijst}
                     ${meer}
                 </div>
@@ -1675,10 +1648,16 @@ const app = {
             screenCorrectie: 'Werkbon corrigeren',
             screenProfile: 'Mijn profiel',
             screenDagoverzicht: 'Mijn registraties',
+            screenRecap: 'Maandrecap',  // v288
+            screenJaar: 'Jaaroverzicht',  // v290
             screenAanpassing: 'Aanpassing aanvragen',
             screenOverschrijving: 'Overschrijving',
             screenClock: 'Klok',
             screenAfwezigheid: 'Afwezigheid melden',  // v219
+            screenAanvragen: 'Aanvragen',  // v278
+            screenVerlofDetail: 'Verlofaanvraag',  // v278
+            screenGoedkeuren: 'Goedkeuren',  // v278
+            screenFactuurDetail: 'Factuur',  // v283
             screenAdmin: 'Beheer',  // v233
             screenUrenAnalyse: 'Uren-analyse',  // v247
         };
@@ -1686,7 +1665,7 @@ const app = {
 
         const backBtn = document.getElementById('headerBack');
         // Geen back-button op hoofdschermen EN op betaalschermen (factuur is al aangemaakt, mag niet herhaald worden)
-        const noBackScreens = ['screenPlanning', 'screenUitgevoerd', 'screenDagoverzicht', 'screenClock', 'screenPayment', 'screenOverschrijving'];
+        const noBackScreens = ['screenPlanning', 'screenUitgevoerd', 'screenAanvragen', 'screenClock', 'screenPayment', 'screenOverschrijving'];
         backBtn.classList.toggle('visible', !noBackScreens.includes(screenId));
 
         // Scroll to top
@@ -1699,6 +1678,8 @@ const app = {
         if (screenId === 'screenClock') this.onNavigateToClock();
         if (screenId === 'screenAdmin') this.loadAdmin();
         if (screenId === 'screenUrenAnalyse') this.onNavigateToUrenAnalyse();
+        if (screenId === 'screenAanvragen') this.openAanvragenTab();  // v278
+        if (screenId === 'screenGoedkeuren') this.loadGoedkeuren();  // v278
 
         // v137: toon FAB enkel op planning-tab + niet voor monteurs
         this._updateNewWoFabVisibility();
@@ -2698,6 +2679,8 @@ const app = {
 
     toggleTimer(type) {
         if (!this.timer.running) {
+            // v275: haptiek "timer start" — korte tik (Marble-tabel). No-op in 1.x.
+            try { if (window.QEMarble && QEMarble.haptic) QEMarble.haptic('timer'); } catch (_) {}
             this.timer.running = true;
             this.timer.type = type;
             // Sanity: als elapsed ongeldig is (null, NaN, negatief, >24u), reset naar 0
@@ -2742,6 +2725,8 @@ const app = {
 
     stopTimer() {
         if (this.timer.running || this.timer.elapsed > 0) {
+            // v275: haptiek "timer stop" — korte tik (Marble-tabel). No-op in 1.x.
+            try { if (window.QEMarble && QEMarble.haptic) QEMarble.haptic('timer'); } catch (_) {}
             clearInterval(this.timer.interval);
             const elapsed = this.timer.running ? (Date.now() - this.timer.startTime) : this.timer.elapsed;
             // Alleen correctie-modal tonen als er minstens 1 minuut getimed is
@@ -3558,23 +3543,23 @@ const app = {
         card.style.cssText = 'background:#fff;border-radius:16px;max-width:420px;width:100%;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.3);box-sizing:border-box';
 
         card.innerHTML =
-            '<div style="font-size:18px;font-weight:700;color:#1A237E;margin-bottom:6px">' + this.icon('edit', { size: 16, style: 'vertical-align:-3px' }) + ' Eenmalig artikel</div>' +
+            '<div style="font-size:18px;font-weight:700;color:var(--ink);margin-bottom:6px">' + this.icon('edit', { size: 16, style: 'vertical-align:-3px' }) + ' Eenmalig artikel</div>' +
             '<div style="font-size:12px;color:#666;margin-bottom:16px">Voor artikels die nog niet in Robaws staan. Felicity krijgt een taakje om het artikel aan te maken.</div>' +
             '<div style="margin-bottom:12px">' +
                 '<label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Omschrijving</label>' +
                 '<input id="caDesc" type="text" placeholder="Bijv. Speciale flens 50mm" autocomplete="off" ' +
-                'style="width:100%;padding:12px;font-size:15px;border:2px solid #cfd8dc;border-radius:10px;box-sizing:border-box">' +
+                'style="width:100%;padding:12px;font-size:15px;border:1px solid var(--b1);border-radius:10px;box-sizing:border-box">' +
             '</div>' +
             '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">' +
                 '<div>' +
                     '<label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Verkoopprijs (€)</label>' +
                     '<input id="caPrice" type="number" step="0.01" min="0" value="0" ' +
-                    'style="width:100%;padding:12px;font-size:15px;border:2px solid #cfd8dc;border-radius:10px;box-sizing:border-box;text-align:center">' +
+                    'style="width:100%;padding:12px;font-size:15px;border:1px solid var(--b1);border-radius:10px;box-sizing:border-box;text-align:center">' +
                 '</div>' +
                 '<div>' +
                     '<label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Aantal</label>' +
                     '<input id="caQty" type="number" step="0.01" min="0.01" value="1" ' +
-                    'style="width:100%;padding:12px;font-size:15px;border:2px solid #cfd8dc;border-radius:10px;box-sizing:border-box;text-align:center">' +
+                    'style="width:100%;padding:12px;font-size:15px;border:1px solid var(--b1);border-radius:10px;box-sizing:border-box;text-align:center">' +
                 '</div>' +
             '</div>' +
             '<div id="caError" style="font-size:12px;color:#c62828;margin-bottom:8px;display:none"></div>' +
@@ -4389,24 +4374,24 @@ const app = {
     // Slimme iconen per groepsnaam (Robaws API geeft geen afbeeldingen)
     getGroupIcon(name) {
         const n = (name || '').toLowerCase();
-        if (n.includes('verplaatsing') || n.includes('transport')) return { icon: this.icon('car', { size: 28 }), bg: 'linear-gradient(135deg,#e3f2fd,#bbdefb)' };
-        if (n.includes('koper') || n.includes('koperen') || n.includes('leiding')) return { icon: this.icon('tool', { size: 28 }), bg: 'linear-gradient(135deg,#fff3e0,#ffe0b2)' };
-        if (n.includes('mannesmann') || n.includes('buis') || n.includes('pijp')) return { icon: this.icon('tool', { size: 28 }), bg: 'linear-gradient(135deg,#efebe9,#d7ccc8)' };
-        if (n.includes('onderhoud') || n.includes('service')) return { icon: this.icon('tool', { size: 28 }), bg: 'linear-gradient(135deg,#e8f5e9,#c8e6c9)' };
-        if (n.includes('expansie') || n.includes('vat')) return { icon: this.icon('package', { size: 28 }), bg: 'linear-gradient(135deg,#fce4ec,#f8bbd0)' };
-        if (n.includes('thermostaat') || n.includes('regeling') || n.includes('temp')) return { icon: this.icon('thermometer', { size: 28 }), bg: 'linear-gradient(135deg,#e8eaf6,#c5cae9)' };
-        if (n.includes('bosch') || n.includes('junker')) return { icon: this.icon('flame', { size: 28 }), bg: 'linear-gradient(135deg,#fff8e1,#ffecb3)' };
-        if (n.includes('ketel') || n.includes('cv')) return { icon: this.icon('flame', { size: 28 }), bg: 'linear-gradient(135deg,#fbe9e7,#ffccbc)' };
-        if (n.includes('atag') || n.includes('remeha') || n.includes('vaillant')) return { icon: this.icon('home', { size: 28 }), bg: 'linear-gradient(135deg,#f3e5f5,#e1bee7)' };
-        if (n.includes('radiat') || n.includes('convect')) return { icon: this.icon('package', { size: 28 }), bg: 'linear-gradient(135deg,#e0f7fa,#b2ebf2)' };
-        if (n.includes('pomp') || n.includes('circul')) return { icon: this.icon('droplet', { size: 28 }), bg: 'linear-gradient(135deg,#e1f5fe,#b3e5fc)' };
-        if (n.includes('ventiel') || n.includes('kraan') || n.includes('afsluit')) return { icon: this.icon('tool', { size: 28 }), bg: 'linear-gradient(135deg,#eceff1,#cfd8dc)' };
-        if (n.includes('elektr') || n.includes('kabel') || n.includes('draad')) return { icon: this.icon('bolt', { size: 28 }), bg: 'linear-gradient(135deg,#fffde7,#fff9c4)' };
-        if (n.includes('sanitair') || n.includes('douche') || n.includes('bad')) return { icon: this.icon('droplet', { size: 28 }), bg: 'linear-gradient(135deg,#e0f2f1,#b2dfdb)' };
-        if (n.includes('gas') || n.includes('brandstof')) return { icon: this.icon('flame', { size: 28 }), bg: 'linear-gradient(135deg,#fff3e0,#ffe0b2)' };
-        if (n.includes('filter') || n.includes('zuiver')) return { icon: this.icon('wind', { size: 28 }), bg: 'linear-gradient(135deg,#f1f8e9,#dcedc8)' };
-        if (n.includes('isolatie') || n.includes('isoleer')) return { icon: this.icon('package', { size: 28 }), bg: 'linear-gradient(135deg,#efebe9,#d7ccc8)' };
-        return { icon: this.icon('package', { size: 28 }), bg: 'linear-gradient(135deg,rgba(249,157,62,0.12),rgba(106,44,145,0.1))' };
+        if (n.includes('verplaatsing') || n.includes('transport')) return { icon: this.icon('car', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('koper') || n.includes('koperen') || n.includes('leiding')) return { icon: this.icon('tool', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('mannesmann') || n.includes('buis') || n.includes('pijp')) return { icon: this.icon('tool', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('onderhoud') || n.includes('service')) return { icon: this.icon('tool', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('expansie') || n.includes('vat')) return { icon: this.icon('package', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('thermostaat') || n.includes('regeling') || n.includes('temp')) return { icon: this.icon('thermometer', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('bosch') || n.includes('junker')) return { icon: this.icon('flame', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('ketel') || n.includes('cv')) return { icon: this.icon('flame', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('atag') || n.includes('remeha') || n.includes('vaillant')) return { icon: this.icon('home', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('radiat') || n.includes('convect')) return { icon: this.icon('package', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('pomp') || n.includes('circul')) return { icon: this.icon('droplet', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('ventiel') || n.includes('kraan') || n.includes('afsluit')) return { icon: this.icon('tool', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('elektr') || n.includes('kabel') || n.includes('draad')) return { icon: this.icon('bolt', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('sanitair') || n.includes('douche') || n.includes('bad')) return { icon: this.icon('droplet', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('gas') || n.includes('brandstof')) return { icon: this.icon('flame', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('filter') || n.includes('zuiver')) return { icon: this.icon('wind', { size: 28 }), bg: 'var(--wash)' };
+        if (n.includes('isolatie') || n.includes('isoleer')) return { icon: this.icon('package', { size: 28 }), bg: 'var(--wash)' };
+        return { icon: this.icon('package', { size: 28 }), bg: 'var(--wash)' };
     },
 
     renderGroupBrowser() {
@@ -6360,14 +6345,9 @@ const app = {
             } catch(e) { /* localStorage quota — niet kritiek */ }
 
             // === STAP 4: Betaalmethode-specifieke afhandeling ===
-            if (paymentMethod === 'Mollie Tap') {
-                // v139: direct Mollie payment aanmaken + Tap app launchen
-                this.payWithMollieTap(invoiceResult).catch(e => {
-                    console.warn('[Mollie] flow faalde:', e);
-                    this.toast('Mollie betaling kon niet starten: ' + (e && e.message || e));
-                    this.showPaymentScreen(invoiceResult);  // fallback naar manueel
-                });
-            } else if (paymentMethod === 'Viva wallet') {
+            // (v310 / 1.x v304) 'Mollie Tap'-branch verwijderd — de methode
+            // bestaat niet meer in de UI; de Tap-code zelf blijft slapend.
+            if (paymentMethod === 'Viva wallet') {
                 // Viva Wallet → toon betaalscherm met terminal/QR
                 this.showPaymentScreen(invoiceResult);
             } else if (paymentMethod === 'QR code') {
@@ -6942,7 +6922,7 @@ const app = {
                 '<p style="font-size:14px;color:#444;margin:14px 6px 4px"><b>Scan om te betalen</b> — ' +
                     'de klant scant met de camera of bank-app en kiest zelf de betaalmethode ' +
                     '(Bancontact, kaart, Apple Pay…).</p>' +
-                '<p id="mollieQrStatus" style="font-weight:600;color:#1565c0;margin:10px 0 16px">' +
+                '<p id="mollieQrStatus" style="font-weight:600;color:var(--ink);margin:10px 0 16px">' +
                     'Wachten op betaling…</p>' +
                 '<button style="background:none;border:1px solid #bbb;border-radius:8px;' +
                     'padding:10px 16px;color:#444;font-size:13.5px" ' +
@@ -7101,11 +7081,11 @@ const app = {
             }
         } catch (e) {
             console.error('[Terminal] start mislukt:', e);
-            this.toast('Terminal-betaling niet beschikbaar: ' + ((e && e.message) || e), true);
+            this.toast('Bancontact-betaling niet beschikbaar: ' + ((e && e.message) || e), true);
             if (container) {
                 container.innerHTML =
                     '<div style="text-align:center;padding:40px 20px">' +
-                        '<p style="color:#c62828;font-weight:600">Terminal-betaling kon niet starten.</p>' +
+                        '<p style="color:#c62828;font-weight:600">Bancontact-betaling kon niet starten.</p>' +
                         '<p style="color:#666;font-size:14px">' + this.escapeHtml(String((e && e.message) || e)) + '</p>' +
                         '<button class="btn btn-primary btn-full" style="margin-top:18px;padding:13px" ' +
                             'onclick="app.showTerminalBetaalScherm(app._terminalCtx)">Opnieuw proberen</button>' +
@@ -7248,7 +7228,7 @@ const app = {
                             ? '<p style="color:#888;font-size:11.5px;margin:-8px 0 14px">Standaard terminal — aanpassen kan op je Profiel</p>'
                             : '') +
                         '<div class="spinner" style="margin:14px auto"></div>' +
-                        '<p id="terminalPayStatus" style="font-weight:600;color:#1565c0;margin:10px 0 16px">' +
+                        '<p id="terminalPayStatus" style="font-weight:600;color:var(--ink);margin:10px 0 16px">' +
                             'Bedrag staat op de terminal — de klant kan de kaart aanbieden…</p>' +
                         (tapHier
                             ? '<button class="btn btn-primary btn-full" style="margin-bottom:10px;padding:13px" ' +
@@ -7275,7 +7255,7 @@ const app = {
             if (container) {
                 container.innerHTML =
                     '<div style="text-align:center;padding:40px 20px">' +
-                        '<p style="color:#c62828;font-weight:600">Terminal-betaling kon niet starten.</p>' +
+                        '<p style="color:#c62828;font-weight:600">Bancontact-betaling kon niet starten.</p>' +
                         '<p style="color:#666;font-size:14px">' + this.escapeHtml(String((e && e.message) || e)) + '</p>' +
                         '<button class="btn btn-primary btn-full" style="margin-top:18px;padding:13px" ' +
                             'onclick="app.showTerminalBetaalScherm(app._terminalCtx)">Opnieuw proberen</button>' +
@@ -7429,9 +7409,9 @@ const app = {
 
         const mkBtnHtml = (key, icon, label) => {
             const isCurrent = (key === cur) || (key === 'Overschrijving' && cur === 'Overschrijving ter plaatse');
-            const bg = isCurrent ? '#e3f2fd' : '#ffffff';
-            const border = isCurrent ? '#1565C0' : '#cfd8dc';
-            const tag = isCurrent ? ' <span style="font-size:10px;background:#1565C0;color:#fff;padding:2px 6px;border-radius:8px;font-weight:600;margin-left:6px">HUIDIG</span>' : '';
+            const bg = isCurrent ? 'var(--wash)' : 'var(--card)';
+            const border = isCurrent ? 'var(--ink)' : 'var(--b1)';
+            const tag = isCurrent ? ' <span style="font-size:10px;background:var(--btn);color:var(--btnfg);padding:2px 6px;border-radius:8px;font-weight:600;margin-left:6px">HUIDIG</span>' : '';
             return '<div onclick="app.changeLastPaymentMethod(\'' + key + '\')" ' +
                 'style="display:flex;align-items:center;gap:12px;padding:18px 16px;margin-bottom:10px;' +
                 'border:2px solid ' + border + ';border-radius:12px;background:' + bg + ';' +
@@ -7444,18 +7424,15 @@ const app = {
 
         screen.innerHTML =
             '<div style="padding:16px;max-width:600px;margin:0 auto">' +
-                '<div style="font-size:22px;font-weight:700;color:#1A237E;margin-bottom:6px">Betaalmethode aanpassen</div>' +
+                '<div style="font-size:22px;font-weight:700;color:var(--ink);margin-bottom:6px">Betaalmethode aanpassen</div>' +
                 '<div style="font-size:14px;color:#666;margin-bottom:6px">Factuur <strong>' + (ctx.invoiceLogicId || inv.logicId || '') + '</strong></div>' +
-                '<div style="font-size:18px;color:#1A237E;font-weight:700;margin-bottom:18px">€ ' + amount + '</div>' +
+                '<div style="font-size:18px;color:var(--ink);font-weight:700;margin-bottom:18px">€ ' + amount + '</div>' +
                 '<div style="font-size:13px;color:#666;margin-bottom:14px">Kies een methode hieronder:</div>' +
-                // v252: Mollie Tap alleen tonen waar hij actief is — dit scherm
-                // omzeilde de release-vergrendeling (_applyCardPaymentMode) en
-                // kon in de release-APK alsnog een Tap-betaling starten.
-                (this._mollieActive()
-                    ? mkBtnHtml('Mollie Tap', this.icon('card', { size: 20 }), 'Bancontact / kaart (Mollie Tap)')
-                    : '') +
+                // (v310 / 1.x v304) Mollie Tap-keuze definitief verwijderd; de
+                // methode 'Terminal' (interne id + Robaws-waarde blijven zo)
+                // heet in de UI voortaan Bancontact.
                 mkBtnHtml('QR code',       this.icon('card', { size: 20 }), 'QR code (scan & betaal)') +
-                mkBtnHtml('Terminal',      this.icon('card', { size: 20 }), 'Terminal (bedrag verschijnt op de terminal)') +
+                mkBtnHtml('Terminal',      this.icon('card', { size: 20 }), 'Bancontact (bedrag verschijnt op de terminal)') +
                 // v255: Viva Wallet verwijderd uit de keuzes (code blijft slapend
                 // voor oude betaalcontexten met paymentMethod 'Viva wallet').
                 mkBtnHtml('Cash',          this.icon('cash', { size: 20 }), 'Cash') +
@@ -7484,10 +7461,10 @@ const app = {
      *    werk localStorage context bij, en open eventueel het nieuwe betaalscherm.
      */
     async changeLastPaymentMethod(newMethod) {
-        // v252: beleidsgate — 'Release-app: Mollie Tap vergrendeld'. Ook als
-        // de knop tóch aangeroepen wordt (oude HTML/console) blokkeren we hier.
-        if (newMethod === 'Mollie Tap' && !this._mollieActive()) {
-            this.toast('Mollie Tap is niet beschikbaar in deze app-versie', true);
+        // (v310 / 1.x v304) 'Mollie Tap' is geen kiesbare methode meer; een
+        // oude aanroep (verouderde HTML/console) wordt hard geblokkeerd.
+        if (newMethod === 'Mollie Tap') {
+            this.toast('Mollie Tap bestaat niet meer als betaalmethode', true);
             return;
         }
         const statusEl = document.getElementById('changePmStatus');
@@ -7507,12 +7484,7 @@ const app = {
 
         if (sameMethod) {
             // Zelfde methode → gewoon het oude betaalscherm openen (als er één is)
-            if (newMethod === 'Mollie Tap' && ctx.invoiceResult) {
-                // v141: retry de Mollie Tap betaling
-                this.payWithMollieTap(ctx.invoiceResult).catch(e => {
-                    this.toast('Mollie retry faalde: ' + (e && e.message || e));
-                });
-            } else if (newMethod === 'QR code' && ctx.invoiceResult) {
+            if (newMethod === 'QR code' && ctx.invoiceResult) {
                 // v229: betaallink-QR met live bevestiging
                 this.showQrBetaalScherm(ctx.invoiceResult);
             } else if (newMethod === 'Terminal' && ctx.invoiceResult) {
@@ -7533,7 +7505,7 @@ const app = {
         if (statusEl) {
             statusEl.style.display = 'block';
             statusEl.style.color = '#444';
-            statusEl.style.background = '#fff8e1';
+            statusEl.style.background = 'var(--awash)';
             statusEl.textContent = 'Bijwerken in Robaws…';
         }
 
@@ -7547,7 +7519,7 @@ const app = {
                 console.warn('[App] Betaling update partial fail:', res.results);
                 if (statusEl) {
                     statusEl.style.color = '#c62828';
-                    statusEl.style.background = '#ffebee';
+                    statusEl.style.background = 'var(--rwash)';
                     const failed = [];
                     if (res.results.workOrder && !res.results.workOrder.ok) failed.push('werkbon');
                     if (res.results.salesOrder && !res.results.salesOrder.ok) failed.push('order');
@@ -7564,12 +7536,7 @@ const app = {
             this.toast('Betaalmethode → ' + newMethod);
 
             // Open nieuw betaalscherm waar relevant — anders terug naar Uitgevoerd
-            if (newMethod === 'Mollie Tap' && ctx.invoiceResult) {
-                // v141: start direct de Mollie Tap betaling
-                this.payWithMollieTap(ctx.invoiceResult).catch(e => {
-                    this.toast('Mollie betaling kon niet starten: ' + (e && e.message || e));
-                });
-            } else if (newMethod === 'QR code' && ctx.invoiceResult) {
+            if (newMethod === 'QR code' && ctx.invoiceResult) {
                 // v229: betaallink-QR met live bevestiging
                 this.showQrBetaalScherm(ctx.invoiceResult);
             } else if (newMethod === 'Terminal' && ctx.invoiceResult) {
@@ -7588,7 +7555,7 @@ const app = {
             console.error('[App] changeLastPaymentMethod error:', e);
             if (statusEl) {
                 statusEl.style.color = '#c62828';
-                statusEl.style.background = '#ffebee';
+                statusEl.style.background = 'var(--rwash)';
                 statusEl.textContent = 'Fout: ' + (e && e.message);
             }
         }
@@ -7621,49 +7588,43 @@ const app = {
         // v79: planning statusbar moet 4 staten kunnen tonen:
         //   - Nog niet ingeklokt (NFC niet gescand vandaag)
         //   - Ingeklokt (actief, hoofd-shift loopt)
-        //   - L&L actief (📦 prominent)
-        //   - Uitgeklokt (🏁 finish-vlag)
+        //   - L&L actief
+        //   - Uitgeklokt
+        // v265 (Marble): rustige kaart + gekleurde status-dot i.p.v. gradients.
+        // MOTOR-SYNC: dit blok is een bewuste DESIGN-afwijking t.o.v. 1.x —
+        // bij het overzetten van motor-fixes deze Marble-versie laten staan.
+        bar.style.cssText = 'display:block;padding:14px 16px;border-radius:14px;margin-bottom:14px;cursor:pointer;' +
+            'background:var(--card);border:1px solid var(--cb);box-shadow:var(--shadow-md)';
+        const dot = (c) => '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:middle;background:' + c + '"></span>';
+        text.style.color = 'var(--ink)';
+        sub.style.color = 'var(--g1)';
         const llActive = session && session.llActive;
         const llStartTxt = session && session.llStartTime ? session.llStartTime : '';
         if (llActive) {
             // L&L actief — krijgt voorrang in de statusbar
-            bar.style.cssText = 'display:block;padding:12px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer;' +
-                'background:linear-gradient(135deg,#e3f2fd,#bbdefb);border-left:4px solid #1565c0';
-            icon.innerHTML = this.icon('package', { size: 22 });
+            icon.innerHTML = dot('var(--purple2)');
             text.textContent = 'Bezig met Laden & Lossen';
-            text.style.color = '#0d47a1';
             sub.textContent = llStartTxt ? ('Gestart om ' + llStartTxt) : 'Actief';
-            sub.style.color = '#1565c0';
         } else if (isActive) {
             // Ingeklokt (hoofd-shift)
-            const lateClass = isLate ? 'background:linear-gradient(135deg,#fff3e0,#ffccbc)' : 'background:linear-gradient(135deg,#e8f5e9,#c8e6c9)';
-            bar.style.cssText = `display:block;padding:12px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer;${lateClass}`;
-            icon.innerHTML = isLate ? this.icon('alert', { size: 22 }) : this.icon('check-circle', { size: 22 });
+            icon.innerHTML = dot(isLate ? 'var(--amber)' : 'var(--green2)');
             const activeTag = QEClock.getActiveTagName();
             const cleanTag = this._publicRemark(activeTag);
             text.textContent = `Actief sinds ${session.startTime}`;
-            text.style.color = isLate ? '#e65100' : '#2e7d32';
             sub.textContent = isLate ? 'Te laat!' : (cleanTag || 'Ingeklokt');
-            sub.style.color = isLate ? '#e65100' : '#2e7d32';
+            if (isLate) sub.style.color = 'var(--amber2)';
         } else if (clockTime) {
-            // Uitgeklokt — 🏁 finish-vlag
-            bar.style.cssText = 'display:block;padding:12px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer;' +
-                'background:linear-gradient(135deg,#e8eaf6,#c5cae9);border-left:4px solid #001E45';
-            icon.innerHTML = this.icon('flag', { size: 22 });
+            // Uitgeklokt
+            icon.innerHTML = dot('var(--g3)');
             text.textContent = `Uitgeklokt — ${clockTime}`;
-            text.style.color = '#001E45';
             sub.textContent = 'Klaar voor vandaag';
-            sub.style.color = '#3f51b5';
         } else {
             // Nog niet ingeclockt
             const isLateNow = QEClock.isLate();
-            const bg = isLateNow ? 'background:linear-gradient(135deg,#fce4ec,#ffcdd2)' : 'background:linear-gradient(135deg,#e3f2fd,#bbdefb)';
-            bar.style.cssText = `display:block;padding:12px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer;${bg}`;
-            icon.innerHTML = isLateNow ? this.icon('alert', { size: 22 }) : this.icon('clock', { size: 22 });
+            icon.innerHTML = dot(isLateNow ? 'var(--red2)' : 'var(--amber)');
             text.textContent = isLateNow ? 'Nog niet ingeklokt!' : 'Nog niet ingeklokt';
-            text.style.color = isLateNow ? '#c62828' : '#1565c0';
             sub.textContent = `Verwacht: ${QEClock.getExpectedStartTime()}`;
-            sub.style.color = isLateNow ? '#c62828' : '#1565c0';
+            if (isLateNow) sub.style.color = 'var(--red2)';
         }
     },
 
@@ -7715,92 +7676,59 @@ const app = {
         const isActive = session && session.active;
         const clockTime = QEClock.getClockTime();
 
-        // ── Grote status bovenaan ──
+        // ── Marble 1:1 (v267): grote klok-kaart (prototype "kl-card") ──
+        // MOTOR-SYNC: dit blok is een bewuste DESIGN-afwijking t.o.v. 1.x —
+        // dezelfde toestanden (L&L / actief / uitgeklokt / nog niet), maar
+        // geschilderd als de Marble-hero (50px tijd + accentlijn + status).
+        // clockNfcCard/clockActiveSession blijven bestaan maar verborgen.
+        const hero = document.getElementById('clockHeroCard');
+        const heroLine = document.getElementById('clockHeroLine');
         const bigStatus = document.getElementById('clockBigStatus');
         const bigText = document.getElementById('clockBigText');
         const bigTime = document.getElementById('clockBigTime');
+        const nfcCardEl = document.getElementById('clockNfcCard');
+        if (nfcCardEl) nfcCardEl.style.display = 'none';
+        const activeEl = document.getElementById('clockActiveSession');
+        if (activeEl) activeEl.style.display = 'none';
 
-        // v78: L&L active block wordt onafhankelijk gerenderd, ook als main session inactief.
-        const llActiveHtml = session && session.llActive ? `
-            <div style="margin-top:10px;padding:14px 16px;background:#e3f2fd;border-left:4px solid #1565c0;border-radius:8px;display:flex;align-items:center;gap:12px">
-                <span style="color:#e65100">${this.icon('package', { size: 26 })}</span>
-                <div>
-                    <div style="font-size:15px;font-weight:700;color:#0d47a1">Bezig met Laden &amp; Lossen</div>
-                    <div style="font-size:12px;color:#1565c0;opacity:0.9;margin-top:2px">Gestart om ${session.llStartTime || '?'} — scan de L&amp;L tag opnieuw om te stoppen</div>
-                </div>
-            </div>` : '';
+        const nfcOff = !!(window.QEBridge && QEBridge.isNfcEnabled && !QEBridge.isNfcEnabled());
+        const setHero = (time, fg, border, txt, sub) => {
+            if (!bigTime || !bigText || !bigStatus) return;
+            bigTime.textContent = time;
+            bigTime.style.color = fg;
+            if (heroLine) heroLine.style.background = fg;
+            if (hero) hero.style.borderColor = border;
+            bigText.textContent = txt;
+            bigText.style.color = fg;
+            bigStatus.textContent = sub;
+        };
 
-        if (isActive) {
+        if (session && session.llActive) {
+            // L&L krijgt voorrang in de hero (zoals de planning-statusbar)
+            setHero(session.llStartTime || '––:––', 'var(--purple2)', 'var(--pborder)',
+                'Bezig met Laden & Lossen',
+                'Gestart om ' + (session.llStartTime || '?') + ' — scan de L&L-tag opnieuw om te stoppen');
+        } else if (isActive) {
             const isLate = session.registrationType === 'Te laat';
-            const isLL = session.registrationType === 'Laden & Lossen';
-            bigStatus.innerHTML = isLL ? this.icon('package', { size: 52 }) : (isLate ? this.icon('alert', { size: 52 }) : this.icon('check-circle', { size: 52 }));
-            bigText.textContent = isLL ? 'Laden & Lossen' : 'Ingeklokt';
-            bigText.style.color = isLate ? '#e65100' : 'var(--qe-green)';
-            const _cleanTag = this._publicRemark(session.tagName);
-            bigTime.textContent = `${session.startTime} — ${_cleanTag}${isLate ? ' (te laat)' : ''}`;
-
-            document.getElementById('clockNfcCard').style.display = 'none';
-            const activeEl = document.getElementById('clockActiveSession');
-            if (activeEl) {
-                activeEl.style.display = 'block';
-                document.getElementById('clockActiveContent').innerHTML = `
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-                        <h3 style="margin:0;font-size:16px;color:var(--qe-darkblue)">${this.icon('refresh', { size: 16, style: 'vertical-align:-3px' })} Actieve registratie</h3>
-                        <span style="background:${isLL ? '#e3f2fd' : '#e8f5e9'};color:${isLL ? '#1565c0' : '#2e7d32'};font-size:11px;padding:2px 8px;border-radius:8px;font-weight:600">${session.registrationType}</span>
-                    </div>
-                    <div style="display:flex;gap:16px;margin-bottom:8px">
-                        <div><span style="font-size:12px;color:var(--qe-grey)">Start</span><br><span style="font-size:15px;font-weight:600">${session.startTime}</span></div>
-                        <div><span style="font-size:12px;color:var(--qe-grey)">Verwacht</span><br><span style="font-size:15px;font-weight:600">${QEClock.getExpectedStartTime()}</span></div>
-                        <div><span style="font-size:12px;color:var(--qe-grey)">Locatie</span><br><span style="font-size:15px;font-weight:600">${this._publicRemark(session.tagName)}</span></div>
-                    </div>
-                    <p style="font-size:13px;color:var(--qe-grey);margin:0">Scan opnieuw een NFC tag om uit te clocken</p>
-                    ${llActiveHtml}
-                `;
-            }
+            const cleanTag = this._publicRemark(session.tagName);
+            setHero(session.startTime || '––:––',
+                isLate ? 'var(--amber)' : 'var(--green2)',
+                isLate ? 'var(--aborder2)' : 'var(--gborder1)',
+                'Actief — scan een tag om uit te klokken',
+                'Ingeklokt op ' + cleanTag + (isLate ? ' · te laat' : ' · op tijd') +
+                ' · verwacht ' + QEClock.getExpectedStartTime());
+        } else if (clockTime) {
+            setHero(clockTime, 'var(--g2)', 'var(--b1)',
+                'Afgerond voor vandaag',
+                'Eerste scan ' + clockTime + ' · gesynchroniseerd met Robaws');
         } else {
             const isLateNow = QEClock.isLate();
-            if (clockTime) {
-                bigStatus.innerHTML = this.icon('flag', { size: 52 });
-                bigText.textContent = 'Uitgeklokt';
-                bigText.style.color = 'var(--qe-darkblue)';
-                bigTime.textContent = `Eerste scan: ${clockTime}`;
-            } else {
-                bigStatus.innerHTML = isLateNow ? this.icon('alert', { size: 52 }) : this.icon('clock', { size: 52 });
-                bigText.textContent = isLateNow ? 'Nog niet ingeklokt!' : 'Nog niet ingeklokt';
-                bigText.style.color = isLateNow ? '#c62828' : 'var(--qe-darkblue)';
-                bigTime.textContent = `Verwacht: ${QEClock.getExpectedStartTime()}`;
-            }
-
-            // Toon NFC instructie
-            const nfcCard = document.getElementById('clockNfcCard');
-            nfcCard.style.display = 'block';
-            if (window.QEBridge && !QEBridge.isNfcEnabled()) {
-                nfcCard.innerHTML = `
-                    <div style="text-align:center;padding:20px">
-                        <div style="margin-bottom:8px;color:var(--qe-grey)">${this.icon('phone-off', { size: 34 })}</div>
-                        <div style="font-size:15px;font-weight:600;margin-bottom:4px">NFC niet beschikbaar</div>
-                        <div style="font-size:13px;color:var(--qe-grey)">Zet NFC aan in je telefoon-instellingen</div>
-                        ${llActiveHtml}
-                    </div>`;
-            } else {
-                nfcCard.innerHTML = `
-                    <div style="margin-bottom:8px;color:var(--qe-purple)">${this.icon('phone', { size: 34 })}</div>
-                    <div style="font-size:15px;font-weight:600;margin-bottom:4px">Houd je telefoon tegen de NFC tag</div>
-                    <div style="font-size:13px;color:var(--qe-grey)">Bureau, camionet of laden & lossen</div>
-                    ${llActiveHtml}
-                `;
-            }
-            // v78: actieve sessie card alleen tonen als L&L actief is (zonder main shift)
-            const activeEl = document.getElementById('clockActiveSession');
-            if (activeEl) {
-                if (session && session.llActive) {
-                    activeEl.style.display = 'block';
-                    document.getElementById('clockActiveContent').innerHTML = llActiveHtml ||
-                        '<p style="color:var(--qe-grey)">Geen actieve sessie</p>';
-                } else {
-                    activeEl.style.display = 'none';
-                }
-            }
+            setHero('––:––',
+                isLateNow ? 'var(--red2)' : 'var(--amber)',
+                'var(--aborder2)',
+                isLateNow ? 'Nog niet ingeklokt!' : 'Houd je telefoon tegen de NFC-tag',
+                nfcOff ? 'NFC staat uit — zet NFC aan in je telefoon-instellingen'
+                       : 'NFC · Bureau, camionet of laden & lossen · verwacht ' + QEClock.getExpectedStartTime());
         }
 
         // ── Voltooide sessies vandaag ──
@@ -7809,21 +7737,18 @@ const app = {
         const completed = session ? (session.completedSessions || []) : [];
         if (completed.length > 0) {
             completedSection.style.display = 'block';
+            // v267 (Marble 1:1): prototype "VANDAAG"-rijen — wash-tint per type,
+            // "Type · locatie", tijdsbereik en uren rechts in de accentkleur.
             completedList.innerHTML = completed.map(s => {
-                const typeIcon = s.type === 'Te laat' ? this.icon('alert', { size: 16 }) : (s.type === 'Laden & Lossen' ? this.icon('package', { size: 16 }) : (s.type === 'Extra uren' ? this.icon('refresh', { size: 16 }) : this.icon('check-circle', { size: 16 })));
-                const bg = s.type === 'Te laat' ? '#fff8e1' : '#f1f8e9';
-                return `<div class="card" style="padding:10px 14px;margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;background:${bg}">
-                    <div style="display:flex;align-items:center;gap:10px">
-                        <span>${typeIcon}</span>
-                        <div>
-                            <div style="font-size:14px;font-weight:500">${s.type}</div>
-                            <div style="font-size:11px;color:var(--qe-grey)">${this._publicRemark(s.tagName)}</div>
-                        </div>
-                    </div>
-                    <div style="text-align:right">
-                        <div style="font-size:14px;font-weight:600">${s.startTime} → ${s.endTime}</div>
-                        <div style="font-size:11px;color:var(--qe-grey)">${s.hours} uur</div>
-                    </div>
+                let wash, border, accent;
+                if (s.type === 'Te laat') { wash = 'var(--awash)'; border = 'var(--aborder)'; accent = 'var(--amber2)'; }
+                else if (s.type === 'Laden & Lossen') { wash = 'var(--awash2)'; border = 'var(--aborder2)'; accent = 'var(--amber2)'; }
+                else if (s.type === 'Extra uren') { wash = 'var(--pwash)'; border = 'var(--pborder)'; accent = 'var(--purple2)'; }
+                else { wash = 'var(--gwash)'; border = 'var(--gborder2)'; accent = 'var(--green2)'; }
+                return `<div style="display:flex;align-items:baseline;gap:12px;padding:13px 16px;border-radius:12px;background:${wash};border:1px solid ${border};margin-bottom:6px">
+                    <span style="font-size:13.5px;font-weight:500;flex:1;min-width:0;color:var(--ink)">${s.type} · ${this._publicRemark(s.tagName)}</span>
+                    <span style="font-size:13px;color:var(--g2);font-variant-numeric:tabular-nums;flex-shrink:0">${s.startTime} – ${s.endTime}</span>
+                    <span style="font:500 15px var(--font);color:${accent};font-variant-numeric:tabular-nums;flex-shrink:0">${s.hours}</span>
                 </div>`;
             }).join('');
         } else {
@@ -8040,7 +7965,7 @@ const app = {
         if (!this._adminIsBureel()) { this.toast('Geen toegang', true); return; }
         this.showModal(
             '<div style="font-size:16px;font-weight:600;margin-bottom:4px">Nieuwe werknemer</div>' +
-            '<div style="font-size:12px;color:var(--qe-orange);margin-bottom:12px;line-height:1.4">Let op: dit maakt enkel de werknemerfiche. De login-gebruiker maak je daarna in Robaws-web (Instellingen → Gebruikers) en koppel je aan deze fiche.</div>' +
+            '<div style="font-size:12px;color:var(--qe-orange);margin-bottom:12px;line-height:1.4">Dit maakt de werknemerfiche; daarna opent automatisch de controle-checklist. De login-gebruiker maak je in Robaws-web (Instellingen → Gebruikers, veld "Werknemer" = deze fiche) — de checklist ziet vanzelf wanneer dat gebeurd is.</div>' +
             '<div class="form-group"><label>Voornaam</label><input class="form-input" id="adminNewFirst"></div>' +
             '<div class="form-group"><label>Achternaam</label><input class="form-input" id="adminNewLast"></div>' +
             '<div class="form-group"><label>E-mail</label><input class="form-input" id="adminNewEmail" type="email" placeholder="naam@qe.be"></div>' +
@@ -8064,12 +7989,128 @@ const app = {
         if (pin && !/^\d{4,6}$/.test(pin)) { this.toast('PIN = 4 tot 6 cijfers', true); return; }
         this._adminBusy = true;
         try {
-            await RobawsAPI.adminCreateEmployee({ firstName, lastName, email, role, pin });
-            this.closeModal();
+            const created = await RobawsAPI.adminCreateEmployee({ firstName, lastName, email, role, pin });
             this.toast('Werknemerfiche aangemaakt', false);
             this.loadAdmin();
+            // (v308 / 1.x v303) meteen door naar de controle-checklist zodat
+            // bureel ziet wat er nog ontbreekt (login-koppeling in Robaws-web).
+            if (created && created.id) this.showAdminOnboardChecklist(created.id);
+            else this.closeModal();
         } catch (err) { this.toast('Mislukt: ' + ((err && err.message) || 'fout'), true); }
         finally { this._adminBusy = false; }
+    },
+
+    // ================================================================
+    // (v308 / 1.x v303) ONBOARDING-WIZARD — "werkt deze werknemer?"
+    // Kies een werknemer (geen ID's nodig): de app controleert e-mail,
+    // status, rol, login-koppeling en PIN, en repareert met één tik wat
+    // hij zelf kan zetten. De login-user aanmaken/koppelen kan de app
+    // NIET (API geeft 403) — daarvoor toont de wizard de exacte
+    // Robaws-web-stap + een hercheck-knop.
+    // ================================================================
+    async openAdminOnboard(preselectId) {
+        if (!this._adminIsBureel()) { this.toast('Geen toegang', true); return; }
+        this.showModal('<div class="spinner"></div>');
+        let emps = [];
+        try { emps = await RobawsAPI.getActiveEmployees({ force: true }); } catch (_e) {}
+        if (!emps || !emps.length) {
+            this.showModal('<p class="text-grey text-sm text-center">Geen werknemers gevonden.</p>' +
+                '<button class="btn btn-outline btn-full" onclick="app.closeModal()">Sluiten</button>');
+            return;
+        }
+        const opts = emps.map(e => {
+            const id = String(e.employeeId != null ? e.employeeId : (e.id != null ? e.id : ''));
+            return '<option value="' + this.escapeHtml(id) + '"' + (id === String(preselectId || '') ? ' selected' : '') + '>' +
+                this.escapeHtml(e.name || ('#' + id)) + '</option>';
+        }).join('');
+        this.showModal(
+            '<div style="font-size:16px;font-weight:600;margin-bottom:4px">Werknemer controleren</div>' +
+            '<div style="font-size:12px;color:var(--qe-grey);margin-bottom:12px;line-height:1.4">Kies een werknemer — de app controleert alles wat nodig is om te kunnen werken (e-mail, rol, login-koppeling, PIN) en repareert wat kan.</div>' +
+            '<div class="form-group"><label>Werknemer</label><select class="form-input" id="adminOnboardSelect">' + opts + '</select></div>' +
+            '<div style="display:flex;gap:8px;margin-top:8px">' +
+                '<button class="btn btn-outline btn-full" onclick="app.closeModal()">Annuleren</button>' +
+                '<button class="btn btn-primary btn-full" onclick="app.adminRunOnboardCheck()">Controleren</button></div>'
+        );
+    },
+    adminRunOnboardCheck() {
+        const sel = document.getElementById('adminOnboardSelect');
+        if (sel && sel.value) this.showAdminOnboardChecklist(sel.value);
+    },
+    async showAdminOnboardChecklist(empId) {
+        this.showModal('<div class="spinner"></div>');
+        let st;
+        try { st = await RobawsAPI.adminGetOnboardingStatus(empId); }
+        catch (e) {
+            this.showModal('<p style="font-size:13px;color:var(--qe-red);text-align:center">Controle mislukt: ' + this.escapeHtml(e.message || '?') + '</p>' +
+                '<button class="btn btn-outline btn-full" onclick="app.closeModal()">Sluiten</button>');
+            return;
+        }
+        const c = st.checks;
+        const idArg = this._escapeJsArg(String(empId));
+        const row = (ok, label, valueHtml, fixHtml, warn) => {
+            const icon = ok ? '&#10003;' : (warn ? '&#9888;' : '&#10007;');
+            const color = ok ? 'var(--qe-green)' : (warn ? '#b8860b' : 'var(--qe-red)');
+            return '<div style="padding:9px 0;border-bottom:1px solid rgba(0,0,0,0.06)">' +
+                '<div style="display:flex;gap:8px;align-items:baseline">' +
+                    '<span style="color:' + color + ';font-weight:700;flex-shrink:0">' + icon + '</span>' +
+                    '<span style="font-size:13.5px;font-weight:600;flex:1">' + label + '</span>' +
+                    (valueHtml ? '<span style="font-size:12px;color:var(--qe-grey);text-align:right;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%">' + valueHtml + '</span>' : '') +
+                '</div>' + (fixHtml || '') + '</div>';
+        };
+        const fixWrap = (inner) => '<div style="display:flex;gap:6px;margin-top:7px">' + inner + '</div>';
+        const allOk = c.email.ok && c.actief.ok && c.rol.ok && c.user.ok;
+        let html = '<div style="font-size:16px;font-weight:600">' + this.escapeHtml(st.naam) + '</div>' +
+            '<div style="font-size:12.5px;font-weight:600;margin:2px 0 10px;color:' + (allOk ? 'var(--qe-green)' : 'var(--qe-orange)') + '">' +
+                (allOk ? (c.pin.ok ? 'Klaar om in te loggen &#10003;' : 'Klaar — PIN kiest de werknemer bij de eerste login') : 'Nog niet klaar — zie de punten hieronder') + '</div>';
+        html += row(c.email.ok, 'E-mail op de fiche', this.escapeHtml(c.email.value || '—'),
+            c.email.ok ? '' : fixWrap('<input class="form-input" id="obEmail" type="email" placeholder="naam@qe.be" style="flex:1">' +
+                '<button class="btn btn-primary btn-sm" onclick="app.adminOnboardFixEmail(\'' + idArg + '\')">Zet</button>'));
+        html += row(c.actief.ok, 'Status actief', this.escapeHtml(c.actief.value || ''),
+            c.actief.ok ? '' : fixWrap('<button class="btn btn-primary btn-sm" style="flex:1" onclick="app.adminOnboardFixStatus(\'' + idArg + '\')">Heractiveren</button>'));
+        html += row(c.rol.ok, 'Rol / planning-groep', this.escapeHtml(c.rol.value || '—'),
+            fixWrap('<select class="form-input" id="obRole" style="flex:1"><option value="monteur">Monteur</option><option value="technieker">Technieker</option><option value="bureel">Bureel</option></select>' +
+                '<button class="btn btn-outline btn-sm" onclick="app.adminOnboardFixRole(\'' + idArg + '\')">' + (c.rol.ok ? 'Wijzig' : 'Zet') + '</button>'));
+        html += row(c.user.ok, 'Login-gebruiker gekoppeld', this.escapeHtml(c.user.value || ''),
+            c.user.ok ? '' : '<div style="font-size:12px;color:var(--qe-grey);margin-top:6px;line-height:1.45">De app kan dit niet zelf (Robaws staat het niet toe via de API). Maak in <b>Robaws-web &#8594; Instellingen &#8594; Gebruikers</b> een gebruiker aan (of open de bestaande) en kies bij <b>Werknemer</b> deze fiche. Kom daarna terug en tik &quot;Opnieuw controleren&quot;.</div>');
+        html += row(c.pin.ok, 'PIN', c.pin.ok ? 'ingesteld' : 'nog geen — kiest werknemer bij 1e login',
+            c.pin.ok ? '' : fixWrap('<input class="form-input" id="obPin" inputmode="numeric" maxlength="6" placeholder="nu al zetten (optioneel)" style="flex:1">' +
+                '<button class="btn btn-outline btn-sm" onclick="app.adminOnboardFixPin(\'' + idArg + '\')">Zet</button>'), !c.pin.ok);
+        html += '<div style="display:flex;gap:8px;margin-top:14px">' +
+            '<button class="btn btn-outline btn-full" onclick="app.closeModal()">Sluiten</button>' +
+            '<button class="btn btn-primary btn-full" onclick="app.showAdminOnboardChecklist(\'' + idArg + '\')">Opnieuw controleren</button></div>';
+        this.showModal(html);
+        const roleSel = document.getElementById('obRole');
+        if (roleSel) {
+            const v = String(c.rol.value || '').toLowerCase();
+            if (v.includes('monteur')) roleSel.value = 'monteur';
+            else if (v.includes('bureel') || v.includes('kantoor') || v.includes('service') || v.includes('projectleider')) roleSel.value = 'bureel';
+            else roleSel.value = 'technieker';
+        }
+    },
+    async _adminOnboardFix(empId, fn, okMsg) {
+        if (this._adminBusy) return;
+        this._adminBusy = true;
+        try { await fn(); this.toast(okMsg); }
+        catch (e) { this.toast('Mislukt: ' + (e.message || '?'), true); }
+        finally { this._adminBusy = false; }
+        this.showAdminOnboardChecklist(empId);
+    },
+    adminOnboardFixEmail(empId) {
+        const v = ((document.getElementById('obEmail') || {}).value || '').trim().toLowerCase();
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) { this.toast('Geldig e-mailadres vereist', true); return; }
+        this._adminOnboardFix(empId, () => RobawsAPI._adminMutateEmployee(empId, (emp) => { emp.email = v; }), 'E-mail gezet');
+    },
+    adminOnboardFixStatus(empId) {
+        this._adminOnboardFix(empId, () => RobawsAPI.adminSetStatus(empId, 'actief'), 'Geheractiveerd');
+    },
+    adminOnboardFixRole(empId) {
+        const role = (document.getElementById('obRole') || {}).value || 'monteur';
+        this._adminOnboardFix(empId, () => RobawsAPI.adminSetRole(empId, role), 'Rol ingesteld');
+    },
+    adminOnboardFixPin(empId) {
+        const pin = ((document.getElementById('obPin') || {}).value || '').trim();
+        if (!/^\d{4,6}$/.test(pin)) { this.toast('PIN = 4 tot 6 cijfers', true); return; }
+        this._adminOnboardFix(empId, () => RobawsAPI._savePinToRobaws(empId, pin), 'PIN gezet');
     },
 
     async loadClockAdmin() {
@@ -8274,6 +8315,1588 @@ const app = {
                 fouten.map(f => this.escapeHtml(f)).join('<br>') + '</span>' : ''));
         this.toast(ok + ' afwezigheids-registratie(s) aangemaakt' + (fouten.length ? ' — ' + fouten.length + ' mislukt' : ''), fouten.length > 0);
         if (ok > 0) this.loadClockAdmin();
+    },
+
+    // ============================================================
+    // v276: VERLOF AANVRAGEN (self-service, alle rollen) — native Robaws
+    // time-off-request. Alleen "Verlof"; Ziek gaat bewust via bericht.
+    // De aanvraag wordt meteen ingediend ter goedkeuring (Fase 2 = bureel
+    // keurt goed). Robaws berekent zelf de uren uit het uurrooster.
+    // ============================================================
+    async loadMyVerlof() {
+        const van = document.getElementById('verlofVan');
+        const tot = document.getElementById('verlofTot');
+        if (van && !van.value) van.value = this._localDateStr();
+        if (tot && !tot.value) tot.value = '';
+        const list = document.getElementById('verlofList');
+        if (!list) return;
+        list.innerHTML = '<div class="spinner"></div>';
+        const empId = this.currentUser && this.currentUser.robawsEmployeeId;
+        if (!empId) { list.innerHTML = '<p class="text-grey text-sm text-center">Geen werknemer-koppeling gevonden.</p>'; return; }
+        try {
+            const reqs = await RobawsAPI.getMyTimeOffRequests(empId);
+            if (!reqs.length) { list.innerHTML = '<p class="text-grey text-sm text-center">Nog geen aanvragen.</p>'; return; }
+            this._verlofReqCache = {};
+            list.innerHTML = reqs.map(r => {
+                this._verlofReqCache[String(r.id)] = r;
+                const st = this._verlofStatus(r.status);
+                const periode = this._verlofPeriode(r.fromDate, r.toDate);
+                const dur = (r.durationInMinutes != null) ? (' · ' + (Math.round(r.durationInMinutes / 60 * 100) / 100) + ' u') : '';
+                const cat = (r.timeOffCategory && r.timeOffCategory.name) || 'Verlof';
+                return `<div onclick="app.openVerlofDetail('${this._escapeJsArg(String(r.id))}')" style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0;border-bottom:1px solid var(--l2,#eee);cursor:pointer">
+                    <div style="min-width:0">
+                        <div style="font-size:14px;font-weight:600">${this.escapeHtml(periode)}</div>
+                        <div style="font-size:12px;color:var(--qe-grey)">${this.escapeHtml(cat)}${dur} · tik voor details</div>
+                    </div>
+                    <span style="font-size:11.5px;font-weight:600;color:${st.color};background:${st.bg};border:1px solid ${st.border};border-radius:12px;padding:3px 10px;white-space:nowrap">${st.label}</span>
+                </div>`;
+            }).join('');
+        } catch (e) {
+            list.innerHTML = `<p class="text-grey text-sm text-center">Aanvragen laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    _verlofStatus(status) {
+        switch (String(status || '').toUpperCase()) {
+            case 'APPROVED': return { label: 'Goedgekeurd', color: '#2e7d32', bg: 'rgba(46,125,50,0.10)', border: 'rgba(46,125,50,0.25)' };
+            case 'REJECTED': return { label: 'Geweigerd', color: '#c62828', bg: 'rgba(198,40,40,0.10)', border: 'rgba(198,40,40,0.25)' };
+            case 'DRAFT':    return { label: 'Concept', color: '#8a8a8a', bg: 'rgba(0,0,0,0.05)', border: 'rgba(0,0,0,0.12)' };
+            default:         return { label: 'Aangevraagd', color: '#e65100', bg: 'rgba(230,81,0,0.10)', border: 'rgba(230,81,0,0.25)' }; // SUBMITTED/WAITING
+        }
+    },
+
+    _verlofPeriode(fromISO, toISO) {
+        try {
+            const f = new Date(fromISO), t = new Date(toISO);
+            const opt = { day: 'numeric', month: 'short' };
+            const fs = f.toLocaleDateString('nl-BE', opt);
+            const ts = t.toLocaleDateString('nl-BE', opt);
+            return (f.toDateString() === t.toDateString()) ? fs : (fs + ' – ' + ts);
+        } catch (e) { return ''; }
+    },
+
+    async submitVerlofRequest() {
+        const btn = document.getElementById('btnVerlofSubmit');
+        const err = document.getElementById('verlofError');
+        const vanV = (document.getElementById('verlofVan') || {}).value || '';
+        const totV = (document.getElementById('verlofTot') || {}).value || '';
+        const comment = ((document.getElementById('verlofComment') || {}).value || '').trim();
+        const showErr = (m) => { if (err) { err.textContent = m; err.style.display = 'block'; } else this.toast(m, true); };
+        if (err) err.style.display = 'none';
+        if (!vanV) { showErr('Kies een begindatum'); return; }
+        const tot = totV || vanV;
+        if (tot < vanV) { showErr('De einddatum ligt vóór de begindatum'); return; }
+        const empId = this.currentUser && this.currentUser.robawsEmployeeId;
+        if (!empId) { showErr('Geen werknemer-koppeling gevonden'); return; }
+        if (this._verlofBusy) return;
+        this._verlofBusy = true;
+        const oldTxt = btn ? btn.textContent : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'Versturen...'; }
+        try {
+            // Belgische werkdag-uren; new Date(...) interpreteert lokaal (toestel =
+            // Belgische tijd) → juiste UTC incl. zomertijd. Robaws herrekent de uren.
+            const fromDate = new Date(vanV + 'T07:00:00').toISOString();
+            const toDate = new Date(tot + 'T15:30:00').toISOString();
+            await RobawsAPI.createVerlofRequest({ employeeId: empId, fromDate, toDate, comment, authorUserId: this._myRobawsUserId() });
+            this.toast('Verlofaanvraag verstuurd');
+            const c = document.getElementById('verlofComment'); if (c) c.value = '';
+            await this.loadMyVerlof();
+        } catch (e) {
+            showErr('Versturen mislukt: ' + (e.message || '?'));
+        } finally {
+            this._verlofBusy = false;
+            if (btn) { btn.disabled = false; btn.textContent = oldTxt || 'Verlof aanvragen'; }
+        }
+    },
+
+    // ============================================================
+    // v277 (Fase 2): VERLOF GOEDKEUREN (bureel). Openstaande aanvragen
+    // goedkeuren/weigeren via de approval-request (accept/reject).
+    // ============================================================
+    async loadVerlofApprovals() {
+        const u = RobawsAPI.getLoggedInUser();
+        const list = document.getElementById('verlofBeheerList');
+        if (!list) return;
+        if (!u || u.role !== 'bureel') { list.innerHTML = '<p class="text-grey text-sm text-center">Alleen bureel.</p>'; return; }
+        list.innerHTML = '<div class="spinner"></div>';
+        try {
+            const items = await RobawsAPI.getPendingLeaveApprovals(this.currentUser && this.currentUser.robawsEmployeeId, this._myRobawsUserId());
+            this._verlofApprovalCache = {};
+            if (!items.length) { list.innerHTML = '<p class="text-grey text-sm text-center">Geen openstaande verlofaanvragen.</p>'; return; }
+            list.innerHTML = items.map(it => {
+                this._verlofApprovalCache[it.approvalId] = it;
+                const r = it.request;
+                const naam = (r.employee && (r.employee.name || r.employee.firstName)) || ('Werknemer ' + r.employeeId);
+                const periode = this._verlofPeriode(r.fromDate, r.toDate);
+                const cat = (r.timeOffCategory && r.timeOffCategory.name) || 'Verlof';
+                return `<div class="card" style="margin-bottom:10px;padding:14px 16px">
+                    <div style="font-size:15px;font-weight:600">${this.escapeHtml(naam)}</div>
+                    <div style="font-size:12.5px;color:var(--qe-grey);margin-top:2px">${this.escapeHtml(cat)} · ${this.escapeHtml(periode)}</div>
+                    <div style="display:flex;gap:8px;margin-top:12px">
+                        <button class="btn btn-outline btn-sm" style="flex:1" onclick="app.decideVerlof('${this._escapeJsArg(it.approvalId)}', false)">Weigeren</button>
+                        <button class="btn btn-primary btn-sm" style="flex:1" onclick="app.decideVerlof('${this._escapeJsArg(it.approvalId)}', true)">Goedkeuren</button>
+                    </div>
+                </div>`;
+            }).join('');
+        } catch (e) {
+            list.innerHTML = `<p class="text-grey text-sm text-center">Laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    async decideVerlof(approvalId, approve) {
+        const it = (this._verlofApprovalCache || {})[approvalId];
+        const naam = (it && it.request && it.request.employee && it.request.employee.name) || '';
+        const confirmFn = (window.QEClock && QEClock._showConfirmModal)
+            ? QEClock._showConfirmModal.bind(QEClock)
+            : (t, m, ok) => Promise.resolve(window.confirm(m));
+        const ok = await confirmFn(
+            approve ? 'Verlof goedkeuren?' : 'Verlof weigeren?',
+            (approve ? 'Verlof' : 'Verlofaanvraag') + (naam ? ' van ' + naam : '') + (approve ? ' goedkeuren?' : ' weigeren?'),
+            approve ? 'Goedkeuren' : 'Weigeren',
+            'Annuleren'
+        );
+        if (!ok) return;
+        if (this._verlofDecideBusy) return;
+        this._verlofDecideBusy = true;
+        try {
+            await RobawsAPI.decideLeaveApproval(approvalId, approve, '');
+            this.toast(approve ? 'Verlof goedgekeurd' : 'Verlof geweigerd');
+            await this.loadVerlofApprovals();
+            this._refreshGoedkeurTabCounts();
+            this._refreshAanvraagGoedkeurCount();
+        } catch (e) {
+            this.toast('Mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._verlofDecideBusy = false;
+        }
+    },
+
+    // ============================================================
+    // v278: AANVRAGEN-tab (hub: Verlof / Materiaal / Materieel) +
+    // verlofsaldo + chat op een aanvraag + goedkeur-hub (Verlof/Facturen).
+    // ============================================================
+    _aanvraagTab: 'verlof',
+    openAanvragenTab() {
+        const u = RobawsAPI.getLoggedInUser();
+        const card = document.getElementById('aanvraagGoedkeurenCard');
+        const isBureel = u && u.role === 'bureel';
+        if (card) card.style.display = isBureel ? 'block' : 'none';
+        if (isBureel) this._refreshAanvraagGoedkeurCount();
+        this.setAanvraagTab(this._aanvraagTab || 'verlof');
+    },
+
+    setAanvraagTab(tab) {
+        this._aanvraagTab = tab;
+        document.querySelectorAll('#aanvraagSubtabs .mb-subtab').forEach(b =>
+            b.classList.toggle('active', b.dataset.atab === tab));
+        [['verlof', 'aanvraagVerlof'], ['materiaal', 'aanvraagMateriaal'], ['materieel', 'aanvraagMaterieel']].forEach(([t, id]) => {
+            const p = document.getElementById(id);
+            if (p) p.style.display = (t === tab) ? 'block' : 'none';
+        });
+        if (tab === 'verlof') { this._renderVerlofBudget(); this.loadMyVerlof(); }
+        else if (tab === 'materieel') { this.loadMaterieel(); }
+    },
+
+    async _refreshAanvraagGoedkeurCount() {
+        const badge = document.getElementById('aanvraagGoedkeurenCount');
+        if (!badge) return;
+        try {
+            const empId = this.currentUser && this.currentUser.robawsEmployeeId;
+            const [verlof, fact, mat] = await Promise.all([
+                RobawsAPI.getPendingLeaveApprovals(empId, this._myRobawsUserId()).catch(() => []),
+                RobawsAPI.getPurchaseInvoiceApprovals(this._myRobawsUserId()).catch(() => []),
+                RobawsAPI.getMaterieelAanvragen().catch(() => []),
+            ]);
+            const n = (verlof.length || 0) + (fact.length || 0) + (mat.length || 0);
+            if (n > 0) { badge.textContent = String(n); badge.style.display = ''; } else badge.style.display = 'none';
+            try { if (window.QEBridge && QEBridge.setApprovalCount) QEBridge.setApprovalCount(n); } catch (_e) {}
+        } catch (e) { badge.style.display = 'none'; }
+    },
+
+    async _renderVerlofBudget() {
+        const box = document.getElementById('verlofBudgetBox');
+        if (!box) return;
+        const empId = this.currentUser && this.currentUser.robawsEmployeeId;
+        if (!empId) { box.innerHTML = ''; return; }
+        try {
+            const [budget, used] = await Promise.all([
+                RobawsAPI.getEmployeeVerlofBudget(empId).catch(() => null),
+                RobawsAPI.getVerlofUsedHours(empId).catch(() => 0),
+            ]);
+            const jaar = new Date().getFullYear();
+            if (budget != null) {
+                const rest = Math.round((budget - used) * 100) / 100;
+                box.innerHTML = `<div class="card" style="padding:16px;display:flex;justify-content:space-between;align-items:center">
+                    <div><div style="font:400 28px var(--font);letter-spacing:-0.8px;color:var(--ink)">${rest} u</div><div style="font-size:11px;font-weight:600;color:var(--g1);letter-spacing:0.5px">RESTEREND ${jaar}</div></div>
+                    <div style="text-align:right;font-size:12.5px;color:var(--g1)">${used} u gebruikt<br>van ${budget} u</div>
+                </div>`;
+            } else {
+                box.innerHTML = `<div class="card" style="padding:16px;display:flex;justify-content:space-between;align-items:center">
+                    <div><div style="font:400 28px var(--font);letter-spacing:-0.8px;color:var(--ink)">${used} u</div><div style="font-size:11px;font-weight:600;color:var(--g1);letter-spacing:0.5px">GEBRUIKT ${jaar}</div></div>
+                    <div style="text-align:right;font-size:11px;color:var(--g1);max-width:50%">Jaartotaal niet ingesteld in Robaws</div>
+                </div>`;
+            }
+        } catch (e) { box.innerHTML = ''; }
+    },
+
+    // --- detail + chat ---
+    openVerlofDetail(torId) {
+        this._verlofDetailTorId = String(torId);
+        const r = (this._verlofReqCache || {})[String(torId)];
+        this.navigate('screenVerlofDetail');
+        const head = document.getElementById('verlofDetailHead');
+        if (head) {
+            if (r) {
+                const st = this._verlofStatus(r.status);
+                head.innerHTML = `<div class="card" style="padding:16px">
+                    <div style="font-size:16px;font-weight:600">${this.escapeHtml((r.timeOffCategory && r.timeOffCategory.name) || 'Verlof')}</div>
+                    <div style="font-size:13px;color:var(--qe-grey);margin-top:2px">${this.escapeHtml(this._verlofPeriode(r.fromDate, r.toDate))}</div>
+                    <span style="display:inline-block;margin-top:8px;font-size:11.5px;font-weight:600;color:${st.color};background:${st.bg};border:1px solid ${st.border};border-radius:12px;padding:3px 10px">${st.label}</span>
+                </div>`;
+            } else { head.innerHTML = ''; }
+        }
+        this.loadVerlofChat();
+    },
+
+    async loadVerlofChat() {
+        const torId = this._verlofDetailTorId;
+        const list = document.getElementById('verlofChatList');
+        if (!list || !torId) return;
+        list.innerHTML = '<div class="spinner"></div>';
+        try {
+            const comments = await RobawsAPI.getTimeOffComments(torId);
+            if (!comments.length) { list.innerHTML = '<p class="text-grey text-sm text-center">Nog geen berichten.</p>'; return; }
+            const myUserId = String(this._myRobawsUserId() || '');
+            list.innerHTML = comments.map(c => {
+                const aId = (c.authorId != null) ? c.authorId : (c.author && c.author.id);
+                const mine = myUserId && String(aId) === myUserId;
+                const who = (c.author && (c.author.name || c.author.fullName)) || ('Gebruiker ' + (c.authorId || '?'));
+                return `<div style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:8px">
+                    <div style="max-width:82%;padding:10px 13px;border-radius:12px;background:${mine ? 'var(--wash,#eee)' : 'var(--card,#fff)'};border:1px solid var(--cb,#e5e5e5)">
+                        <div style="font-size:11px;color:var(--qe-grey);margin-bottom:3px">${this.escapeHtml(who)} · ${this._verlofChatTime(c.createdAt)}</div>
+                        <div style="font-size:13.5px;white-space:pre-wrap">${this.escapeHtml(c.content || '')}</div>
+                    </div>
+                </div>`;
+            }).join('');
+            list.scrollTop = list.scrollHeight;
+        } catch (e) {
+            list.innerHTML = `<p class="text-grey text-sm text-center">Berichten laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    _verlofChatTime(iso) {
+        try {
+            const d = new Date(iso);
+            return d.toLocaleDateString('nl-BE', { day: 'numeric', month: 'short' }) + ' ' +
+                d.toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit' });
+        } catch (e) { return ''; }
+    },
+
+    _myRobawsUserId() {
+        const u = this.currentUser || {};
+        if (u.robawsUserId) return u.robawsUserId;
+        if (u.userId) return u.userId;
+        try { const e = (RobawsAPI.EMPLOYEES || {})[String(u.email || '').toLowerCase()]; if (e && e.userId) return e.userId; } catch (_) {}
+        return null;
+    },
+
+    async sendVerlofComment() {
+        const torId = this._verlofDetailTorId;
+        const input = document.getElementById('verlofChatInput');
+        const btn = document.getElementById('btnVerlofChatSend');
+        if (!torId || !input) return;
+        const txt = (input.value || '').trim();
+        if (!txt) return;
+        if (this._verlofChatBusy) return;
+        this._verlofChatBusy = true;
+        if (btn) btn.disabled = true;
+        try {
+            await RobawsAPI.postTimeOffComment(torId, txt, this._myRobawsUserId());
+            input.value = '';
+            await this.loadVerlofChat();
+        } catch (e) {
+            this.toast('Versturen mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._verlofChatBusy = false;
+            if (btn) btn.disabled = false;
+        }
+    },
+
+    // --- goedkeur-hub (bureel): Verlof / Facturen ---
+    _goedkeurTab: 'verlof',
+    openGoedkeuren() {
+        const u = RobawsAPI.getLoggedInUser();
+        if (!u || u.role !== 'bureel') { this.toast('Alleen bureel kan goedkeuren', true); return; }
+        this.navigate('screenGoedkeuren');
+    },
+
+    loadGoedkeuren() {
+        const u = RobawsAPI.getLoggedInUser();
+        if (!u || u.role !== 'bureel') { this.navigate('screenAanvragen'); return; }
+        this.setGoedkeurTab(this._goedkeurTab || 'verlof');
+    },
+
+    setGoedkeurTab(tab) {
+        this._goedkeurTab = tab;
+        document.querySelectorAll('#goedkeurSubtabs .mb-subtab').forEach(b =>
+            b.classList.toggle('active', b.dataset.gtab === tab));
+        const vp = document.getElementById('goedkeurVerlof'); if (vp) vp.style.display = (tab === 'verlof') ? 'block' : 'none';
+        const fp = document.getElementById('goedkeurFacturen'); if (fp) fp.style.display = (tab === 'facturen') ? 'block' : 'none';
+        const mp = document.getElementById('goedkeurMaterieel'); if (mp) mp.style.display = (tab === 'materieel') ? 'block' : 'none';
+        if (tab === 'verlof') this.loadVerlofApprovals();
+        else if (tab === 'materieel') this.loadMaterieelApprovals();
+        else this.loadFactuurApprovals();
+        this._refreshGoedkeurTabCounts();
+    },
+
+    async _refreshGoedkeurTabCounts() {
+        try {
+            const empId = this.currentUser && this.currentUser.robawsEmployeeId;
+            const [v, f, mat] = await Promise.all([
+                RobawsAPI.getPendingLeaveApprovals(empId, this._myRobawsUserId()).catch(() => []),
+                RobawsAPI.getPurchaseInvoiceApprovals(this._myRobawsUserId()).catch(() => []),
+                RobawsAPI.getMaterieelAanvragen().catch(() => []),
+            ]);
+            const setB = (id, n) => { const b = document.getElementById(id); if (b) { if (n > 0) { b.textContent = String(n); b.style.display = ''; } else b.style.display = 'none'; } };
+            setB('goedkeurVerlofCount', v.length);
+            setB('goedkeurFactuurCount', f.length);
+            setB('goedkeurMaterieelCount', mat.length);
+        } catch (e) { /* tellers zijn niet kritisch */ }
+    },
+
+    // ============================================================
+    // v284: MATERIEEL VERHUUR / UITLEEN — reserveren + goedkeuren.
+    // Data-laag: RobawsAPI.getMaterials + reservering-CRUD (JSON op /materials).
+    // Statussen: AANGEVRAAGD → GOEDGEKEURD (blokkeert) | GEWEIGERD | GEANNULEERD;
+    // GOEDGEKEURD → IN_GEBRUIK → TERUGGEBRACHT.
+    // ============================================================
+    _materieelCache: null,
+    _materieelDetailId: null,
+    _materieelBusy: false,
+
+    _matToday() { const d = new Date(), p = n => String(n).padStart(2, '0'); return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()); },
+    _matDmy(iso) { const s = String(iso || '').split('-'); return s.length === 3 ? (s[2] + '/' + s[1]) : String(iso || ''); },
+    _matDmyLong(iso) { const s = String(iso || '').split('-'); return s.length === 3 ? (s[2] + '/' + s[1] + '/' + s[0]) : String(iso || ''); },
+    _matPeriode(from, to) { return from === to ? this._matDmyLong(from) : (this._matDmyLong(from) + ' → ' + this._matDmyLong(to)); },
+
+    async _loadMaterieelList(force) {
+        if (!force && this._materieelCache && (Date.now() - this._materieelCache.at) < 60000) return this._materieelCache.mats;
+        const mats = await RobawsAPI.getMaterials({ bypassCache: !!force });
+        this._materieelCache = { at: Date.now(), mats };
+        return mats;
+    },
+    _materieelById(id) { return ((this._materieelCache && this._materieelCache.mats) || []).find(m => String(m.id) === String(id)) || null; },
+
+    _matBadge(state, res) {
+        if (state === 'IN_GEBRUIK') return { label: 'Nu in gebruik' + (res && res.to ? ' · tot ' + this._matDmy(res.to) : ''), color: '#8a4b00', bg: 'rgba(249,157,62,0.16)' };
+        if (state === 'GERESERVEERD') return { label: 'Gereserveerd' + (res && res.from ? ' · vanaf ' + this._matDmy(res.from) : ''), color: '#1f4f8a', bg: 'rgba(60,120,220,0.14)' };
+        return { label: 'Nu beschikbaar', color: '#0a6b3f', bg: 'rgba(20,160,90,0.14)' };
+    },
+    _matStatusLabel(s) {
+        return ({ AANGEVRAAGD: 'Aangevraagd', GOEDGEKEURD: 'Goedgekeurd', GEWEIGERD: 'Geweigerd', IN_GEBRUIK: 'In gebruik', TERUGGEBRACHT: 'Teruggebracht', GEANNULEERD: 'Geannuleerd' })[s] || s || '';
+    },
+    _matStatusChip(status) {
+        return ({
+            AANGEVRAAGD:   { label: 'Aangevraagd',   color: '#8a6d00', bg: 'rgba(230,180,0,0.16)' },
+            GOEDGEKEURD:   { label: 'Goedgekeurd',   color: '#0a6b3f', bg: 'rgba(20,160,90,0.14)' },
+            IN_GEBRUIK:    { label: 'In gebruik',    color: '#8a4b00', bg: 'rgba(249,157,62,0.16)' },
+            GEWEIGERD:     { label: 'Geweigerd',     color: '#a12020', bg: 'rgba(200,40,40,0.12)' },
+            GEANNULEERD:   { label: 'Geannuleerd',   color: '#666',    bg: 'rgba(0,0,0,0.06)' },
+            TERUGGEBRACHT: { label: 'Teruggebracht', color: '#666',    bg: 'rgba(0,0,0,0.06)' },
+        })[status] || { label: status || '', color: '#666', bg: 'rgba(0,0,0,0.06)' };
+    },
+
+    // Alle reserveringen van de ingelogde gebruiker over alle materialen.
+    _matMyReserveringen(mats) {
+        const myEmp = this.currentUser && this.currentUser.robawsEmployeeId;
+        const out = [];
+        for (const m of (mats || [])) {
+            for (const r of RobawsAPI._materieelReserveringen(m)) {
+                if (String(r.employeeId) === String(myEmp)) out.push(Object.assign({ materialId: m.id, materialName: m.name }, r));
+            }
+        }
+        return out;
+    },
+    // Aparte pagina met je eigen materieel-aanvragen (knop "Vorige aanvragingen"
+    // op de materieel-lijst) — houdt de hoofdlijst overzichtelijk.
+    openMaterieelAanvragen() {
+        this.navigate('screenMaterieelAanvragen');
+        this.loadMaterieelAanvragen();
+    },
+    async loadMaterieelAanvragen() {
+        const wrap = document.getElementById('materieelAanvragenList');
+        if (!wrap) return;
+        wrap.innerHTML = '<div class="spinner"></div>';
+        try {
+            const mats = await this._loadMaterieelList(true);
+            const mine = this._matMyReserveringen(mats).sort((a, b) => String(b.createdAt || b.from).localeCompare(String(a.createdAt || a.from)));
+            if (!mine.length) { wrap.innerHTML = '<p class="text-grey text-sm text-center" style="padding:24px">Je hebt nog geen materieel-aanvragen.</p>'; return; }
+            wrap.innerHTML = mine.map(r => {
+                const c = this._matStatusChip(r.status);
+                return `<div class="card" style="margin-bottom:10px;padding:14px 16px;cursor:pointer" onclick="app.openMaterieelDetail('${r.materialId}')">
+                    <div style="display:flex;align-items:center;gap:10px">
+                        <span style="flex:1;min-width:0;font-size:14.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${this.escapeHtml(r.materialName || 'Materieel')}</span>
+                        <span style="flex-shrink:0;font-size:11px;font-weight:600;color:${c.color};background:${c.bg};border-radius:12px;padding:4px 10px">${c.label}</span>
+                    </div>
+                    <div style="font-size:12.5px;color:var(--qe-grey);margin-top:3px">${this.escapeHtml(this._matPeriode(r.from, r.to))}</div>
+                    ${r.purpose ? `<div style="font-size:12.5px;color:var(--qe-grey);margin-top:2px">${this.escapeHtml(r.purpose)}</div>` : ''}
+                </div>`;
+            }).join('');
+        } catch (e) {
+            wrap.innerHTML = `<p class="text-grey text-sm text-center">Laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    // --- reservatie-agenda (maandkalender in het materieel-detail) ---
+    _matMonthNames: ['januari', 'februari', 'maart', 'april', 'mei', 'juni', 'juli', 'augustus', 'september', 'oktober', 'november', 'december'],
+    _matCalHtml() {
+        const res = this._matCalRes || [];
+        const ym = this._matCalYM;
+        if (!ym) return '';
+        const y = ym.y, m = ym.m, today = this._matToday();
+        const pad = n => String(n).padStart(2, '0');
+        const lead = (new Date(y, m, 1).getDay() + 6) % 7;   // maandag-start
+        const days = new Date(y, m + 1, 0).getDate();
+        let out = ['ma', 'di', 'wo', 'do', 'vr', 'za', 'zo'].map(d => `<div style="text-align:center;font-size:10px;color:var(--qe-grey)">${d}</div>`).join('');
+        for (let i = 0; i < lead; i++) out += '<div></div>';
+        for (let d = 1; d <= days; d++) {
+            const ds = y + '-' + pad(m + 1) + '-' + pad(d);
+            let block = false, pend = false;
+            for (const r of res) {
+                if (!r || ds < r.from || ds > r.to) continue;
+                if (RobawsAPI.MATERIEEL.BLOCKING.indexOf(r.status) !== -1) block = true;
+                else if (r.status === 'AANGEVRAAGD') pend = true;
+            }
+            const bg = block ? 'rgba(249,157,62,0.28)' : (pend ? 'rgba(230,180,0,0.18)' : 'transparent');
+            const ring = ds === today ? 'box-shadow:inset 0 0 0 2px var(--qe-orange,#F99D3E);' : '';
+            out += `<div style="height:34px;display:flex;align-items:center;justify-content:center;font-size:12px;border-radius:8px;background:${bg};${ring}font-weight:${block ? '700' : '400'}">${d}</div>`;
+        }
+        return `<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px">${out}</div>`;
+    },
+    matCalNav(delta) {
+        const ym = this._matCalYM; if (!ym) return;
+        let m = ym.m + delta, y = ym.y;
+        while (m < 0) { m += 12; y--; }
+        while (m > 11) { m -= 12; y++; }
+        this._matCalYM = { y, m };
+        const grid = document.getElementById('matCalGrid'); if (grid) grid.innerHTML = this._matCalHtml();
+        const lbl = document.getElementById('matCalLabel'); if (lbl) lbl.textContent = this._matMonthNames[m] + ' ' + y;
+    },
+
+    async loadMaterieel() {
+        const wrap = document.getElementById('materieelList');
+        if (!wrap) return;
+        wrap.innerHTML = '<div class="spinner"></div>';
+        try {
+            const all = await this._loadMaterieelList(true);
+            const mats = all.filter(m => RobawsAPI._materieelUitleenbaar(m));
+            if (!mats.length) {
+                wrap.innerHTML = '<p class="text-grey text-sm text-center" style="padding:20px">Nog geen uitleenbaar materieel.<br>Vink in Robaws de items aan met het veld "Uitleenbaar".</p>';
+                return;
+            }
+            const today = this._matToday();
+            const byCat = {};
+            for (const m of mats) { const c = RobawsAPI._materieelCategorie(m) || 'Overig'; (byCat[c] = byCat[c] || []).push(m); }
+            let html = `<button class="btn btn-outline btn-full" style="margin-bottom:14px" onclick="app.openMaterieelAanvragen()">Vorige aanvragingen</button>`;
+            Object.keys(byCat).sort().forEach(cat => {
+                html += `<div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--qe-grey);margin:16px 4px 8px">${this.escapeHtml(cat)}</div>`;
+                byCat[cat].forEach(m => {
+                    const st = RobawsAPI.materieelStatus(RobawsAPI._materieelReserveringen(m), today);
+                    const b = this._matBadge(st.state, st.res);
+                    html += `<div class="card" style="margin-bottom:10px;padding:14px 16px;display:flex;align-items:center;gap:12px;cursor:pointer" onclick="app.openMaterieelDetail('${m.id}')">
+                        <div style="flex:1;min-width:0">
+                            <div style="font-size:14.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${this.escapeHtml(m.name || 'Materieel')}</div>
+                            <div style="font-size:12px;color:var(--qe-grey);margin-top:2px">${this.escapeHtml(m.brand || '')}</div>
+                        </div>
+                        <span style="flex-shrink:0;font-size:11px;font-weight:600;color:${b.color};background:${b.bg};border-radius:12px;padding:4px 10px">${this.escapeHtml(b.label)}</span>
+                        <span style="flex-shrink:0;color:var(--qe-grey);font-size:16px">→</span>
+                    </div>`;
+                });
+            });
+            wrap.innerHTML = html;
+        } catch (e) {
+            wrap.innerHTML = `<p class="text-grey text-sm text-center">Materieel laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    openMaterieelDetail(id) {
+        this._materieelDetailId = String(id);
+        this.navigate('screenMaterieelDetail');
+        this._renderMaterieelDetail();
+    },
+
+    async _renderMaterieelDetail() {
+        const id = this._materieelDetailId;
+        const wrap = document.getElementById('materieelDetail');
+        if (!wrap || !id) return;
+        wrap.innerHTML = '<div class="spinner"></div>';
+        try {
+            const mat = await RobawsAPI._getMaterieelFresh(id);
+            if (!this._materieelCache) this._materieelCache = { at: Date.now(), mats: [] };
+            { const _i = this._materieelCache.mats.findIndex(x => String(x.id) === String(id)); if (_i >= 0) this._materieelCache.mats[_i] = mat; else this._materieelCache.mats.push(mat); }
+            const today = this._matToday();
+            const reserveringen = RobawsAPI._materieelReserveringen(mat);
+            const _now = new Date(); this._matCalYM = { y: _now.getFullYear(), m: _now.getMonth() }; this._matCalRes = reserveringen;
+            const st = RobawsAPI.materieelStatus(reserveringen, today);
+            const b = this._matBadge(st.state, st.res);
+            const myEmp = this.currentUser && this.currentUser.robawsEmployeeId;
+
+            const blocking = reserveringen.filter(r => RobawsAPI.MATERIEEL.BLOCKING.indexOf(r.status) !== -1 && r.to >= today).sort((a, c) => a.from.localeCompare(c.from));
+            const blokHtml = blocking.length
+                ? blocking.map(r => `<div style="display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--cb,#eee)">
+                        <span style="font-size:13px">${this.escapeHtml(this._matPeriode(r.from, r.to))}</span>
+                        <span style="font-size:12px;color:var(--qe-grey)">${this.escapeHtml(r.employeeName || '')}${r.status === 'IN_GEBRUIK' ? ' · in gebruik' : ''}</span>
+                    </div>`).join('')
+                : '<div style="font-size:13px;color:var(--qe-grey);padding:6px 0">Geen komende reservaties — volledig beschikbaar.</div>';
+
+            const mine = reserveringen.filter(r => String(r.employeeId) === String(myEmp) && ['AANGEVRAAGD', 'GOEDGEKEURD', 'IN_GEBRUIK', 'GEWEIGERD'].indexOf(r.status) !== -1).sort((a, c) => a.from.localeCompare(c.from));
+            const mineHtml = mine.map(r => {
+                const canCancel = r.status === 'AANGEVRAAGD' || r.status === 'GOEDGEKEURD';
+                const canReturn = (r.status === 'GOEDGEKEURD' || r.status === 'IN_GEBRUIK') && r.from <= today;
+                return `<div class="card" style="margin-bottom:8px;padding:12px 14px">
+                    <div style="display:flex;justify-content:space-between;gap:10px"><span style="font-size:13.5px;font-weight:600">${this.escapeHtml(this._matPeriode(r.from, r.to))}</span><span style="font-size:11.5px;color:var(--qe-grey)">${this._matStatusLabel(r.status)}</span></div>
+                    ${r.purpose ? `<div style="font-size:12.5px;color:var(--qe-grey);margin-top:3px">${this.escapeHtml(r.purpose)}</div>` : ''}
+                    <div style="display:flex;gap:8px;margin-top:8px">
+                        ${canReturn ? `<button class="btn btn-outline btn-sm" onclick="app.materieelTerugbrengen('${this._escapeJsArg(r.id)}')">Teruggebracht</button>` : ''}
+                        ${canCancel ? `<button class="btn btn-outline btn-sm" onclick="app.materieelAnnuleren('${this._escapeJsArg(r.id)}')">Annuleren</button>` : ''}
+                    </div>
+                </div>`;
+            }).join('');
+
+            wrap.innerHTML = `
+                <div class="card" style="padding:16px;margin-bottom:14px">
+                    <div style="font-size:17px;font-weight:600">${this.escapeHtml(mat.name || 'Materieel')}</div>
+                    <div style="font-size:12.5px;color:var(--qe-grey);margin-top:2px">${this.escapeHtml(mat.brand || '')}${mat.serialNumber ? ' · ' + this.escapeHtml(mat.serialNumber) : ''}</div>
+                    <span style="display:inline-block;margin-top:10px;font-size:12px;font-weight:600;color:${b.color};background:${b.bg};border-radius:12px;padding:4px 12px">${this.escapeHtml(b.label)}</span>
+                </div>
+                <div class="card" style="padding:16px;margin-bottom:14px">
+                    <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--qe-grey);margin-bottom:6px">Beschikbaarheid</div>
+                    ${blokHtml}
+                </div>
+                <div class="card" style="padding:16px;margin-bottom:14px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                        <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--qe-grey)">Reservatie-agenda</div>
+                        <div style="display:flex;align-items:center;gap:4px">
+                            <button onclick="app.matCalNav(-1)" style="border:none;background:none;font-size:18px;color:var(--qe-grey);cursor:pointer;padding:2px 8px;line-height:1">‹</button>
+                            <span id="matCalLabel" style="font-size:13px;font-weight:600;min-width:96px;text-align:center">${this._matMonthNames[this._matCalYM.m] + ' ' + this._matCalYM.y}</span>
+                            <button onclick="app.matCalNav(1)" style="border:none;background:none;font-size:18px;color:var(--qe-grey);cursor:pointer;padding:2px 8px;line-height:1">›</button>
+                        </div>
+                    </div>
+                    <div id="matCalGrid">${this._matCalHtml()}</div>
+                    <div style="display:flex;gap:16px;margin-top:10px;font-size:11px;color:var(--qe-grey)">
+                        <span style="display:flex;align-items:center;gap:5px"><span style="width:11px;height:11px;border-radius:3px;background:rgba(249,157,62,0.5);display:inline-block"></span>Gereserveerd</span>
+                        <span style="display:flex;align-items:center;gap:5px"><span style="width:11px;height:11px;border-radius:3px;background:rgba(230,180,0,0.4);display:inline-block"></span>Aangevraagd</span>
+                    </div>
+                </div>
+                <div class="card" style="padding:16px;margin-bottom:14px">
+                    <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--qe-grey);margin-bottom:10px">Reserveren</div>
+                    <div style="display:flex;gap:10px;margin-bottom:10px">
+                        <div style="flex:1"><label style="font-size:11px;color:var(--qe-grey)">Van</label><input type="date" id="matResVan" class="form-input" value="${today}" min="${today}" oninput="app._matCheckConflict()"></div>
+                        <div style="flex:1"><label style="font-size:11px;color:var(--qe-grey)">Tot</label><input type="date" id="matResTot" class="form-input" value="${today}" min="${today}" oninput="app._matCheckConflict()"></div>
+                    </div>
+                    <label style="font-size:11px;color:var(--qe-grey)">Reden / opmerking</label>
+                    <textarea id="matResReden" class="form-input" rows="2" placeholder="Waarvoor heb je dit nodig?"></textarea>
+                    <div id="matResMsg" style="font-size:12.5px;margin:8px 0;display:none"></div>
+                    <button class="btn btn-primary btn-full" id="btnMatReserveer" onclick="app.submitMaterieelReservering()">Reserveren aanvragen</button>
+                </div>
+                ${mine.length ? `<div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--qe-grey);margin:4px 4px 8px">Mijn reservaties</div>${mineHtml}` : ''}
+            `;
+            this._matCheckConflict();
+        } catch (e) {
+            wrap.innerHTML = `<p class="text-grey text-sm text-center">Laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    _matCheckConflict() {
+        const mat = this._materieelById(this._materieelDetailId);
+        const van = (document.getElementById('matResVan') || {}).value;
+        const tot = (document.getElementById('matResTot') || {}).value || van;
+        const msg = document.getElementById('matResMsg');
+        const btn = document.getElementById('btnMatReserveer');
+        if (!mat || !van || !msg) return;
+        if (tot < van) { msg.style.display = 'block'; msg.style.color = 'var(--qe-red)'; msg.textContent = 'De einddatum ligt vóór de begindatum.'; if (btn) btn.disabled = true; return; }
+        const conflicts = RobawsAPI.materieelConflicts(RobawsAPI._materieelReserveringen(mat), van, tot);
+        if (conflicts.length) {
+            const c = conflicts[0];
+            msg.style.display = 'block'; msg.style.color = 'var(--qe-red)';
+            msg.textContent = 'Niet beschikbaar: al gereserveerd ' + this._matPeriode(c.from, c.to) + (c.employeeName ? ' (' + c.employeeName + ')' : '') + '.';
+            if (btn) btn.disabled = true;
+        } else { msg.style.display = 'none'; if (btn) btn.disabled = false; }
+    },
+
+    async submitMaterieelReservering() {
+        if (this._materieelBusy) return;
+        const id = this._materieelDetailId;
+        const van = (document.getElementById('matResVan') || {}).value;
+        const tot = (document.getElementById('matResTot') || {}).value || van;
+        const reden = ((document.getElementById('matResReden') || {}).value || '').trim();
+        const msg = document.getElementById('matResMsg');
+        const btn = document.getElementById('btnMatReserveer');
+        const showErr = (m) => { if (msg) { msg.style.display = 'block'; msg.style.color = 'var(--qe-red)'; msg.textContent = m; } else this.toast(m, true); };
+        if (!van) return showErr('Kies een begindatum.');
+        if (tot < van) return showErr('De einddatum ligt vóór de begindatum.');
+        const empId = this.currentUser && this.currentUser.robawsEmployeeId;
+        if (!empId) return showErr('Geen werknemer-koppeling gevonden.');
+        this._materieelBusy = true;
+        if (btn) { btn.disabled = true; btn.textContent = 'Versturen...'; }
+        try {
+            const mat = await RobawsAPI._getMaterieelFresh(id);
+            const arr = RobawsAPI._materieelReserveringen(mat);
+            const conflicts = RobawsAPI.materieelConflicts(arr, van, tot);
+            if (conflicts.length) { const c = conflicts[0]; throw new Error('Ondertussen gereserveerd ' + this._matPeriode(c.from, c.to) + '.'); }
+            arr.push({
+                id: RobawsAPI._resNewId(),
+                materialId: mat.id,
+                employeeId: empId,
+                employeeName: (this.currentUser && this.currentUser.name) || '',
+                from: van, to: tot,
+                status: 'AANGEVRAAGD',
+                purpose: reden,
+                createdAt: new Date().toISOString(),
+            });
+            await RobawsAPI._putMaterieelReserveringen(mat, arr);
+            this.toast('Reservatie aangevraagd');
+            this._materieelCache = null;
+            this._renderMaterieelDetail();
+            if (RobawsAPI.getLoggedInUser() && RobawsAPI.getLoggedInUser().role === 'bureel') this._refreshAanvraagGoedkeurCount();
+        } catch (e) {
+            showErr('Aanvragen mislukt: ' + (e.message || '?'));
+        } finally {
+            this._materieelBusy = false;
+            if (btn) { btn.disabled = false; btn.textContent = 'Reserveren aanvragen'; }
+        }
+    },
+
+    async materieelAnnuleren(resId) {
+        const confirmFn = (window.QEClock && QEClock._showConfirmModal) ? QEClock._showConfirmModal.bind(QEClock) : (t, m) => Promise.resolve(window.confirm(m));
+        const ok = await confirmFn('Annuleren', 'Deze reservatie annuleren?', 'Ja, annuleren', 'Nee');
+        if (!ok) return;
+        try {
+            await RobawsAPI.patchMaterieelReservering(this._materieelDetailId, resId, { status: 'GEANNULEERD', decidedAt: new Date().toISOString() });
+            this._materieelCache = null;
+            this.toast('Reservatie geannuleerd');
+            this._renderMaterieelDetail();
+        } catch (e) { this.toast('Annuleren mislukt: ' + (e.message || '?'), true); }
+    },
+
+    async materieelTerugbrengen(resId) {
+        try {
+            await RobawsAPI.patchMaterieelReservering(this._materieelDetailId, resId, { status: 'TERUGGEBRACHT', returnedAt: new Date().toISOString() });
+            this._materieelCache = null;
+            this.toast('Genoteerd als teruggebracht');
+            this._renderMaterieelDetail();
+        } catch (e) { this.toast('Mislukt: ' + (e.message || '?'), true); }
+    },
+
+    // --- bureel: materieel-aanvragen goedkeuren ---
+    async loadMaterieelApprovals() {
+        const list = document.getElementById('materieelBeheerList');
+        if (!list) return;
+        list.innerHTML = '<div class="spinner"></div>';
+        try {
+            const items = await RobawsAPI.getMaterieelAanvragen();
+            if (!items.length) { list.innerHTML = '<p class="text-grey text-sm text-center">Geen openstaande materieel-aanvragen.</p>'; return; }
+            list.innerHTML = items.map(r => `<div class="card" style="margin-bottom:10px;padding:14px 16px">
+                <div style="display:flex;justify-content:space-between;gap:10px"><span style="font-size:14.5px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${this.escapeHtml(r.materialName || 'Materieel')}</span><span style="font-size:12px;color:var(--qe-grey);flex-shrink:0">${this.escapeHtml(this._matPeriode(r.from, r.to))}</span></div>
+                <div style="font-size:12.5px;color:var(--qe-grey);margin-top:3px">${this.escapeHtml(r.employeeName || '')}${r.purpose ? ' — ' + this.escapeHtml(r.purpose) : ''}</div>
+                <div style="display:flex;gap:8px;margin-top:10px">
+                    <button class="btn btn-primary btn-sm" style="flex:1" onclick="app.decideMaterieel('${this._escapeJsArg(String(r.materialId))}','${this._escapeJsArg(String(r.id))}',true)">Goedkeuren</button>
+                    <button class="btn btn-outline btn-sm" style="flex:1" onclick="app.decideMaterieel('${this._escapeJsArg(String(r.materialId))}','${this._escapeJsArg(String(r.id))}',false)">Weigeren</button>
+                </div>
+            </div>`).join('');
+        } catch (e) {
+            list.innerHTML = `<p class="text-grey text-sm text-center">Laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    async decideMaterieel(materialId, resId, approve) {
+        if (this._materieelDecideBusy) return;
+        const decider = (this.currentUser && this.currentUser.name) || 'Bureel';
+        const confirmFn = (window.QEClock && QEClock._showConfirmModal) ? QEClock._showConfirmModal.bind(QEClock) : (t, m) => Promise.resolve(window.confirm(m));
+        this._materieelDecideBusy = true;
+        try {
+            if (approve) {
+                const mat = await RobawsAPI._getMaterieelFresh(materialId);
+                const arr = RobawsAPI._materieelReserveringen(mat);
+                const i = arr.findIndex(r => String(r.id) === String(resId));
+                if (i === -1) throw new Error('Reservering niet gevonden');
+                const target = arr[i];
+                const conflicts = RobawsAPI.materieelConflicts(arr, target.from, target.to, resId);
+                if (conflicts.length) {
+                    const c = conflicts[0];
+                    const ok = await confirmFn('Let op — overlap', 'Botst met een goedgekeurde reservatie ' + this._matPeriode(c.from, c.to) + (c.employeeName ? ' (' + this.escapeHtml(c.employeeName) + ')' : '') + '. Toch goedkeuren?', 'Toch goedkeuren', 'Annuleren');
+                    if (!ok) { this._materieelDecideBusy = false; return; }
+                }
+                arr[i] = Object.assign({}, target, { status: 'GOEDGEKEURD', decidedBy: decider, decidedAt: new Date().toISOString() });
+                await RobawsAPI._putMaterieelReserveringen(mat, arr);
+                this.toast('Reservatie goedgekeurd');
+            } else {
+                const ok = await confirmFn('Weigeren', 'Deze materieel-aanvraag weigeren?', 'Weigeren', 'Annuleren');
+                if (!ok) { this._materieelDecideBusy = false; return; }
+                await RobawsAPI.patchMaterieelReservering(materialId, resId, { status: 'GEWEIGERD', decidedBy: decider, decidedAt: new Date().toISOString() });
+                this.toast('Reservatie geweigerd');
+            }
+            this._materieelCache = null;
+            this.loadMaterieelApprovals();
+            this._refreshGoedkeurTabCounts();
+            this._refreshAanvraagGoedkeurCount();
+        } catch (e) {
+            this.toast('Beslissen mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._materieelDecideBusy = false;
+        }
+    },
+
+    async loadFactuurApprovals() {
+        const list = document.getElementById('factuurBeheerList');
+        if (!list) return;
+        list.innerHTML = '<div class="spinner"></div>';
+        try {
+            const items = await RobawsAPI.getPurchaseInvoiceApprovals(this._myRobawsUserId());
+            this._factuurApprovalCache = {};
+            if (!items.length) { list.innerHTML = '<p class="text-grey text-sm text-center">Geen openstaande factuur-goedkeuringen.</p>'; return; }
+            list.innerHTML = items.map(a => {
+                this._factuurApprovalCache[String(a.id)] = a;
+                const nr = a.invoiceNumber || a.logicId || (a.resourceUnderApprovalRef || '');
+                const bedrag = (a.totalVatIncl != null) ? ('€ ' + Number(a.totalVatIncl).toFixed(2)) : '';
+                const sup = (a.supplier && a.supplier.name) || (a.supplierId ? ('Leverancier ' + a.supplierId) : '');
+                return `<div class="card card-clickable" style="margin-bottom:10px;padding:14px 16px;cursor:pointer" onclick="app.openFactuurDetail('${this._escapeJsArg(String(a.id))}')">
+                    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px">
+                        <span style="font-size:14.5px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${this.escapeHtml(String(nr))}</span>
+                        <span style="font-size:14px;font-weight:600;flex-shrink:0">${bedrag}</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:3px">
+                        <span style="font-size:12.5px;color:var(--qe-grey);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${this.escapeHtml(sup)}${a.date ? ' · ' + this.escapeHtml(String(a.date)) : ''}</span>
+                        <span style="flex-shrink:0;color:var(--qe-grey);font-size:16px">→</span>
+                    </div>
+                </div>`;
+            }).join('');
+        } catch (e) {
+            list.innerHTML = `<p class="text-grey text-sm text-center">Laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    // ===== v283: factuur-goedkeuring — detail, PDF (fullscreen), beslissen,
+    // goedkeurder toevoegen. De accept/reject-beslissing gaat via de gedeelde
+    // sleutel (kantoor); add-approver zet een echte extra goedkeurder. =====
+    openFactuurDetail(approvalId) {
+        this._factuurDetailId = String(approvalId);
+        this.navigate('screenFactuurDetail');
+        this.loadFactuurDetail();
+    },
+
+    async loadFactuurDetail() {
+        const host = document.getElementById('factuurDetailContent');
+        if (!host) return;
+        const id = this._factuurDetailId;
+        if (!id) { host.innerHTML = '<p class="text-grey text-sm text-center">Geen factuur geselecteerd.</p>'; return; }
+        host.innerHTML = '<div class="spinner"></div>';
+        let detail = (this._factuurApprovalCache || {})[id] || {};
+        // Merge het lijst-item (heeft resourceUnderApprovalRef + displayvelden) met
+        // het verse detail (heeft userStates) — nooit de ref-drager wegwerken.
+        try { const fresh = await RobawsAPI.getApprovalDetail(id); if (fresh) detail = Object.assign({}, detail, fresh); } catch (e) { /* val terug op de lijst-data */ }
+        this._factuurApprovalCache = this._factuurApprovalCache || {};
+        this._factuurApprovalCache[id] = detail;
+        const invoiceId = detail.resourceUnderApprovalRef ? String(detail.resourceUnderApprovalRef).split('/').pop() : null;
+        this._factuurInvoiceId = invoiceId;
+
+        // v288: volledige factuur (lijnen + velden) + keuzelijsten parallel ophalen.
+        let inv = null, journals = [], payconds = [];
+        const [i, j, p] = await Promise.all([
+            invoiceId ? RobawsAPI.getPurchaseInvoiceFull(invoiceId).catch(() => null) : Promise.resolve(null),
+            RobawsAPI.getJournals().catch(() => []),
+            RobawsAPI.getPaymentConditions().catch(() => []),
+        ]);
+        inv = i; journals = j; payconds = p;
+        this._factuurInvoice = inv;
+        this._factuurJournals = journals;
+        this._factuurPayconds = payconds;
+
+        const nr = (inv && inv.invoiceNumber) || detail.invoiceNumber || detail.logicId || '';
+        const inclN = (detail.totalVatIncl != null) ? detail.totalVatIncl : (inv && inv.totalInclVat);
+        const exclN = (detail.totalVatExcl != null) ? detail.totalVatExcl : (inv && inv.totalExclVat);
+        const inclV = (inclN != null) ? ('€ ' + Number(inclN).toFixed(2)) : '';
+        const exclV = (exclN != null) ? ('€ ' + Number(exclN).toFixed(2)) : '';
+        const sup = (detail.supplier && detail.supplier.name) || (inv && inv.supplier && inv.supplier.name) || (detail.supplierId ? ('Leverancier ' + detail.supplierId) : '');
+        const states = Array.isArray(detail.userStates) ? detail.userStates : [];
+        const stRow = (s) => {
+            const st = String(s.status || '');
+            const lbl = st === 'ACCEPTED' ? 'Goedgekeurd' : (st === 'REJECTED' ? 'Geweigerd' : 'In afwachting');
+            const col = st === 'ACCEPTED' ? 'var(--qe-green,#3E7A54)' : (st === 'REJECTED' ? 'var(--qe-red,#B4372F)' : 'var(--qe-grey)');
+            return `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--l2,#eee)">
+                <span style="font-size:13.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${this.escapeHtml(RobawsAPI.nameForUserId(s.userId))}</span>
+                <span style="font-size:12px;font-weight:600;flex-shrink:0;color:${col}">${lbl}</span>
+            </div>`;
+        };
+        const approvers = states.length
+            ? states.map(stRow).join('')
+            : '<div style="font-size:12.5px;color:var(--qe-grey);padding:6px 0">Geen goedkeurders-info beschikbaar.</div>';
+
+        host.innerHTML = `
+            <div class="card" style="margin-bottom:12px;padding:16px">
+                <div style="font-size:17px;font-weight:600;color:var(--ink,#1A237E)">${this.escapeHtml(String(nr))}</div>
+                <div style="font-size:13px;color:var(--qe-grey);margin-top:2px">${this.escapeHtml(sup)}${detail.date ? ' · ' + this.escapeHtml(String(detail.date)) : ''}</div>
+                <div style="display:flex;gap:20px;margin-top:14px">
+                    <div><div style="font:400 22px var(--font,inherit);color:var(--ink,#1A237E)">${inclV}</div><div style="font-size:11px;color:var(--qe-grey)">incl. btw</div></div>
+                    ${exclV ? `<div><div style="font:400 22px var(--font,inherit);color:var(--ink,#1A237E)">${exclV}</div><div style="font-size:11px;color:var(--qe-grey)">excl. btw</div></div>` : ''}
+                </div>
+            </div>
+            <button class="btn btn-primary btn-full" style="margin-bottom:12px" onclick="app.openFactuurPdf('${this._escapeJsArg(id)}')">Factuur openen (PDF)</button>
+            <div id="factuurRefSuggest"></div>
+            <div class="card" style="margin-bottom:12px;padding:14px 16px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--qe-grey);margin-bottom:2px">Goedkeuringsflow</div>
+                ${approvers}
+                <button class="btn btn-outline btn-sm btn-full" style="margin-top:12px" onclick="app.addFactuurApprover('${this._escapeJsArg(id)}')">+ Goedkeurder toevoegen</button>
+            </div>
+            <div style="display:flex;gap:8px">
+                <button class="btn btn-outline" style="flex:1" onclick="app.decideFactuur('${this._escapeJsArg(id)}', false)">Afkeuren</button>
+                <button class="btn btn-primary" style="flex:1" onclick="app.decideFactuur('${this._escapeJsArg(id)}', true)">Goedkeuren</button>
+            </div>
+            <div style="font-size:11px;color:var(--qe-grey);text-align:center;margin:10px 0 14px;line-height:1.4">Goedkeuren/afkeuren wordt geregistreerd op het gedeelde kantoor-account.</div>
+            ${this._renderFacturatiePanel(inv, sup)}
+            ${this._renderFactuurLines(inv)}
+            ${this._renderFactuurComments()}
+            ${this._renderFactuurTaken()}`;
+        // v305: auto-suggestie — scan de PDF-tekst op project- én verkooporder-referenties.
+        this._suggestLinksFromPdf(invoiceId, inv);
+        this.loadFactuurComments(invoiceId);
+        this.loadFactuurTaken(invoiceId);
+    },
+
+    // ===== v304: PDF-referentie → project automatisch voorstellen (één tik). =====
+    async _extractPdfText(blob) {
+        await this._ensurePdfLib();
+        await this._ensurePdfWorker();
+        const buf = await blob.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+        let text = '';
+        for (let p = 1; p <= pdf.numPages; p++) {
+            const page = await pdf.getPage(p);
+            const tc = await page.getTextContent();
+            text += ' ' + tc.items.map(it => it.str).join(' ');
+        }
+        return text;
+    },
+
+    async _suggestLinksFromPdf(invoiceId, inv) {
+        try {
+            if (!invoiceId || !inv) return;
+            const lines = (inv.lineItems || []).filter(l => l.type === 'LINE');
+            if (!lines.length) return;
+            const needProject = !lines.every(l => l.projectId);
+            const needOrder = !lines.every(l => l.salesOrderId);
+            if (!needProject && !needOrder) return;
+            const docId = await RobawsAPI.getPurchaseInvoiceDocumentId(invoiceId);
+            if (!docId) return;
+            const doc = await RobawsAPI.getDocumentUrl(docId);
+            if (!doc || !doc.blob) return;
+            let text = '';
+            try { text = await this._extractPdfText(doc.blob); } catch (_e) {}
+            if (doc.blobUrl) { try { URL.revokeObjectURL(doc.blobUrl); } catch (_e) {} }
+            const uniq = (re) => Array.from(new Set((text.match(re) || []).map(m => m.toUpperCase().replace(/[\s-]/g, ''))));
+            const suggestions = [];
+            if (needProject) {
+                for (const c of uniq(/\bP\s?-?\s?\d{6}\b/gi)) {
+                    const proj = await RobawsAPI.getProjectByLogicId(c);
+                    if (proj) { suggestions.push({ kind: 'project', id: proj.id, logicId: proj.logicId, name: proj.name }); break; }
+                }
+            }
+            if (needOrder) {
+                for (const c of uniq(/\bR\s?-?\s?\d{6}\b/gi)) {
+                    const ord = await RobawsAPI.getSalesOrderByLogicId(c);
+                    if (ord) { suggestions.push({ kind: 'order', id: ord.id, logicId: ord.logicId, name: ord.name }); break; }
+                }
+            }
+            if (suggestions.length) this._showRefSuggestion(invoiceId, suggestions);
+        } catch (_e) { /* suggestie is optioneel — stil falen */ }
+    },
+
+    _showRefSuggestion(invoiceId, suggestions) {
+        if (this._factuurInvoiceId !== String(invoiceId)) return;
+        const host = document.getElementById('factuurRefSuggest');
+        if (!host) return;
+        this._refSuggest = suggestions;
+        const rows = suggestions.map((s, i) => {
+            const noun = s.kind === 'order' ? 'verkooporder' : 'project';
+            const naam = (s.name || '').trim();
+            return `<div style="font-size:12.5px;color:var(--ink,#1A237E);line-height:1.4${i ? ';margin-top:12px' : ''}">📎 Referentie <b>${this.escapeHtml(s.logicId)}</b> gevonden in de PDF${naam ? (' → ' + noun + ' <b>' + this.escapeHtml(naam) + '</b>') : ''}.</div>
+            <button class="btn btn-primary btn-sm btn-full" style="margin-top:8px" onclick="app.applyRefSuggestion(${i})">Koppel alle lijnen aan ${this.escapeHtml(s.logicId)}</button>`;
+        }).join('');
+        host.innerHTML = `<div class="card" style="margin-bottom:12px;padding:14px 16px;border:1.5px solid var(--qe-green,#3E7A54)">${rows}</div>`;
+    },
+
+    async applyRefSuggestion(idx) {
+        const s = (this._refSuggest || [])[idx || 0];
+        const invId = this._factuurInvoiceId;
+        const inv = this._factuurInvoice;
+        if (!s || !invId || !inv) return;
+        if (this._assignBusy) return;
+        this._assignBusy = true;
+        try {
+            const lines = (inv.lineItems || []).filter(l => l.type === 'LINE');
+            for (const l of lines) {
+                if (s.kind === 'order') await RobawsAPI.setLineItemSalesOrder(invId, l.id, s.id);
+                else await RobawsAPI.setLineItemProject(invId, l.id, s.id);
+            }
+            this.toast('Alle lijnen gekoppeld aan ' + s.logicId);
+            await this.loadFactuurDetail();
+        } catch (e) {
+            this.toast('Koppelen mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._assignBusy = false;
+        }
+    },
+
+    // v288: inklapbaar bewerkbaar facturatie-gegevens-paneel.
+    _renderFacturatiePanel(inv, sup) {
+        if (!inv) {
+            return `<div class="card" style="margin-bottom:12px;padding:14px 16px"><div style="font-size:12.5px;color:var(--qe-grey)">Factuurgegevens niet beschikbaar.</div></div>`;
+        }
+        const esc = (v) => this.escapeHtml(v == null ? '' : String(v));
+        const opt = (v, cur, lbl) => `<option value="${esc(v)}"${String(cur == null ? '' : cur) === String(v) ? ' selected' : ''}>${esc(lbl)}</option>`;
+        const journals = this._factuurJournals || [];
+        const payconds = this._factuurPayconds || [];
+        const bureel = (RobawsAPI.getBureelApprovers ? RobawsAPI.getBureelApprovers() : []);
+        const jOpts = journals.map(o => opt(o.id, inv.journalId, o.name)).join('');
+        const pOpts = '<option value="">—</option>' + payconds.map(o => opt(o.id, inv.paymentConditionId, o.name)).join('');
+        const uOpts = '<option value="">—</option>' + bureel.map(u => opt(u.userId, inv.assignedUserId, u.name)).join('');
+        const grp = (label, inner) => `<div style="margin-bottom:10px"><label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:3px">${label}</label>${inner}</div>`;
+        const inp = (id, val, type) => `<input id="${id}" class="form-input" ${type ? ('type="' + type + '" ') : ''}value="${esc(val)}">`;
+        const body = `
+            ${grp('Factuur nr.', inp('fgNr', inv.invoiceNumber))}
+            ${grp('Type', `<select id="fgType" class="form-input">${opt('INVOICE', inv.type, 'Factuur')}${opt('CREDIT_NOTE', inv.type, 'Creditnota')}</select>`)}
+            ${grp('Dagboek', `<select id="fgJournal" class="form-input"><option value="">—</option>${jOpts}</select>`)}
+            ${grp('Leverancier', `<input class="form-input" value="${esc(sup)}" disabled>`)}
+            ${grp('Betaalvoorwaarde', `<select id="fgPay" class="form-input">${pOpts}</select>`)}
+            ${grp('Datum', inp('fgDate', inv.date, 'date'))}
+            ${grp('Vervaldatum', inp('fgExpire', inv.expireDate, 'date'))}
+            ${grp('Boekingsdatum', inp('fgBooking', inv.bookingDate, 'date'))}
+            ${grp('Verantwoordelijke', `<select id="fgUser" class="form-input">${uOpts}</select>`)}
+            ${grp('Status', inp('fgStatus', inv.status))}
+            ${grp('Mededeling', inp('fgRemit', inv.paymentInstruction))}
+            ${grp('Opmerking', `<textarea id="fgRemark" class="form-input" rows="2">${esc(inv.remark)}</textarea>`)}
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:2px 0 12px"><input type="checkbox" id="fgConf"${inv.confidential ? ' checked' : ''}> Confidentieel</label>
+            <button class="btn btn-primary btn-full" onclick="app.saveFactuurFields()">Opslaan</button>`;
+        return `<div class="card" style="margin-bottom:12px;padding:4px 16px">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;cursor:pointer" onclick="app.toggleFacturatiePanel()">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--qe-grey)">Facturatie gegevens</div>
+                <span id="fgChev" style="color:var(--qe-grey);font-size:15px">▾</span>
+            </div>
+            <div id="fgBody" style="display:none;padding:2px 0 14px">${body}</div>
+        </div>`;
+    },
+
+    toggleFacturatiePanel() {
+        const b = document.getElementById('fgBody');
+        const c = document.getElementById('fgChev');
+        if (!b) return;
+        const open = b.style.display === 'none';
+        b.style.display = open ? 'block' : 'none';
+        if (c) c.textContent = open ? '▴' : '▾';
+    },
+
+    async saveFactuurFields() {
+        const invId = this._factuurInvoiceId;
+        const orig = this._factuurInvoice;
+        if (!invId || !orig) { this.toast('Factuur niet geladen', true); return; }
+        const val = (id) => { const el = document.getElementById(id); return el ? el.value : undefined; };
+        const changes = {};
+        const put = (field, nv, ov) => {
+            if (nv === undefined) return;
+            const a = (nv === null ? '' : String(nv));
+            const b = (ov == null ? '' : String(ov));
+            if (a !== b) changes[field] = (nv === '' ? null : nv);
+        };
+        put('invoiceNumber', val('fgNr'), orig.invoiceNumber);
+        put('type', val('fgType'), orig.type);
+        put('journalId', val('fgJournal'), orig.journalId);
+        put('paymentConditionId', val('fgPay'), orig.paymentConditionId);
+        put('date', val('fgDate'), orig.date);
+        put('expireDate', val('fgExpire'), orig.expireDate);
+        put('bookingDate', val('fgBooking'), orig.bookingDate);
+        put('assignedUserId', val('fgUser'), orig.assignedUserId);
+        put('status', val('fgStatus'), orig.status);
+        put('paymentInstruction', val('fgRemit'), orig.paymentInstruction);
+        put('remark', val('fgRemark'), orig.remark);
+        const confEl = document.getElementById('fgConf');
+        if (confEl && !!confEl.checked !== !!orig.confidential) changes.confidential = !!confEl.checked;
+        if (!Object.keys(changes).length) { this.toast('Niets gewijzigd'); return; }
+        if (this._saveFieldsBusy) return;
+        this._saveFieldsBusy = true;
+        try {
+            await RobawsAPI.patchPurchaseInvoice(invId, changes);
+            this.toast('Factuurgegevens opgeslagen');
+            await this.loadFactuurDetail();
+        } catch (e) {
+            this.toast('Opslaan mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._saveFieldsBusy = false;
+        }
+    },
+
+    // v288/v305: alle factuurlijnen + project- én verkooporder-toewijzing
+    // (per lijn / alles ineens), net als in de Robaws-goedkeuring.
+    _renderFactuurLines(inv) {
+        if (!inv) {
+            return `<div class="card" style="margin-bottom:12px;padding:14px 16px"><div style="font-size:12.5px;color:var(--qe-grey)">Lijnen niet beschikbaar.</div></div>`;
+        }
+        const lines = Array.isArray(inv.lineItems) ? inv.lineItems : [];
+        const linkRow = (leeg, val, has, onclick) => `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:5px">
+            <span style="font-size:12px;color:${has ? 'var(--ink,#1A237E)' : 'var(--qe-grey)'};min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${has ? this.escapeHtml(val) : leeg}</span>
+            <button class="btn btn-outline btn-sm" style="padding:4px 12px;font-size:12px;flex-shrink:0" onclick="${onclick}">${has ? 'Wijzig' : 'Toewijzen'}</button>
+        </div>`;
+        const rows = lines.map((l) => {
+            const isLine = l.type === 'LINE';
+            const proj = (l.project && ((l.project.logicId || '') + ' ' + (l.project.planningName || l.project.name || '')).trim())
+                || (l.projectId ? ('Project ' + l.projectId) : '');
+            const ord = (l.salesOrder && ((l.salesOrder.logicId || '') + ' ' + (l.salesOrder.title || '')).trim())
+                || (l.salesOrderId ? ('Order ' + l.salesOrderId) : '');
+            const amt = (isLine && l.price != null) ? ('€ ' + (Number(l.price) * Number(l.quantity || 1)).toFixed(2)) : '';
+            const qty = isLine && l.quantity != null ? (Number(l.quantity) + '× ') : '';
+            const desc = l.description || (l.type === 'TEXT' ? '(tekst)' : '(lijn)');
+            const jid = this._escapeJsArg(String(l.id));
+            return `<div style="padding:10px 0;border-bottom:1px solid var(--l2,#eee)">
+                <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline">
+                    <span style="font-size:13px;min-width:0">${this.escapeHtml(desc)}</span>
+                    <span style="font-size:12.5px;color:var(--qe-grey);flex-shrink:0">${qty}${amt}</span>
+                </div>
+                ${isLine ? linkRow('Geen project', proj, !!proj, `app.assignLineProject('${jid}')`) : ''}
+                ${isLine ? linkRow('Geen verkooporder', ord, !!ord, `app.assignLineOrder('${jid}')`) : ''}
+            </div>`;
+        }).join('');
+        const hasLines = lines.some(l => l.type === 'LINE');
+        return `<div class="card" style="margin-bottom:12px;padding:14px 16px">
+            <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--qe-grey);margin-bottom:4px">Lijnen (${lines.length})</div>
+            ${rows || '<div style="font-size:12.5px;color:var(--qe-grey);padding:6px 0">Geen lijnen.</div>'}
+            ${hasLines ? `<div style="display:flex;gap:8px;margin-top:12px">
+                <button class="btn btn-outline btn-sm" style="flex:1;font-size:12px" onclick="app.assignAllLinesProject()">Alle → project</button>
+                <button class="btn btn-outline btn-sm" style="flex:1;font-size:12px" onclick="app.assignAllLinesOrder()">Alle → order</button>
+            </div>` : ''}
+        </div>`;
+    },
+
+    // v305: gegeneraliseerde koppel-picker — project OF verkooporder.
+    assignLineProject(lineId) { this._pickTarget = 'line:' + lineId; this._pickKind = 'project'; this.openLinkPicker(); },
+    assignAllLinesProject() { this._pickTarget = 'all'; this._pickKind = 'project'; this.openLinkPicker(); },
+    assignLineOrder(lineId) { this._pickTarget = 'line:' + lineId; this._pickKind = 'order'; this.openLinkPicker(); },
+    assignAllLinesOrder() { this._pickTarget = 'all'; this._pickKind = 'order'; this.openLinkPicker(); },
+
+    async openLinkPicker() {
+        if (this._pickBusy) return;
+        this._pickBusy = true;
+        const order = this._pickKind === 'order';
+        this.toast(order ? 'Verkooporders laden…' : 'Projecten laden…');
+        let list = [];
+        try {
+            list = order ? await RobawsAPI.searchSalesOrders('', 60) : await RobawsAPI.searchProjects('', 60);
+        } catch (e) {
+            this._pickBusy = false;
+            this.toast((order ? 'Verkooporders' : 'Projecten') + ' laden mislukt: ' + ((e && e.message) || '?'), true);
+            return;
+        }
+        this._pickBusy = false;
+        this._pickAll = Array.isArray(list) ? list : [];
+        const cnt = this._pickAll.length;
+        const noun = order ? 'verkooporder' : 'project';
+        // Géén geneste vh-scrollbox (klapt in de file://-WebView tot 0px) — de
+        // .modal-sheet scrollt zelf.
+        this.showModal(`<div><h3 style="margin:0 0 10px">${order ? 'Verkooporder' : 'Project'} toewijzen</h3>
+            <input id="linkPickSearch" class="form-input" placeholder="Zoek ${noun}…" oninput="app.searchLinkPicker(this.value)" style="margin-bottom:10px">
+            <div style="font-size:11.5px;color:var(--qe-grey);margin-bottom:8px">${cnt} ${noun}(en) — tik er één of typ om te zoeken.</div>
+            <div id="linkPickResults"></div>
+            <button class="btn btn-outline btn-full" style="margin-top:10px" onclick="app.pickLink('','')">Geen ${noun} (wissen)</button>
+            <button class="btn btn-outline btn-full" style="margin-top:6px" onclick="app.closeModal()">Annuleren</button></div>`);
+        const b = document.getElementById('linkPickResults');
+        if (b) b.innerHTML = this._linkPickRows(this._pickAll);
+        else this.toast('Resultvak niet gevonden in de modal', true);
+    },
+
+    _linkPickRows(list) {
+        const order = this._pickKind === 'order';
+        if (!list || !list.length) return `<div style="font-size:12.5px;color:var(--qe-grey);padding:12px">Geen ${order ? 'verkooporders' : 'projecten'} gevonden.</div>`;
+        return list.map(p => {
+            const label = (p.logicId + ' ' + p.name).trim();
+            const main = (p.logicId + ' — ' + p.name).trim();
+            const sub = order ? [p.status, p.date, p.client].filter(Boolean).join(' · ') : '';
+            return `<button class="btn btn-outline btn-full" style="margin-bottom:6px;text-align:left${sub ? ';line-height:1.35' : ''}" onclick="app.pickLink('${this._escapeJsArg(p.id)}','${this._escapeJsArg(label)}')">${this.escapeHtml(main)}${sub ? `<br><span style="font-size:11px;color:var(--qe-grey)">${this.escapeHtml(sub)}</span>` : ''}</button>`;
+        }).join('');
+    },
+
+    // Typen: eerst INSTANT lokaal filteren op de reeds geladen lijst (kan niet
+    // stil falen); bij een langere query ook server-side zoeken.
+    searchLinkPicker(q) {
+        const box = document.getElementById('linkPickResults');
+        const ql = (q || '').toLowerCase();
+        const order = this._pickKind === 'order';
+        const local = (this._pickAll || []).filter(p => (p.logicId + ' ' + p.name + ' ' + (p.client || '')).toLowerCase().indexOf(ql) !== -1);
+        if (box) box.innerHTML = this._linkPickRows(local);
+        clearTimeout(this._pickTimer);
+        if (!q || q.length < 2) return;
+        const token = (this._pickToken = (this._pickToken || 0) + 1);
+        this._pickTimer = setTimeout(async () => {
+            try {
+                const srv = order ? await RobawsAPI.searchSalesOrders(q, 40) : await RobawsAPI.searchProjects(q, 40);
+                if (token !== this._pickToken) return;
+                const b = document.getElementById('linkPickResults');
+                if (b && srv && srv.length) b.innerHTML = this._linkPickRows(srv);
+            } catch (_e) { /* de lokale filter staat er al */ }
+        }, 300);
+    },
+
+    async pickLink(id, label) {
+        this.closeModal();
+        const invId = this._factuurInvoiceId;
+        const inv = this._factuurInvoice;
+        if (!invId || !inv) { this.toast('Factuur niet geladen', true); return; }
+        if (this._assignBusy) return;
+        this._assignBusy = true;
+        const order = this._pickKind === 'order';
+        const noun = order ? 'Verkooporder' : 'Project';
+        const setOne = (lineId) => order
+            ? RobawsAPI.setLineItemSalesOrder(invId, lineId, id || null)
+            : RobawsAPI.setLineItemProject(invId, lineId, id || null);
+        try {
+            const target = this._pickTarget;
+            if (target === 'all') {
+                const lines = (inv.lineItems || []).filter(l => l.type === 'LINE');
+                for (const l of lines) await setOne(l.id);
+                this.toast(id ? ('Alle lijnen → ' + (label || noun)) : (noun + ' gewist op alle lijnen'));
+            } else if (target && target.indexOf('line:') === 0) {
+                await setOne(target.slice(5));
+                this.toast(id ? ('Lijn → ' + (label || noun)) : (noun + ' gewist'));
+            }
+            await this.loadFactuurDetail();
+        } catch (e) {
+            this.toast('Toewijzen mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._assignBusy = false;
+        }
+    },
+
+    // ===== v305: OPMERKINGEN (chat) op de aankoopfactuur — zelfde comment-bron
+    // en -weergave als de verlof-chat. =====
+    _renderFactuurComments() {
+        return `<div class="card" style="margin-bottom:12px;padding:4px 16px">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;cursor:pointer" onclick="app.toggleFactuurComments()">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--qe-grey)">Opmerkingen <span id="fcCount" style="color:var(--qe-grey)"></span></div>
+                <span id="fcChev" style="color:var(--qe-grey);font-size:15px">▾</span>
+            </div>
+            <div id="fcBody" style="display:none;padding:2px 0 14px">
+                <div id="factuurChatList" style="margin-bottom:10px"><div class="spinner"></div></div>
+                <div style="display:flex;gap:8px;align-items:flex-end">
+                    <textarea id="factuurChatInput" class="form-input" rows="1" placeholder="Schrijf een opmerking…" style="flex:1;resize:none"></textarea>
+                    <button id="btnFactuurChatSend" class="btn btn-primary btn-sm" style="flex-shrink:0" onclick="app.sendFactuurComment()">Stuur</button>
+                </div>
+            </div>
+        </div>`;
+    },
+
+    toggleFactuurComments() {
+        const b = document.getElementById('fcBody');
+        const c = document.getElementById('fcChev');
+        if (!b) return;
+        const open = b.style.display === 'none';
+        b.style.display = open ? 'block' : 'none';
+        if (c) c.textContent = open ? '▴' : '▾';
+    },
+
+    async loadFactuurComments(invoiceId) {
+        const invId = invoiceId || this._factuurInvoiceId;
+        this._factuurCommentsInvId = invId;
+        const list = document.getElementById('factuurChatList');
+        if (!invId) return;
+        if (list) list.innerHTML = '<div class="spinner"></div>';
+        try {
+            const comments = await RobawsAPI.getInvoiceComments(invId);
+            if (this._factuurCommentsInvId !== invId) return;
+            const cntEl = document.getElementById('fcCount');
+            if (cntEl) cntEl.textContent = comments.length ? ('(' + comments.length + ')') : '';
+            if (!list) return;
+            if (!comments.length) { list.innerHTML = '<p class="text-grey text-sm text-center">Nog geen opmerkingen.</p>'; return; }
+            const myUserId = String(this._myRobawsUserId() || '');
+            list.innerHTML = comments.map(c => {
+                const aId = (c.authorId != null) ? c.authorId : (c.author && c.author.id);
+                const mine = myUserId && String(aId) === myUserId;
+                const who = (c.author && (c.author.name || c.author.fullName)) || RobawsAPI.nameForUserId(c.authorId != null ? c.authorId : '?');
+                return `<div style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:8px">
+                    <div style="max-width:82%;padding:10px 13px;border-radius:12px;background:${mine ? 'var(--wash,#eee)' : 'var(--card,#fff)'};border:1px solid var(--cb,#e5e5e5)">
+                        <div style="font-size:11px;color:var(--qe-grey);margin-bottom:3px">${this.escapeHtml(who)} · ${this._verlofChatTime(c.createdAt)}</div>
+                        <div style="font-size:13.5px;white-space:pre-wrap">${this.escapeHtml(c.content || '')}</div>
+                    </div>
+                </div>`;
+            }).join('');
+            list.scrollTop = list.scrollHeight;
+        } catch (e) {
+            if (list) list.innerHTML = `<p class="text-grey text-sm text-center">Opmerkingen laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    async sendFactuurComment() {
+        const invId = this._factuurInvoiceId;
+        const input = document.getElementById('factuurChatInput');
+        const btn = document.getElementById('btnFactuurChatSend');
+        if (!invId || !input) return;
+        const txt = (input.value || '').trim();
+        if (!txt) return;
+        if (this._factuurChatBusy) return;
+        this._factuurChatBusy = true;
+        if (btn) btn.disabled = true;
+        try {
+            await RobawsAPI.postInvoiceComment(invId, txt, this._myRobawsUserId());
+            input.value = '';
+            await this.loadFactuurComments(invId);
+        } catch (e) {
+            this.toast('Versturen mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._factuurChatBusy = false;
+            if (btn) btn.disabled = false;
+        }
+    },
+
+    // ===== v305: TAKEN op de aankoopfactuur — tonen, afvinken, toevoegen,
+    // verwijderen (Robaws /tasks, relatedResource = /purchase-invoices/{id}). =====
+    _renderFactuurTaken() {
+        return `<div class="card" style="margin-bottom:12px;padding:4px 16px">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;cursor:pointer" onclick="app.toggleFactuurTaken()">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--qe-grey)">Taken <span id="ftCount" style="color:var(--qe-grey)"></span></div>
+                <span id="ftChev" style="color:var(--qe-grey);font-size:15px">▾</span>
+            </div>
+            <div id="ftBody" style="display:none;padding:2px 0 14px">
+                <div id="factuurTakenList"><div class="spinner"></div></div>
+                <button class="btn btn-outline btn-sm btn-full" style="margin-top:10px" onclick="app.openNewFactuurTaak()">+ Taak toevoegen</button>
+            </div>
+        </div>`;
+    },
+
+    toggleFactuurTaken() {
+        const b = document.getElementById('ftBody');
+        const c = document.getElementById('ftChev');
+        if (!b) return;
+        const open = b.style.display === 'none';
+        b.style.display = open ? 'block' : 'none';
+        if (c) c.textContent = open ? '▴' : '▾';
+    },
+
+    async loadFactuurTaken(invoiceId) {
+        const invId = invoiceId || this._factuurInvoiceId;
+        this._factuurTakenInvId = invId;
+        const list = document.getElementById('factuurTakenList');
+        if (!invId) return;
+        if (list) list.innerHTML = '<div class="spinner"></div>';
+        try {
+            const tasks = await RobawsAPI.getTasksForResource('/purchase-invoices/' + invId);
+            if (this._factuurTakenInvId !== invId) return;
+            this._factuurTaken = tasks;
+            const open = tasks.filter(t => t.status !== 'Gedaan').length;
+            const cntEl = document.getElementById('ftCount');
+            if (cntEl) cntEl.textContent = tasks.length ? ('(' + open + '/' + tasks.length + ')') : '';
+            if (!list) return;
+            if (!tasks.length) { list.innerHTML = '<p class="text-grey text-sm text-center">Nog geen taken.</p>'; return; }
+            list.innerHTML = tasks.map(t => {
+                const done = t.status === 'Gedaan';
+                const who = t.assignedUserId ? RobawsAPI.nameForUserId(t.assignedUserId) : '—';
+                const jid = this._escapeJsArg(t.id);
+                return `<div style="display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--l2,#eee)">
+                    <span style="flex-shrink:0;margin-top:1px;font-size:17px;line-height:1;cursor:pointer;color:${done ? 'var(--qe-green,#3E7A54)' : 'var(--qe-grey)'}" onclick="app.toggleFactuurTaakStatus('${jid}')" title="${done ? 'Heropenen' : 'Afvinken'}">${done ? '☑' : '☐'}</span>
+                    <div style="flex:1;min-width:0">
+                        <div style="font-size:13.5px;${done ? 'text-decoration:line-through;color:var(--qe-grey)' : 'color:var(--ink,#1A237E)'}">${this.escapeHtml(t.title)}</div>
+                        ${t.description ? `<div style="font-size:12px;color:var(--qe-grey);white-space:pre-wrap;margin-top:2px">${this.escapeHtml(t.description)}</div>` : ''}
+                        <div style="font-size:11px;color:var(--qe-grey);margin-top:3px">${this.escapeHtml(who)}${t.deadline ? (' · tegen ' + this.escapeHtml(String(t.deadline).slice(0, 10))) : ''} · ${this.escapeHtml(t.status)}</div>
+                    </div>
+                    <span style="flex-shrink:0;cursor:pointer;color:var(--qe-red,#B4372F);font-size:13px" onclick="app.deleteFactuurTaak('${jid}')" title="Verwijderen">✕</span>
+                </div>`;
+            }).join('');
+        } catch (e) {
+            if (list) list.innerHTML = `<p class="text-grey text-sm text-center">Taken laden mislukt: ${this.escapeHtml(e.message || '')}</p>`;
+        }
+    },
+
+    async toggleFactuurTaakStatus(taskId) {
+        const t = (this._factuurTaken || []).find(x => x.id === String(taskId));
+        if (!t) return;
+        const next = t.status === 'Gedaan' ? 'Te doen' : 'Gedaan';
+        try {
+            await RobawsAPI.setTaskStatus(taskId, next);
+            await this.loadFactuurTaken();
+        } catch (e) { this.toast('Status wijzigen mislukt: ' + (e.message || '?'), true); }
+    },
+
+    async deleteFactuurTaak(taskId) {
+        const confirmFn = (window.QEClock && QEClock._showConfirmModal) ? QEClock._showConfirmModal.bind(QEClock) : (t, m) => Promise.resolve(window.confirm(m));
+        const ok = await confirmFn('Taak verwijderen?', 'Deze taak wordt definitief verwijderd.', 'Verwijderen', 'Annuleren');
+        if (!ok) return;
+        try {
+            await RobawsAPI.deleteTask(taskId);
+            this.toast('Taak verwijderd');
+            await this.loadFactuurTaken();
+        } catch (e) { this.toast('Verwijderen mislukt: ' + (e.message || '?'), true); }
+    },
+
+    openNewFactuurTaak() {
+        const invId = this._factuurInvoiceId;
+        if (!invId) { this.toast('Factuur niet geladen', true); return; }
+        const bureel = (RobawsAPI.getBureelApprovers ? RobawsAPI.getBureelApprovers() : []);
+        const def = (RobawsAPI.TASK_USERS && RobawsAPI.TASK_USERS.FACTUREN) || '';
+        const opts = bureel.map(u => `<option value="${this._escapeJsArg(u.userId)}"${String(u.userId) === String(def) ? ' selected' : ''}>${this.escapeHtml(u.name)}</option>`).join('');
+        this.showModal(`<div><h3 style="margin:0 0 12px">Nieuwe taak</h3>
+            <label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:3px">Titel</label>
+            <input id="ntTitle" class="form-input" placeholder="Bv. Factuur nakijken" style="margin-bottom:10px">
+            <label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:3px">Omschrijving (optioneel)</label>
+            <textarea id="ntDesc" class="form-input" rows="2" style="margin-bottom:10px"></textarea>
+            <label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:3px">Toewijzen aan</label>
+            <select id="ntUser" class="form-input" style="margin-bottom:10px"><option value="">—</option>${opts}</select>
+            <label style="font-size:12px;color:var(--qe-grey);display:block;margin-bottom:3px">Deadline (optioneel)</label>
+            <input id="ntDeadline" type="date" class="form-input" style="margin-bottom:14px">
+            <button class="btn btn-primary btn-full" onclick="app.submitNewFactuurTaak()">Taak aanmaken</button>
+            <button class="btn btn-outline btn-full" style="margin-top:6px" onclick="app.closeModal()">Annuleren</button></div>`);
+    },
+
+    async submitNewFactuurTaak() {
+        const invId = this._factuurInvoiceId;
+        if (!invId) return;
+        const val = (id) => { const el = document.getElementById(id); return el ? el.value.trim() : ''; };
+        const title = val('ntTitle');
+        if (!title) { this.toast('Geef een titel', true); return; }
+        if (this._newTaakBusy) return;
+        this._newTaakBusy = true;
+        try {
+            await RobawsAPI.createTask({
+                title,
+                description: val('ntDesc'),
+                assignedUserId: val('ntUser'),
+                reportingUserId: this._myRobawsUserId(),
+                relatedResource: '/purchase-invoices/' + invId,
+                deadline: val('ntDeadline'),
+            });
+            this.closeModal();
+            this.toast('Taak aangemaakt');
+            await this.loadFactuurTaken(invId);
+            const b = document.getElementById('ftBody'); const c = document.getElementById('ftChev');
+            if (b && b.style.display === 'none') { b.style.display = 'block'; if (c) c.textContent = '▴'; }
+        } catch (e) {
+            this.toast('Taak aanmaken mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._newTaakBusy = false;
+        }
+    },
+
+    async openFactuurPdf(approvalId) {
+        const detail = (this._factuurApprovalCache || {})[String(approvalId)] || {};
+        const ref = detail.resourceUnderApprovalRef;
+        const invoiceId = ref ? String(ref).split('/').pop() : null;
+        if (!invoiceId) { this.toast('Factuur niet gevonden', true); return; }
+        this._openPdfOverlay(detail.invoiceNumber || 'Factuur');
+        try {
+            const docId = await RobawsAPI.getPurchaseInvoiceDocumentId(invoiceId);
+            if (!docId) throw new Error('Geen document aan deze factuur gekoppeld');
+            const doc = await RobawsAPI.getDocumentUrl(docId);
+            await this._renderPdfIntoOverlay(doc);
+        } catch (e) {
+            this._closePdfFullscreen();
+            this.toast('PDF openen mislukt: ' + (e.message || '?'), true);
+        }
+    },
+
+    // Fullscreen PDF-viewer via pdf.js (v288): de Android-WebView toont PDF niet
+    // in een iframe, dus renderen we elke pagina naar een canvas. Inzoombaar via
+    // knijp-gebaar, dubbeltik en +/--knoppen — inzoomen = CSS-breedte vergroten
+    // (native pannen/scrollen); intern op 2x fit gerenderd zodat het scherp blijft.
+    // pdf.js + worker lui geladen uit js/vendor/pdfjs/.
+    _openPdfOverlay(title) {
+        let ov = document.getElementById('pdfFullscreen');
+        if (ov) ov.remove();
+        this._pdfZoom = 1;
+        this._pdfBaseCss = 0;
+        ov = document.createElement('div');
+        ov.id = 'pdfFullscreen';
+        ov.style.cssText = 'position:fixed;inset:0;z-index:100000;background:#33383f;display:flex;flex-direction:column';
+        const btn = (onclick, label, fs) => '<button onclick="' + onclick + '" style="width:38px;height:38px;flex-shrink:0;border:none;border-radius:19px;background:rgba(255,255,255,.16);color:#fff;font-size:' + (fs || 20) + 'px;line-height:1;cursor:pointer">' + label + '</button>';
+        ov.innerHTML =
+            '<div style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:#1b1b1b;color:#fff;flex-shrink:0">' +
+                '<div style="flex:1;min-width:0;font:600 14px var(--font,sans-serif);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + this.escapeHtml(String(title || 'Document')) + '</div>' +
+                btn('app._pdfZoomBy(1/1.4)', '−') +
+                btn('app._pdfZoomBy(1.4)', '+') +
+                btn('app._closePdfFullscreen()', '✕', 18) +
+            '</div>' +
+            '<div id="pdfScroll" style="flex:1;overflow:auto;-webkit-overflow-scrolling:touch;padding:12px 0;touch-action:pan-x pan-y">' +
+                '<div id="pdfPages" style="text-align:center">' +
+                    '<div id="pdfLoading" style="color:#fff;text-align:center;font:500 14px var(--font,sans-serif);padding:44px 0">Factuur laden…</div>' +
+                '</div>' +
+            '</div>';
+        document.body.appendChild(ov);
+        this._attachPdfGestures(document.getElementById('pdfScroll'));
+    },
+
+    // Knijp-zoom + dubbeltik-zoom op de PDF-scroller.
+    _attachPdfGestures(scroll) {
+        if (!scroll) return;
+        const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+        let startDist = 0, startZoom = 1, lastTap = 0;
+        scroll.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 2) { startDist = dist(e.touches); startZoom = this._pdfZoom || 1; }
+        }, { passive: true });
+        scroll.addEventListener('touchmove', (e) => {
+            if (e.touches.length === 2 && startDist) {
+                e.preventDefault();
+                this._pdfZoom = Math.max(1, Math.min(4, startZoom * (dist(e.touches) / startDist)));
+                this._applyPdfZoom();
+            }
+        }, { passive: false });
+        scroll.addEventListener('touchend', (e) => {
+            startDist = 0;
+            if (e.touches.length) return;
+            const now = Date.now();
+            if (now - lastTap < 300) { this._pdfZoom = (this._pdfZoom > 1.2) ? 1 : 2; this._applyPdfZoom(); lastTap = 0; }
+            else lastTap = now;
+        }, { passive: true });
+    },
+
+    _applyPdfZoom() {
+        const base = this._pdfBaseCss || 0;
+        if (!base) return;
+        const z = this._pdfZoom || 1;
+        const list = document.querySelectorAll('#pdfPages canvas');
+        for (let i = 0; i < list.length; i++) {
+            const c = list[i];
+            const aspect = parseFloat(c.getAttribute('data-aspect')) || 1.414;
+            c.style.width = (base * z) + 'px';
+            c.style.height = (base * z * aspect) + 'px';
+        }
+    },
+
+    _pdfZoomBy(factor) {
+        this._pdfZoom = Math.max(1, Math.min(4, (this._pdfZoom || 1) * factor));
+        this._applyPdfZoom();
+    },
+
+    _ensurePdfLib() {
+        return new Promise((resolve, reject) => {
+            if (window.pdfjsLib) return resolve();
+            const s = document.createElement('script');
+            s.src = 'js/vendor/pdfjs/pdf.min.js';
+            s.onload = () => window.pdfjsLib ? resolve() : reject(new Error('pdf.js init mislukt'));
+            s.onerror = () => reject(new Error('pdf.js kon niet laden'));
+            document.head.appendChild(s);
+        });
+    },
+
+    async _ensurePdfWorker() {
+        if (this._pdfWorkerReady) return;
+        // Worker als blob-URL (omzeilt file://-worker-restricties in de WebView).
+        try {
+            const resp = await fetch('js/vendor/pdfjs/pdf.worker.min.js');
+            const blob = await resp.blob();
+            pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(blob);
+        } catch (e) {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'js/vendor/pdfjs/pdf.worker.min.js';
+        }
+        this._pdfWorkerReady = true;
+    },
+
+    async _renderPdfIntoOverlay(doc) {
+        const scroll = document.getElementById('pdfScroll');
+        const pages = document.getElementById('pdfPages');
+        if (!scroll || !pages) return;
+        // Afbeelding? Direct tonen (de WebView rendert images wél).
+        if (doc.contentType && doc.contentType.includes('image')) {
+            pages.innerHTML = '';
+            const img = document.createElement('img');
+            img.src = doc.blobUrl;
+            img.style.cssText = 'max-width:100%;height:auto;display:block;margin:0 auto';
+            pages.appendChild(img);
+            this._pdfBlobUrl = doc.blobUrl;
+            return;
+        }
+        await this._ensurePdfLib();
+        await this._ensurePdfWorker();
+        const buf = await doc.blob.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+        pages.innerHTML = '';
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const QUALITY = 2;           // intern op 2x fit → scherp bij inzoomen
+        const MAX_CANVAS_W = 2200;   // geheugenplafond
+        const base = Math.min((scroll.clientWidth || 360) - 16, 900);
+        this._pdfBaseCss = base;
+        this._pdfZoom = 1;
+        for (let p = 1; p <= pdf.numPages; p++) {
+            const page = await pdf.getPage(p);
+            const vp1 = page.getViewport({ scale: 1 });
+            let renderScale = (base / vp1.width) * dpr * QUALITY;
+            if (vp1.width * renderScale > MAX_CANVAS_W) renderScale = MAX_CANVAS_W / vp1.width;
+            const vp = page.getViewport({ scale: renderScale });
+            const aspect = vp.height / vp.width;
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.floor(vp.width);
+            canvas.height = Math.floor(vp.height);
+            canvas.setAttribute('data-aspect', String(aspect));
+            canvas.style.cssText = 'width:' + base + 'px;height:' + Math.floor(base * aspect) + 'px;display:block;margin:0 auto 12px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.4)';
+            pages.appendChild(canvas);
+            await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+        }
+        if (doc.blobUrl) { try { URL.revokeObjectURL(doc.blobUrl); } catch (_e) {} }
+    },
+
+    _closePdfFullscreen() {
+        const ov = document.getElementById('pdfFullscreen');
+        if (ov) ov.remove();
+        if (this._pdfBlobUrl) { try { URL.revokeObjectURL(this._pdfBlobUrl); } catch (_e) {} this._pdfBlobUrl = null; }
+    },
+
+    async decideFactuur(approvalId, approve) {
+        if (this._factuurDecideBusy) return;   // guard vóór de confirm — geen dubbele dialogen
+        this._factuurDecideBusy = true;
+        try {
+            const confirmFn = (window.QEClock && QEClock._showConfirmModal)
+                ? QEClock._showConfirmModal.bind(QEClock)
+                : (t, m) => Promise.resolve(window.confirm(m));
+            const ok = await confirmFn(
+                approve ? 'Factuur goedkeuren?' : 'Factuur afkeuren?',
+                (approve ? 'Deze aankoopfactuur goedkeuren?' : 'Deze aankoopfactuur afkeuren?') + ' De beslissing wordt op het gedeelde kantoor-account geregistreerd.',
+                approve ? 'Goedkeuren' : 'Afkeuren', 'Annuleren'
+            );
+            if (!ok) return;
+            await RobawsAPI.decideApproval(approvalId, approve, '');
+            this.toast(approve ? 'Factuur goedgekeurd' : 'Factuur afgekeurd');
+            // pushHistory=false: het besliste detail hoort niet meer in de back-stack.
+            this.navigate('screenGoedkeuren', false);
+            this.setGoedkeurTab('facturen');
+            this._refreshAanvraagGoedkeurCount();
+        } catch (e) {
+            this.toast('Mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._factuurDecideBusy = false;
+        }
+    },
+
+    addFactuurApprover(approvalId) {
+        const detail = (this._factuurApprovalCache || {})[String(approvalId)] || {};
+        const existing = new Set((Array.isArray(detail.userStates) ? detail.userStates : []).map(s => String(s.userId)));
+        const bureel = RobawsAPI.getBureelApprovers().filter(u => !existing.has(String(u.userId)));
+        if (!bureel.length) { this.toast('Iedereen van bureel staat al op de flow'); return; }
+        const rows = bureel.map(u =>
+            `<button class="btn btn-outline btn-full" style="margin-bottom:8px;text-align:left" onclick="app._doAddFactuurApprover('${this._escapeJsArg(approvalId)}','${this._escapeJsArg(u.userId)}','${this._escapeJsArg(u.name)}')">${this.escapeHtml(u.name)}</button>`
+        ).join('');
+        this.showModal(`<div><h3 style="margin:0 0 10px">Goedkeurder toevoegen</h3>
+            <div style="font-size:12.5px;color:var(--qe-grey);margin-bottom:14px;line-height:1.4">Alleen bureelpersoneel. De gekozen persoon moet de factuur daarna ook goedkeuren.</div>
+            ${rows}
+            <button class="btn btn-outline btn-full" style="margin-top:4px" onclick="app.closeModal()">Annuleren</button></div>`);
+    },
+
+    async _doAddFactuurApprover(approvalId, userId, name) {
+        this.closeModal();
+        if (this._addApproverBusy) return;
+        this._addApproverBusy = true;
+        try {
+            await RobawsAPI.addApprovalApprover(approvalId, userId);
+            this.toast((name || 'Goedkeurder') + ' toegevoegd');
+            this.loadFactuurDetail();
+            this._refreshGoedkeurTabCounts();
+            this._refreshAanvraagGoedkeurCount();
+        } catch (e) {
+            this.toast('Toevoegen mislukt: ' + (e.message || '?'), true);
+        } finally {
+            this._addApproverBusy = false;
+        }
     },
 
     /** v217: tijd-modal voor handmatig in-/uitklokken (alleen bureel). */
@@ -8576,7 +10199,7 @@ const app = {
 
         // Check of native bridge beschikbaar is (in APK)
         if (typeof QEBridge === 'undefined' || !QEBridge.openVivaTerminal) {
-            statusDiv.innerHTML = `<div style="color:#e53935;padding:12px;background:#ffebee;border-radius:8px">
+            statusDiv.innerHTML = `<div style="color:var(--red2);padding:12px;background:var(--rwash);border-radius:8px">
                 Terminal-integratie alleen beschikbaar in de APK versie.<br>
                 <small>Gebruik de QR/betaallink optie als alternatief.</small>
             </div>`;
@@ -8606,7 +10229,7 @@ const app = {
             const orderData = await orderRes.json();
 
             if (!orderData.success) {
-                statusDiv.innerHTML = `<div style="color:#e53935;padding:12px;background:#ffebee;border-radius:8px">
+                statusDiv.innerHTML = `<div style="color:var(--red2);padding:12px;background:var(--rwash);border-radius:8px">
                     ${orderData.error || 'Betaalorder aanmaken mislukt'}
                 </div>`;
                 return;
@@ -8644,7 +10267,7 @@ const app = {
 
             if (opened) {
                 statusDiv.innerHTML = `
-                    <div style="color:#2e7d32;padding:16px;background:#e8f5e9;border-radius:12px;text-align:center">
+                    <div style="color:var(--green2);padding:16px;background:var(--gwash);border-radius:12px;text-align:center">
                         <div style="margin-bottom:8px;color:var(--qe-purple)">${this.icon('phone', { size: 28 })}</div>
                         <div style="font-weight:600;font-size:15px">Terminal geopend</div>
                         <div style="font-size:13px;color:#558b2f;margin-top:4px">Controleer de Viva Wallet app</div>
@@ -8661,13 +10284,13 @@ const app = {
                         </button>
                     </div>`;
             } else {
-                statusDiv.innerHTML = `<div style="color:#e53935;padding:12px;background:#ffebee;border-radius:8px">
+                statusDiv.innerHTML = `<div style="color:var(--red2);padding:12px;background:var(--rwash);border-radius:8px">
                     Viva.com Terminal app kon niet geopend worden.<br>
                     <small>Installeer "Viva.com | Terminal" uit de Play Store, of gebruik de QR-code als alternatief.</small>
                 </div>`;
             }
         } catch (e) {
-            statusDiv.innerHTML = `<div style="color:#e53935;padding:12px;background:#ffebee;border-radius:8px">Fout: ${e.message}</div>`;
+            statusDiv.innerHTML = `<div style="color:var(--red2);padding:12px;background:var(--rwash);border-radius:8px">Fout: ${e.message}</div>`;
         }
     },
 
@@ -9698,7 +11321,7 @@ const app = {
         const list = this._loadPendingPayments();
         if (!list.length) { container.innerHTML = ''; return; }
         container.innerHTML = `
-            <div style="background:#fff3e0;border:1px solid #ffb74d;border-radius:12px;padding:12px;margin:0 0 12px 0">
+            <div style="background:var(--awash2);border:1px solid var(--aborder2);border-radius:12px;padding:12px;margin:0 0 12px 0">
                 <div style="font-size:13px;font-weight:600;color:#e65100;margin-bottom:8px">
                     ⚠️ ${list.length} openstaande betaling${list.length === 1 ? '' : 'en'}
                 </div>
@@ -9736,7 +11359,7 @@ const app = {
             const orderData = await orderRes.json();
 
             if (!orderData.success) {
-                statusDiv.innerHTML = `<div style="color:#e53935;padding:12px;background:#ffebee;border-radius:8px">
+                statusDiv.innerHTML = `<div style="color:var(--red2);padding:12px;background:var(--rwash);border-radius:8px">
                     ${orderData.error || 'Betaallink aanmaken mislukt'}<br>
                     <small>${orderData.hint || 'Controleer de Viva Wallet configuratie'}</small>
                 </div>`;
@@ -9767,7 +11390,7 @@ const app = {
             // Start polling
             this.pollPaymentStatus(orderData.orderCode, invoiceId);
         } catch (e) {
-            statusDiv.innerHTML = `<div style="color:#e53935;padding:12px;background:#ffebee;border-radius:8px">Fout: ${e.message}</div>`;
+            statusDiv.innerHTML = `<div style="color:var(--red2);padding:12px;background:var(--rwash);border-radius:8px">Fout: ${e.message}</div>`;
         }
     },
 
@@ -9785,7 +11408,7 @@ const app = {
                 if (data.paid) {
                     // Betaling gelukt!
                     statusDiv.innerHTML = `
-                        <div style="background:#e8f5e9;border-radius:12px;padding:24px;text-align:center">
+                        <div style="background:var(--gwash);border-radius:12px;padding:24px;text-align:center">
                             <div style="margin-bottom:8px;color:var(--qe-green)">${this.icon('check-circle', { size: 44 })}</div>
                             <div style="font-size:20px;font-weight:700;color:#2e7d32">Betaling ontvangen!</div>
                             <div style="font-size:13px;color:#558b2f;margin-top:4px">Factuur wordt als betaald gemarkeerd...</div>
@@ -9810,7 +11433,7 @@ const app = {
                 }
 
                 if (data.status === 'expired' || data.status === 'canceled') {
-                    statusDiv.innerHTML += `<div style="color:#e53935;font-size:13px;margin-top:8px">
+                    statusDiv.innerHTML += `<div style="color:var(--red2);font-size:13px;margin-top:8px">
                         Betaling ${data.status === 'expired' ? 'verlopen' : 'geannuleerd'}
                     </div>`;
                     return;
@@ -10310,40 +11933,42 @@ const app = {
 
             let html = '';
 
-            // v179: maand-navigatie. "Volgende" is uitgeschakeld op de huidige
-            // maand (geen toekomst). Knoppen herladen met de nieuwe offset.
+            // v266 (Marble 1:1, prototype "UREN"): kop met maandlabel + grote
+            // "Uren"-titel + ‹ ›-pijltjes, daarna de 4-stats-grid met 2px
+            // ink-onderlijn (Totaal · Werkuren · Overuren · Dagen).
+            // MOTOR-SYNC: alleen de HTML-opmaak wijkt af van 1.x — alle
+            // databerekening hierboven is identiek gebleven.
+            const monthLabelNice = monthNames[target.getMonth()].charAt(0).toUpperCase()
+                + monthNames[target.getMonth()].slice(1) + ' ' + yyyy;
             html += `
-                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px">
-                    <button class="btn btn-outline btn-sm" onclick="app.loadDagoverzicht(${offset - 1})" style="font-size:13px;padding:6px 12px">◀ Vorige maand</button>
-                    <span style="font-size:13px;font-weight:600;color:var(--qe-darkblue);flex:1;text-align:center">${monthLabel}</span>
-                    <button class="btn btn-outline btn-sm" onclick="app.loadDagoverzicht(${offset + 1})" ${isCurrentMonth ? 'disabled' : ''} style="font-size:13px;padding:6px 12px;${isCurrentMonth ? 'opacity:0.4;pointer-events:none' : ''}">Volgende ▶</button>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start">
+                    <div>
+                        <div style="font-size:13px;color:var(--g1);margin-bottom:2px">${monthLabelNice}</div>
+                        <div style="font:400 34px var(--font);letter-spacing:-1px;margin-bottom:24px;color:var(--ink)">Uren</div>
+                    </div>
+                    <div style="display:flex;gap:6px;padding-top:6px">
+                        <button onclick="app.loadDagoverzicht(${offset - 1})" style="width:32px;height:32px;border:1px solid var(--b1);border-radius:2px;background:none;color:var(--g2);cursor:pointer;font-size:15px">‹</button>
+                        <button onclick="app.loadDagoverzicht(${offset + 1})" ${isCurrentMonth ? 'disabled' : ''} style="width:32px;height:32px;border:1px solid var(--b1);border-radius:2px;background:none;color:${isCurrentMonth ? 'var(--b2)' : 'var(--g2)'};cursor:pointer;font-size:15px;${isCurrentMonth ? 'pointer-events:none' : ''}">›</button>
+                    </div>
                 </div>`;
 
-            // Samenvatting kaart — v83: Totaal, Werkuren, Overuren, Werkdagen, Te laat
             html += `
-                <div class="card" style="margin-bottom:16px;padding:20px;background:var(--qe-darkblue);color:#fff;border-radius:16px;border:none">
-                    <div style="font-size:13px;opacity:0.8;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">${monthLabel}</div>
-                    <div style="display:grid;grid-template-columns:repeat(5, 1fr);gap:8px">
-                        <div>
-                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${totalHours}" data-dec="2">${fmt2(totalHours)}</span></div>
-                            <div style="font-size:10px;opacity:0.8">Totaal</div>
-                        </div>
-                        <div>
-                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${werkurenTotal}" data-dec="2">${fmt2(werkurenTotal)}</span></div>
-                            <div style="font-size:10px;opacity:0.8">Werkuren</div>
-                        </div>
-                        <div>
-                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${overurenTotal}" data-dec="2">${fmt2(overurenTotal)}</span></div>
-                            <div style="font-size:10px;opacity:0.8">Overuren</div>
-                        </div>
-                        <div>
-                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${totalDays}" data-dec="0">${totalDays}</span></div>
-                            <div style="font-size:10px;opacity:0.8">Werkdagen</div>
-                        </div>
-                        <div>
-                            <div style="font-size:20px;font-weight:700"><span class="qe-countup" data-count="${lateCount}" data-dec="0">${lateCount}</span></div>
-                            <div style="font-size:10px;opacity:0.8">Te laat</div>
-                        </div>
+                <div id="mbUrenStats" style="display:grid;grid-template-columns:repeat(4, minmax(0,1fr));gap:10px;padding-bottom:22px;border-bottom:2px solid var(--ink);margin-bottom:8px">
+                    <div style="min-width:0">
+                        <div style="font:400 28px var(--font);letter-spacing:-0.8px;color:var(--ink)"><span class="qe-countup" data-count="${totalHours}" data-dec="2">${fmt2(totalHours)}</span></div>
+                        <div style="font-size:10.5px;font-weight:600;color:var(--g1);margin-top:2px;letter-spacing:0.5px">TOTAAL</div>
+                    </div>
+                    <div style="min-width:0">
+                        <div style="font:400 28px var(--font);letter-spacing:-0.8px;color:var(--ink)"><span class="qe-countup" data-count="${werkurenTotal}" data-dec="2">${fmt2(werkurenTotal)}</span></div>
+                        <div style="font-size:10.5px;font-weight:600;color:var(--g1);margin-top:2px;letter-spacing:0.5px">WERKUREN</div>
+                    </div>
+                    <div style="min-width:0">
+                        <div style="font:400 28px var(--font);letter-spacing:-0.8px;color:var(--purple2)"><span class="qe-countup" data-count="${overurenTotal}" data-dec="2">${fmt2(overurenTotal)}</span></div>
+                        <div style="font-size:10.5px;font-weight:600;color:var(--g1);margin-top:2px;letter-spacing:0.5px">OVERUREN</div>
+                    </div>
+                    <div style="min-width:0">
+                        <div style="font:400 28px var(--font);letter-spacing:-0.8px;color:var(--ink)"><span class="qe-countup" data-count="${totalDays}" data-dec="0">${totalDays}</span></div>
+                        <div style="font-size:10.5px;font-weight:600;color:var(--g1);margin-top:2px;letter-spacing:0.5px">DAGEN</div>
                     </div>
                 </div>`;
 
@@ -10377,10 +12002,14 @@ const app = {
                             dayTotal += parseFloat(te.hours || te.billableHours || 0) || 0;
                         }
                     }
-                    html += `<div style="margin-bottom:4px;padding:8px 4px 4px;display:flex;align-items:center;justify-content:space-between">
-                        <div style="font-size:13px;font-weight:600;color:var(--qe-darkblue)">${dayName} ${dateStr}</div>
-                        <div style="font-size:12px;color:var(--qe-grey)">${fmt1(dayTotal)} uur</div>
-                    </div>`;
+                    // v266 (Marble): dag = één blok met hairline-onderlijn.
+                    // v268: het DAGTOTAAL is de hoofdzaak (groot, ink, rechts);
+                    // de opsplitsing eronder is bijzaak (compact, grijs).
+                    html += `<div style="padding:12px 2px 8px;border-bottom:1px solid var(--l2)">
+                        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px">
+                            <span style="font-size:14px;font-weight:700;color:var(--ink)">${dayName} ${dateStr}</span>
+                            <span style="font:600 17px var(--font);color:var(--ink);font-variant-numeric:tabular-nums;letter-spacing:-0.3px">${fmt1(dayTotal)} u</span>
+                        </div>`;
 
                     // v83: per werkbon — render individuele tijdsblokken (1 kaart per time-entry)
                     //   Werkuren (hourTypeId=1, article 185)  → ✅ groen, klant-werk
@@ -10397,14 +12026,13 @@ const app = {
                         const isAbsence = this._isAbsenceTijd(tijd);
                         // v197: afwezigheid → toon enkel het type, géén (forfaitaire) uren
                         if (isAbsence) {
-                            html += `<div class="card" style="padding:10px 14px;margin-bottom:6px;background:${tijdStyle.bg}">
-                                <div style="display:flex;align-items:center;gap:10px">
-                                    <span style="font-size:18px;color:${tijdColor};display:inline-flex;align-items:center">${tijdIcon || this.icon('calendar', { size: 18 })}</span>
-                                    <div style="flex:1">
-                                        <div style="font-size:14px;font-weight:500;color:${tijdColor}">${tijdStyle.label}</div>
-                                        <div style="font-size:11px;color:${tijdColor}">Geen uren gerekend</div>
-                                    </div>
-                                </div>
+                            // v268: compacte bijzaak-rij (22px chip, grijze tekst).
+                            // Rood alleen voor Ziek/Onwettig; Verlof/Feestdag e.d. neutraal.
+                            const isRood = /ziek|onwettig/i.test(tijdStyle.label || '');
+                            html += `<div style="display:flex;align-items:center;gap:10px;padding:3px 0 3px 2px">
+                                <span style="width:22px;height:22px;border-radius:7px;background:${isRood ? 'var(--rwash)' : 'var(--wash)'};color:${isRood ? 'var(--red2)' : 'var(--g2)'};display:flex;align-items:center;justify-content:center;flex-shrink:0">${this.icon('calendar', { size: 12 })}</span>
+                                <div style="flex:1;min-width:0;font-size:12px;color:var(--g2)">${tijdStyle.label} <span style="color:var(--g3)">· geen uren gerekend</span></div>
+                                <span style="font-size:12.5px;color:${isRood ? 'var(--red2)' : 'var(--g3)'}">—</span>
                             </div>`;
                             continue;
                         }
@@ -10416,16 +12044,11 @@ const app = {
                         });
 
                         if (teList.length === 0) {
-                            // Open werkbon zonder entries (nog niet uitgeklokt)
+                            // Open werkbon zonder entries (nog niet uitgeklokt) — compacte rij
                             const ingeklokt = getField(wo, 'Ingeklokt') || '?';
-                            html += `<div class="card" style="padding:12px 14px;margin-bottom:6px;background:#f1f8e9;cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
-                                <div style="display:flex;align-items:center;gap:10px">
-                                    <span style="font-size:18px;color:${tijdColor};display:inline-flex">${this.icon('clock', { size: 18 })}</span>
-                                    <div style="flex:1">
-                                        <div style="font-size:14px;font-weight:500">${ingeklokt} → ...</div>
-                                        <div style="font-size:11px;color:${tijdColor}">${tijdIcon} ${tijd} — nog ingeklokt</div>
-                                    </div>
-                                </div>
+                            html += `<div style="display:flex;align-items:center;gap:10px;padding:3px 0 3px 2px;cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
+                                <span style="width:22px;height:22px;border-radius:7px;background:var(--gwash);color:var(--green2);display:flex;align-items:center;justify-content:center;flex-shrink:0">${this.icon('clock', { size: 12 })}</span>
+                                <div style="flex:1;min-width:0;font-size:12px;color:var(--g2)">Nog ingeklokt · ${tijd} <span style="color:var(--g3);font-variant-numeric:tabular-nums">· ${ingeklokt} → …</span></div>
                             </div>`;
                             continue;
                         }
@@ -10446,62 +12069,56 @@ const app = {
                                 : null;
                             const timeBlockTxt = (sStr && eStr) ? (sStr + ' → ' + eStr) : null;
 
-                            // v87: Styling per type — compensatie duidelijker als "overuren aftrek"
-                            // v166: bij afwezigheidstype (Ziek / Verlof / Feestdag / Inhaal / Sociaal verlof)
-                            // wordt de werkuren-styling overruled door de afwezigheids-kleur
-                            let icon, bg, fg, label;
-                            if (isAbsence) {
-                                icon = tijdStyle.icon || this.icon('calendar', { size: 18 });
-                                bg = tijdStyle.bg;
-                                fg = tijdStyle.color;
-                                label = tijdStyle.label;
-                            } else if (isCompensatie) {
+                            // v266 (Marble 1:1): blokrij per time-entry — 30px chip in
+                            // wash-tint, typelabel 13px/600, tijdsbereik 12px grijs,
+                            // waarde rechts in de typekleur (prototype typeMeta).
+                            // v180-logica (echte hourType-naam) blijft behouden.
+                            let icon, chipBg, chipFg, valFg, label;
+                            if (isCompensatie) {
                                 // Negatieve overuren — wordt afgetrokken van overuren-bank
                                 // omdat L&L gebruikt is om de 8u-baseline te vullen.
-                                icon = this.icon('minus', { size: 18 }); bg = '#ffebee'; fg = '#c62828';
-                                label = 'Overuren aftrek';
+                                icon = this.icon('minus', { size: 12 }); chipBg = 'var(--rwash)'; chipFg = 'var(--red2)'; valFg = 'var(--red2)';
+                                label = 'Aftrek overuren';
                             } else if (isLL) {
-                                icon = this.icon('package', { size: 18 }); bg = '#fff3e0'; fg = '#e65100';
+                                icon = this.icon('package', { size: 12 }); chipBg = 'var(--awash2)'; chipFg = 'var(--amber2)'; valFg = 'var(--amber2)';
                                 label = 'Laden & lossen';
                             } else if (isOveruren) {
-                                icon = this.icon('clock', { size: 18 }); bg = '#fff8e1'; fg = '#ef6c00';
+                                icon = this.icon('clock', { size: 12 }); chipBg = 'var(--pwash)'; chipFg = 'var(--purple2)'; valFg = 'var(--purple2)';
                                 label = htName || 'Overuren';   // v180: toon echte tag (bv "Overuren zaterdag")
                             } else {
-                                icon = this.icon('check-circle', { size: 18 }); bg = '#f1f8e9'; fg = '#2e7d32';
+                                icon = this.icon('check-circle', { size: 12 }); chipBg = 'var(--gwash)'; chipFg = 'var(--green2)'; valFg = 'var(--ink)';
                                 label = htName || 'Werkuren';
                             }
                             const absHrs = Math.abs(hours).toFixed(2);
-                            const headerLine = timeBlockTxt
+                            const range = timeBlockTxt
                                 ? timeBlockTxt
-                                : (isCompensatie ? '−' + absHrs + ' uur (aftrek)' : absHrs + ' uur');
-                            const subLine = timeBlockTxt
-                                ? (label + ' · ' + hours.toFixed(2) + 'u')
-                                : label;
-                            const rightTxt = isCompensatie ? '−' + absHrs + 'u' : hours.toFixed(2) + 'u';
+                                : (isCompensatie ? 'Correctie aanvulling' : 'Zonder tijdsblok');
+                            const rightTxt = isCompensatie ? '−' + absHrs : hours.toFixed(2);
 
-                            html += `<div class="card" style="padding:10px 14px;margin-bottom:6px;background:${bg};cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
-                                <div style="display:flex;align-items:center;justify-content:space-between">
-                                    <div style="display:flex;align-items:center;gap:10px;flex:1">
-                                        <span style="font-size:18px;color:${fg};display:inline-flex;align-items:center">${icon}</span>
-                                        <div>
-                                            <div style="font-size:14px;font-weight:500">${headerLine}</div>
-                                            <div style="font-size:11px;color:${fg}">${subLine}</div>
-                                        </div>
-                                    </div>
-                                    <div style="font-size:14px;color:${fg};font-weight:600">${rightTxt}</div>
-                                </div>
+                            // v268: opsplitsing = bijzaak — één compacte grijze regel
+                            // per blok (22px chip, label · bereik, waarde klein rechts).
+                            html += `<div style="display:flex;align-items:center;gap:10px;padding:3px 0 3px 2px;cursor:pointer" onclick="app.openAanpassing('${wo.id}')">
+                                <span style="width:22px;height:22px;border-radius:7px;background:${chipBg};color:${chipFg};display:flex;align-items:center;justify-content:center;flex-shrink:0">${icon}</span>
+                                <div style="flex:1;min-width:0;font-size:12px;color:var(--g2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${label} <span style="color:var(--g3);font-variant-numeric:tabular-nums">· ${range}</span></div>
+                                <span style="font-size:12.5px;font-variant-numeric:tabular-nums;color:${valFg};flex-shrink:0">${rightTxt}</span>
                             </div>`;
                         }
                     }
+                    html += `</div>`; // Marble: dag-blok sluiten
                 } else {
-                    const opacity = isWeekend ? '0.4' : '0.6';
-                    const label = isWeekend ? 'Weekend' : 'Geen registratie';
-                    html += `<div style="margin-bottom:4px;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;background:#fafafa;border-radius:8px;opacity:${opacity}">
-                        <div style="font-size:13px;font-weight:500;color:var(--qe-grey)">${dayName} ${dateStr}</div>
-                        <div style="font-size:11px;color:var(--qe-grey);font-style:italic">${label}</div>
+                    // v266 (Marble): lege dag = zelfde blokstructuur, gedimd
+                    const opacity = isWeekend ? '0.55' : '0.75';
+                    const label = isWeekend ? 'Weekend' : 'Geen registraties';
+                    html += `<div style="padding:12px 2px 8px;border-bottom:1px solid var(--l2);opacity:${opacity}">
+                        <div style="display:flex;align-items:baseline;justify-content:space-between">
+                            <span style="font-size:14px;font-weight:700;color:var(--ink)">${dayName} ${dateStr}</span>
+                            <span style="font-size:12px;color:var(--g1)">${label}</span>
+                        </div>
                     </div>`;
                 }
             }
+
+            html += `<div style="font-size:12px;color:var(--g1);margin-top:14px">Tik op een registratie om een aanpassing aan te vragen.</div>`;
 
             container.innerHTML = html;
             this._animateCountUps(container);
@@ -10782,21 +12399,12 @@ const app = {
                         localStorage.setItem('qe_last_payment_context', JSON.stringify(ctx));
                     } catch(_) {}
 
-                    const methodIcon = method === 'Mollie Tap' ? this.icon('card', { size: 14, style: 'vertical-align:-2px' })
-                        : method === 'Viva wallet' ? this.icon('card', { size: 14, style: 'vertical-align:-2px' })
-                        : method === 'Cash' ? this.icon('cash', { size: 14, style: 'vertical-align:-2px' })
-                        : method.startsWith('Overschrijving') ? this.icon('bank', { size: 14, style: 'vertical-align:-2px' })
-                        : method === 'Via factuur' ? this.icon('file', { size: 14, style: 'vertical-align:-2px' })
-                        : this.icon('file', { size: 14, style: 'vertical-align:-2px' });
+                    // v268 (Marble 1:1, prototype "uit-laatste"): witte kaart met
+                    // ink-accentrand — geen blauwe gradient/iconen meer.
                     paymentBtns = `
-                        <div class="card" style="margin-bottom:12px;background:linear-gradient(135deg, rgba(21,101,192,0.08), rgba(46,125,50,0.08));border-left:4px solid #1565C0;cursor:pointer" onclick="app.openChangePaymentMethodModal()">
-                            <div style="display:flex;align-items:center;justify-content:space-between">
-                                <div style="flex:1">
-                                    <div style="font-size:14px;font-weight:700;color:#1565C0">${methodIcon} Laatste betaling: ${method}</div>
-                                    <div style="font-size:12px;color:var(--qe-grey);margin-top:3px">Factuur ${logicId} — € ${amount}</div>
-                                    <div style="font-size:11px;color:#1565C0;margin-top:4px;font-weight:600">Tik om te openen of betalingsmethode aan te passen →</div>
-                                </div>
-                            </div>
+                        <div onclick="app.openChangePaymentMethodModal()" style="padding:15px 18px;border-radius:14px;background:var(--card);border:1px solid var(--cb);border-left:3px solid var(--ink);box-shadow:0 2px 10px rgba(38,51,75,0.05);cursor:pointer;margin-bottom:12px">
+                            <div style="font-size:13.5px;font-weight:600;color:var(--ink)">Laatste betaling · ${method}</div>
+                            <div style="font-size:12.5px;color:var(--g1);margin-top:3px">Factuur ${logicId} — € ${amount} · tik om de betaalwijze aan te passen</div>
                         </div>`;
                 } else {
                     // Fallback: localStorage context tonen als Robaws-fetch faalt of geen match
@@ -10806,61 +12414,45 @@ const app = {
                         const cInv = (ctx.invoiceResult && ctx.invoiceResult.invoice) || {};
                         const amount = parseFloat(cInv.totalInclVat || 0).toFixed(2);
                         const method = ctx.paymentMethod || '?';
-                        const methodIcon = method === 'Mollie Tap' ? this.icon('card', { size: 14, style: 'vertical-align:-2px' })
-                            : method === 'Viva wallet' ? this.icon('card', { size: 14, style: 'vertical-align:-2px' })
-                            : method === 'Cash' ? this.icon('cash', { size: 14, style: 'vertical-align:-2px' })
-                            : method.startsWith('Overschrijving') ? this.icon('bank', { size: 14, style: 'vertical-align:-2px' })
-                            : this.icon('file', { size: 14, style: 'vertical-align:-2px' });
                         paymentBtns = `
-                            <div class="card" style="margin-bottom:12px;background:linear-gradient(135deg, rgba(21,101,192,0.08), rgba(46,125,50,0.08));border-left:4px solid #1565C0;cursor:pointer" onclick="app.openChangePaymentMethodModal()">
-                                <div style="display:flex;align-items:center;justify-content:space-between">
-                                    <div style="flex:1">
-                                        <div style="font-size:14px;font-weight:700;color:#1565C0">${methodIcon} Laatste betaling: ${method}</div>
-                                        <div style="font-size:12px;color:var(--qe-grey);margin-top:3px">Factuur ${ctx.invoiceLogicId || cInv.logicId || ''} — € ${amount}</div>
-                                        <div style="font-size:11px;color:#1565C0;margin-top:4px;font-weight:600">Tik om te openen of betalingsmethode aan te passen →</div>
-                                    </div>
-                                </div>
+                            <div onclick="app.openChangePaymentMethodModal()" style="padding:15px 18px;border-radius:14px;background:var(--card);border:1px solid var(--cb);border-left:3px solid var(--ink);box-shadow:0 2px 10px rgba(38,51,75,0.05);cursor:pointer;margin-bottom:12px">
+                                <div style="font-size:13.5px;font-weight:600;color:var(--ink)">Laatste betaling · ${method}</div>
+                                <div style="font-size:12.5px;color:var(--g1);margin-top:3px">Factuur ${ctx.invoiceLogicId || cInv.logicId || ''} — € ${amount} · tik om de betaalwijze aan te passen</div>
                             </div>`;
                     }
                 }
             } catch(e) { console.warn('[App] Laatste betaling fetch fout:', e && e.message); }
 
+            // v268 (Marble 1:1, prototype "UITGEVOERD"): pwash-infokaart +
+            // platte werkbon-rijen met hairline i.p.v. kaarten/emoji's.
+            // MOTOR-SYNC: alleen de HTML-opmaak wijkt af van 1.x.
             let html = paymentBtns + `
-                <div class="card" style="margin-bottom:12px;background:rgba(106,44,145,0.06);border-left:3px solid var(--qe-purple)">
-                    <div style="font-size:13px;color:var(--qe-purple);font-weight:600">${this.icon('edit', { size: 14, style: 'vertical-align:-2px' })} Correctie-modus</div>
-                    <div style="font-size:12px;color:var(--qe-grey);margin-top:4px">Klik op een planning om uren of materialen te corrigeren. De originele werkbon blijft staan; er wordt een correctie-werkbon met het verschil aangemaakt.</div>
+                <div style="padding:13px 18px;border-radius:12px;background:var(--pwash);border:1px solid var(--pborder);margin-bottom:20px">
+                    <div style="font-size:12.5px;font-weight:600;color:var(--purple2)">Correctie-modus</div>
+                    <div style="font-size:12px;color:var(--g2);margin-top:3px;line-height:1.5">Tik op een werkbon om uren of materialen te corrigeren. De originele werkbon blijft staan; het verschil gaat in een correctie-werkbon.</div>
                 </div>`;
 
             Object.keys(grouped).sort().reverse().forEach(dateStr => {
                 const d = new Date(dateStr + 'T12:00:00');
                 const isToday = dateStr === this._localDateStr();
-                const label = isToday ? 'Vandaag' : `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
+                const label = isToday ? 'VANDAAG' : `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`.toUpperCase();
 
-                html += `<div class="section-header mt-16"><h3 style="font-size:14px">${label}</h3></div>`;
+                html += `<div style="font-size:12px;font-weight:600;color:var(--g1);letter-spacing:0.5px;margin:16px 0 4px">${label}</div>`;
 
                 grouped[dateStr].forEach(p => {
                     const totH = (p.cumulatief && p.cumulatief.totalHours) || 0;
                     const matCount = (p.cumulatief && p.cumulatief.materials && p.cumulatief.materials.length) || 0;
                     const corrBadge = p.aantalWerkbonnen > 1
-                        ? `<span style="background:var(--qe-orange);color:#fff;font-size:10px;padding:2px 6px;border-radius:8px;margin-left:6px">${p.aantalWerkbonnen - 1} correctie${p.aantalWerkbonnen > 2 ? 's' : ''}</span>`
+                        ? `<span style="font-size:10.5px;font-weight:600;color:var(--amber2);border:1px solid var(--aborder2);border-radius:10px;padding:1px 8px;margin-left:8px;white-space:nowrap">${p.aantalWerkbonnen - 1} correctie${p.aantalWerkbonnen > 2 ? 's' : ''}</span>`
                         : '';
 
                     html += `
-                        <div class="card" style="margin-bottom:8px;cursor:pointer" onclick="app.openCorrectie('${p.planningItemId}')">
-                            <div style="display:flex;justify-content:space-between;align-items:flex-start">
-                                <div style="flex:1">
-                                    <div style="font-size:15px;font-weight:500">${this.escapeHtml(p.clientName || 'Onbekend')}${corrBadge}</div>
-                                    ${p.clientAddress ? `<div style="font-size:12px;color:var(--qe-grey);margin-top:2px">📍 ${this.escapeHtml(p.clientAddress)}</div>` : ''}
-                                    <div style="font-size:12px;color:var(--qe-grey);margin-top:4px">
-                                        ⏱ ${this.formatDecimalHours(totH)} · 📦 ${matCount} item${matCount !== 1 ? 's' : ''}
-                                    </div>
-                                </div>
-                                <div style="text-align:right">
-                                    ${p.origineelLogicId ? `<div style="font-size:13px;font-weight:600;color:var(--qe-purple)">${this.escapeHtml(p.origineelLogicId)}</div>` : ''}
-                                    ${p.orderLogicId ? `<div style="font-size:11px;color:var(--qe-grey);margin-top:2px">${this.escapeHtml(p.orderLogicId)}</div>` : ''}
-                                    <div style="font-size:18px;color:var(--qe-purple);margin-top:6px">${this.icon('edit', { size: 18 })}</div>
-                                </div>
+                        <div style="padding:15px 0;border-bottom:1px solid var(--l1);cursor:pointer" onclick="app.openCorrectie('${p.planningItemId}')">
+                            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px">
+                                <span style="font-size:15.5px;font-weight:500;color:var(--ink);min-width:0">${this.escapeHtml(p.clientName || 'Onbekend')}${corrBadge}</span>
+                                <span style="font-size:12px;font-weight:600;color:var(--purple2);flex-shrink:0">${this.escapeHtml(p.origineelLogicId || p.orderLogicId || '')}</span>
                             </div>
+                            <div style="font-size:12.5px;color:var(--g1);margin-top:4px">${this.formatDecimalHours(totH)} · ${matCount} item${matCount !== 1 ? 's' : ''}</div>
                         </div>`;
                 });
             });
@@ -11651,10 +13243,11 @@ const app = {
             if (m) m.remove();
             m = document.createElement('div');
             m.id = 'kmPromptModal';
-            // v272: VOLLEDIG scherm i.p.v. modal — en dit formulier is nu ook
-            // de UITKLOK-BEVESTIGING: "Uitklokken bevestigen" = km opslaan →
-            // resolve(true) → clock.js klokt uit; ✕ of "Annuleren" =
-            // resolve(false) → géén uitklok.
+            // v272: VOLLEDIG scherm i.p.v. bottom-sheet — de sheet verdween
+            // achter het numerieke toetsenbord (v96-les opnieuw geleerd).
+            // Dit formulier is nu ook de UITKLOK-BEVESTIGING: "Uitklokken
+            // bevestigen" = km opslaan → resolve(true) → clock.js klokt uit;
+            // ✕ of "Annuleren" = resolve(false) → géén uitklok.
             m.style.cssText = 'position:fixed;inset:0;z-index:99998;background:var(--bg,var(--qe-white,#fff));display:flex;animation:mbSheet 0.35s cubic-bezier(0.22,1,0.36,1)';
             m.innerHTML = `
                 <div style="display:flex;flex-direction:column;width:100%;height:100%;box-sizing:border-box">
@@ -11668,95 +13261,95 @@ const app = {
                     <div style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:12px 20px 20px">
                     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
                         <div>
-                            <label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Heen (km)</label>
+                            <label style="font-size:12px;color:var(--g1);display:block;margin-bottom:4px">Heen (km)</label>
                             <input id="kmHeenInput" type="number" inputmode="numeric" min="0" step="1" value="0"
-                                style="width:100%;padding:12px;font-size:17px;border:2px solid #cfd8dc;border-radius:10px;text-align:center;font-weight:600;box-sizing:border-box">
+                                style="width:100%;padding:12px;font-size:17px;border:1px solid var(--b1);border-radius:10px;text-align:center;font-weight:600;box-sizing:border-box">
                         </div>
                         <div>
-                            <label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Terug (km)</label>
+                            <label style="font-size:12px;color:var(--g1);display:block;margin-bottom:4px">Terug (km)</label>
                             <input id="kmTerugInput" type="number" inputmode="numeric" min="0" step="1" value="0"
-                                style="width:100%;padding:12px;font-size:17px;border:2px solid #cfd8dc;border-radius:10px;text-align:center;font-weight:600;box-sizing:border-box">
+                                style="width:100%;padding:12px;font-size:17px;border:1px solid var(--b1);border-radius:10px;text-align:center;font-weight:600;box-sizing:border-box">
                         </div>
                     </div>
 
-                    <label style="font-size:12px;color:#666;display:block;margin-bottom:4px">Mobiliteit</label>
+                    <label style="font-size:12px;color:var(--g1);display:block;margin-bottom:4px">Mobiliteit</label>
                     <div id="kmMobilityRadio" style="display:grid;gap:6px;margin-bottom:14px">
-                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px">
+                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--b1);border-radius:10px;cursor:pointer;font-size:14px">
                             <input type="radio" name="kmMobility" value="-3" checked style="margin:0">
  <span> Chauffeur zonder passagiers</span>
                         </label>
-                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px">
+                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--b1);border-radius:10px;cursor:pointer;font-size:14px">
                             <input type="radio" name="kmMobility" value="-1" style="margin:0">
  <span> Chauffeur (met passagiers)</span>
                         </label>
-                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px">
+                        <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--b1);border-radius:10px;cursor:pointer;font-size:14px">
                             <input type="radio" name="kmMobility" value="-2" style="margin:0">
  <span> Passagier</span>
                         </label>
                     </div>
 
-                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:8px;background:#fff8e1">
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--b1);border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:8px;background:var(--awash)">
                         <input id="kmFietsInput" type="checkbox" style="margin:0;width:20px;height:20px;cursor:pointer">
  <span> Woonwerk-verkeer met de <strong>fiets</strong></span>
                     </label>
 
-                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:8px;background:#e8f5e9">
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--b1);border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:8px;background:var(--gwash)">
                         <input id="kmDirectThuisWerfInput" type="checkbox" style="margin:0;width:20px;height:20px;cursor:pointer">
  <span> Rechtstreeks van <strong>thuis naar werf</strong> gereden</span>
                     </label>
 
-                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:2px solid #cfd8dc;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:14px;background:#e8f5e9">
+                    <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--b1);border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:14px;background:var(--gwash)">
                         <input id="kmDirectWerfThuisInput" type="checkbox" style="margin:0;width:20px;height:20px;cursor:pointer">
  <span> Rechtstreeks van <strong>werf naar thuis</strong> gereden</span>
                     </label>
 
                     <!-- v131: knop om rit te splitsen in 2 mobiliteits-segmenten -->
                     <button id="kmSplitToggle" type="button"
-                            style="width:100%;padding:11px;background:#fff;color:#1A237E;border:2px dashed #1A237E;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:14px">
+                            style="width:100%;padding:11px;background:#fff;color:var(--ink);border:1px dashed var(--b2);border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:14px">
  Rit splitsen (deel met andere mobiliteit)
                     </button>
 
-                    <div id="kmSplitSection" style="display:none;border:2px solid #cfd8dc;border-radius:12px;padding:14px;margin-bottom:14px;background:#fafafa">
+                    <div id="kmSplitSection" style="display:none;border:1px solid var(--b1);border-radius:12px;padding:14px;margin-bottom:14px;background:var(--wash)">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
- <div style="font-size:13px;font-weight:700;color:#1A237E"> Tweede rit-segment</div>
-                            <button id="kmSplitRemove" type="button" style="background:none;border:none;color:#c62828;cursor:pointer;font-size:13px;font-weight:600;padding:0">✕ verwijder</button>
+ <div style="font-size:13px;font-weight:700;color:var(--ink)"> Tweede rit-segment</div>
+                            <button id="kmSplitRemove" type="button" style="background:none;border:none;color:var(--red2);cursor:pointer;font-size:13px;font-weight:600;padding:0">✕ verwijder</button>
                         </div>
-                        <div style="font-size:11px;color:#888;margin-bottom:10px;line-height:1.4">
+                        <div style="font-size:11px;color:var(--g3);margin-bottom:10px;line-height:1.4">
                             Vul hier de km in die je in een <strong>andere</strong> mobiliteit aflegde (bv. solo-deel voordat je iemand oppikte). De hoofd-keuze hierboven geldt voor de rest.
                         </div>
                         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
                             <div>
-                                <label style="font-size:11px;color:#666;display:block;margin-bottom:3px">Heen (km)</label>
+                                <label style="font-size:11px;color:var(--g1);display:block;margin-bottom:3px">Heen (km)</label>
                                 <input id="kmHeen2Input" type="number" inputmode="numeric" min="0" step="1" value="0"
-                                    style="width:100%;padding:10px;font-size:15px;border:2px solid #cfd8dc;border-radius:8px;text-align:center;font-weight:600;box-sizing:border-box">
+                                    style="width:100%;padding:10px;font-size:15px;border:1px solid var(--b1);border-radius:8px;text-align:center;font-weight:600;box-sizing:border-box">
                             </div>
                             <div>
-                                <label style="font-size:11px;color:#666;display:block;margin-bottom:3px">Terug (km)</label>
+                                <label style="font-size:11px;color:var(--g1);display:block;margin-bottom:3px">Terug (km)</label>
                                 <input id="kmTerug2Input" type="number" inputmode="numeric" min="0" step="1" value="0"
-                                    style="width:100%;padding:10px;font-size:15px;border:2px solid #cfd8dc;border-radius:8px;text-align:center;font-weight:600;box-sizing:border-box">
+                                    style="width:100%;padding:10px;font-size:15px;border:1px solid var(--b1);border-radius:8px;text-align:center;font-weight:600;box-sizing:border-box">
                             </div>
                         </div>
-                        <label style="font-size:11px;color:#666;display:block;margin-bottom:4px">Mobiliteit voor dit segment</label>
+                        <label style="font-size:11px;color:var(--g1);display:block;margin-bottom:4px">Mobiliteit voor dit segment</label>
                         <div id="kmMobility2Radio" style="display:grid;gap:5px">
-                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:2px solid #cfd8dc;border-radius:8px;cursor:pointer;font-size:13px;background:#fff">
+                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:1px solid var(--b1);border-radius:8px;cursor:pointer;font-size:13px;background:var(--card)">
                                 <input type="radio" name="kmMobility2" value="-3" checked style="margin:0">
  <span> Chauffeur zonder passagiers</span>
                             </label>
-                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:2px solid #cfd8dc;border-radius:8px;cursor:pointer;font-size:13px;background:#fff">
+                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:1px solid var(--b1);border-radius:8px;cursor:pointer;font-size:13px;background:var(--card)">
                                 <input type="radio" name="kmMobility2" value="-1" style="margin:0">
  <span> Chauffeur (met passagiers)</span>
                             </label>
-                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:2px solid #cfd8dc;border-radius:8px;cursor:pointer;font-size:13px;background:#fff">
+                            <label style="display:flex;align-items:center;gap:7px;padding:8px 10px;border:1px solid var(--b1);border-radius:8px;cursor:pointer;font-size:13px;background:var(--card)">
                                 <input type="radio" name="kmMobility2" value="-2" style="margin:0">
  <span> Passagier</span>
                             </label>
                         </div>
                     </div>
 
-                    <button id="kmPromptSubmit" style="width:100%;padding:16px;background:var(--btn,var(--qe-darkblue,#1A237E));color:var(--btnfg,#fff);border:none;border-radius:2px;font-size:15px;font-weight:600;cursor:pointer">
+                    <button id="kmPromptSubmit" style="width:100%;padding:16px;background:var(--btn);color:var(--btnfg);border:none;border-radius:2px;font:600 14px var(--font);cursor:pointer">
                         Uitklokken bevestigen
                     </button>
-                    <div id="kmPromptError" style="font-size:11px;color:#e65100;background:#fff3e0;border:1px solid #ffcc80;border-radius:8px;padding:8px;margin-top:8px;text-align:left;display:none;word-wrap:break-word;max-height:120px;overflow-y:auto;line-height:1.4"></div>
+                    <div id="kmPromptError" style="font-size:11px;color:var(--amber2);background:var(--awash2);border:1px solid var(--aborder);border-radius:8px;padding:8px;margin-top:8px;text-align:left;display:none;word-wrap:break-word;max-height:120px;overflow-y:auto;line-height:1.4"></div>
                     <button id="kmPromptCancel" type="button" style="width:100%;margin-top:10px;padding:12px;border:none;background:none;color:var(--g1,var(--qe-grey,#888));font-size:13px;font-weight:500;cursor:pointer">Annuleren — nog niet uitklokken</button>
                     </div>
                 </div>`;
@@ -12498,11 +14091,16 @@ const app = {
         // (Fire-and-forget; processOfflineQueue stopt zelf direct bij count=0.)
         this.processOfflineQueue();
         if (!navigator.onLine) return;
+        // (v307 / 1.x v302) scherm uit / app in achtergrond → poll-tik overslaan
+        // (de wachtrij-poging hierboven blijft wél lopen; bij terugkeren pakt de
+        // volgende tik het gewoon weer op — bespaart calls zonder UX-verlies).
+        if (document.hidden) return;
         try {
             const date = this._localDateStr();
-            const result = await RobawsAPI.getPlanning(this.currentUser.robawsEmployeeId, date, this.currentUser.robawsUserId);
-            const items = (result.items || []).filter(it => !it.hasWerkbon);
-            const count = items.length;
+            // (v307 / 1.x v302) lichte teller i.p.v. de volledige getPlanning met
+            // verrijking — de poll heeft alleen het AANTAL nodig; scheelt per tik
+            // een detail-GET per item + klantdata (~60-80% van de poll-kosten).
+            const count = await RobawsAPI.getOpenPlanningCount(this.currentUser.robawsEmployeeId, date, this.currentUser.robawsUserId);
 
             if (this._lastPlanningCount !== null && count > this._lastPlanningCount) {
                 const diff = count - this._lastPlanningCount;
@@ -12763,6 +14361,483 @@ const app = {
     toggleDarkMode(enabled) {
         document.body.classList.toggle('dark-mode', enabled);
         localStorage.setItem('qe_dark_mode', enabled ? '1' : '0');
+    },
+
+    // ========================================
+    // TOEGANKELIJKHEID (v280 / 1.x v275)
+    // Eén bron van waarheid: localStorage qe_a11y_*. _applyA11y() leest alle
+    // sleutels en zet body-classes (schaal/vet/contrast/beweging/palet) + een
+    // SVG-kleurcorrectiefilter op <html>. Idempotent — veilig om vaak aan te
+    // roepen (init, showApp, na elke wijziging). De oude "werf-modus" is
+    // opgegaan in de schaal (Groot). Alle CSS staat in marble.css / app.css.
+    // ========================================
+    _A11Y_SCALES: ['normaal', 'groot', 'xl'],
+    _A11Y_CVDS: ['deuter', 'protan', 'tritan'],
+
+    _migrateA11y() {
+        // v260 werf-modus → schaal "Groot" (eenmalig), daarna sleutel opruimen.
+        try {
+            if (!localStorage.getItem('qe_a11y_scale') && localStorage.getItem('qe_werf_modus') === '1') {
+                localStorage.setItem('qe_a11y_scale', 'groot');
+            }
+            localStorage.removeItem('qe_werf_modus');
+        } catch (_e) {}
+    },
+
+    _applyA11y() {
+        try {
+            const b = document.body;
+            if (!b) return;
+            const get = (k) => { try { return localStorage.getItem(k); } catch (_e) { return null; } };
+
+            // Donker thema (aparte sleutel, blijft compatibel met toggleDarkMode)
+            b.classList.toggle('dark-mode', get('qe_dark_mode') === '1');
+
+            // Tekst- & knopgrootte (zoom, zie CSS)
+            let scale = get('qe_a11y_scale') || 'normaal';
+            if (this._A11Y_SCALES.indexOf(scale) === -1) scale = 'normaal';
+            b.classList.toggle('a11y-scale-groot', scale === 'groot');
+            b.classList.toggle('a11y-scale-xl', scale === 'xl');
+
+            // Vetgedrukte tekst / hoog contrast / minder beweging / kleurvriendelijk palet
+            b.classList.toggle('a11y-bold', get('qe_a11y_bold') === '1');
+            b.classList.toggle('a11y-contrast', get('qe_a11y_contrast') === '1');
+            b.classList.toggle('a11y-motion', get('qe_a11y_motion') === '1');
+            b.classList.toggle('a11y-cvd-palette', get('qe_a11y_palette') === '1');
+
+            // Kleurenblind-correctie: SVG-filter op <html> (niet op body — zo blijft
+            // de fixed bottom-nav/topbar t.o.v. het viewport gepositioneerd).
+            let cvd = get('qe_a11y_cvd') || '';
+            if (cvd && this._A11Y_CVDS.indexOf(cvd) === -1) cvd = '';
+            const root = document.documentElement;
+            if (root) root.style.filter = cvd ? ('url(#a11y-cvd-' + cvd + ')') : '';
+        } catch (_e) {}
+    },
+
+    // Zet de profiel-bediening gelijk aan de bewaarde voorkeuren (openProfile).
+    _syncA11yControls() {
+        const get = (k) => { try { return localStorage.getItem(k); } catch (_e) { return null; } };
+        const set = (id, prop, val) => { const el = document.getElementById(id); if (el) el[prop] = val; };
+        set('darkModeToggle', 'checked', get('qe_dark_mode') === '1');
+        let scale = get('qe_a11y_scale') || 'normaal';
+        if (this._A11Y_SCALES.indexOf(scale) === -1) scale = 'normaal';
+        set('a11yScaleSelect', 'value', scale);
+        set('a11yBoldToggle', 'checked', get('qe_a11y_bold') === '1');
+        set('a11yContrastToggle', 'checked', get('qe_a11y_contrast') === '1');
+        set('a11yMotionToggle', 'checked', get('qe_a11y_motion') === '1');
+        set('a11yPaletteToggle', 'checked', get('qe_a11y_palette') === '1');
+        set('a11yCvdSelect', 'value', get('qe_a11y_cvd') || '');
+    },
+
+    setA11yScale(v) {
+        if (this._A11Y_SCALES.indexOf(v) === -1) v = 'normaal';
+        try { localStorage.setItem('qe_a11y_scale', v); } catch (_e) {}
+        this._applyA11y();
+    },
+    toggleA11yBold(on) {
+        try { localStorage.setItem('qe_a11y_bold', on ? '1' : '0'); } catch (_e) {}
+        this._applyA11y();
+    },
+    toggleA11yContrast(on) {
+        try { localStorage.setItem('qe_a11y_contrast', on ? '1' : '0'); } catch (_e) {}
+        this._applyA11y();
+    },
+    toggleA11yMotion(on) {
+        try { localStorage.setItem('qe_a11y_motion', on ? '1' : '0'); } catch (_e) {}
+        this._applyA11y();
+    },
+    setA11yCvd(v) {
+        if (v && this._A11Y_CVDS.indexOf(v) === -1) v = '';
+        try { localStorage.setItem('qe_a11y_cvd', v || ''); } catch (_e) {}
+        this._applyA11y();
+    },
+    toggleA11yPalette(on) {
+        try { localStorage.setItem('qe_a11y_palette', on ? '1' : '0'); } catch (_e) {}
+        this._applyA11y();
+    },
+
+    // Back-compat: eventuele oude werf-modus-aanroepen → schaal Groot/Normaal.
+    toggleWerfModus(enabled) {
+        this.setA11yScale(enabled ? 'groot' : 'normaal');
+    },
+
+    // v292: pull-to-refresh (native SwipeRefreshLayout) uitzetten zodra er een
+    // pop-up/overlay openstaat — anders triggert omhoog scrollen in een modal een
+    // ongewilde app-refresh. Een MutationObserver houdt de status bij, dus dit
+    // werkt voor ELKE overlay (modal, PDF-viewer, Marble-loader/succes, …).
+    _pullRefreshOverlayOpen() {
+        try {
+            const m = document.getElementById('modalOverlay');
+            if (m && m.classList.contains('show')) return true;
+            if (document.getElementById('pdfFullscreen')) return true;
+            const nodes = document.querySelectorAll('.mb-fullveil, .modal-overlay.show, [data-overlay="1"]');
+            for (let i = 0; i < nodes.length; i++) {
+                if (nodes[i].offsetWidth > 0 || nodes[i].offsetHeight > 0) return true;
+            }
+            return false;
+        } catch (_e) { return false; }
+    },
+    _syncPullRefresh() {
+        const open = this._pullRefreshOverlayOpen();
+        if (open === this._lastPullState) return;
+        this._lastPullState = open;
+        try { if (window.QEBridge && QEBridge.setPullToRefreshEnabled) QEBridge.setPullToRefreshEnabled(!open); } catch (_e) {}
+    },
+    _installPullRefreshGuard() {
+        if (this._pullGuardInstalled) return;
+        this._pullGuardInstalled = true;
+        try {
+            const schedule = () => { clearTimeout(this._pullSyncT); this._pullSyncT = setTimeout(() => this._syncPullRefresh(), 60); };
+            new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+            this._syncPullRefresh();
+        } catch (_e) {}
+    },
+
+
+    // Profiel-groepen: openklikbare accordeon (v281). Klap één groep open/dicht
+    // (display + chevron ▾/▴). Werkt in beide mappen; de mbUp-animatie bestaat
+    // enkel in marble.css en is een no-op in de 1.x-www.
+    togglePgGroup(bodyId, chevId) {
+        const body = document.getElementById(bodyId);
+        if (!body) return;
+        const open = body.style.display !== 'none';
+        body.style.display = open ? 'none' : 'block';
+        if (!open) {
+            try { body.style.animation = 'none'; void body.offsetWidth; body.style.animation = 'mbUp 0.3s cubic-bezier(0.22, 1, 0.36, 1)'; } catch (_e) {}
+        }
+        const chev = chevId ? document.getElementById(chevId) : null;
+        if (chev) chev.textContent = open ? '▾' : '▴';
+    },
+
+    // ============================================================
+    // MAANDRECAP (v285 / 1.x v280) — "Spotify-Wrapped"-stories.
+    // Data + opslag zit in window.QERecap (js/maand-recap.js); hier
+    // enkel de trigger + de UI. De stories zijn zelfstandig (inline
+    // styles), dus identiek in beide www-mappen.
+    // ============================================================
+
+    /** Na een uitklok: toon 1×/maand de recap van de doelmaand. Doet
+     *  niets op gewone dagen (dueMonth + shown-vlag vóór elke fetch). */
+    async maybeShowMonthRecap(empId) {
+        try {
+            // v290: rond het bouwverlof heeft het jaaroverzicht voorrang.
+            try { if (this.maybeShowYearRecap && this.maybeShowYearRecap()) return; } catch (_y) {}
+            empId = empId || (this.currentUser && this.currentUser.robawsEmployeeId);
+            if (!empId || !window.QERecap) return;
+            const ym = QERecap.dueMonth(new Date());
+            if (!ym || QERecap.isShown(empId, ym)) return;
+            this._showRecapLoading('Je maandrecap wordt gemaakt…');
+            let stats = null;
+            try {
+                stats = await QERecap.get(empId, ym, this.currentUser && this.currentUser.name);
+            } catch (e) {
+                console.warn('[Recap] genereren faalde:', e && e.message);
+                this._hideRecapLoading();
+                return; // niet markeren → een volgende uitklok probeert opnieuw
+            }
+            this._hideRecapLoading();
+            QERecap.markShown(empId, ym); // ook markeren als er niets te tonen valt
+            if (stats && stats.hasData) this.openRecapStories(stats);
+        } catch (e) { console.warn('[Recap] maybeShow faalde:', e && e.message); try { this._hideRecapLoading(); } catch (_e) {} }
+    },
+
+    /** "Terugblik"-knop: kies een maand om de recap (opnieuw) te bekijken. */
+    async openTerugblik() {
+        // v288: echte pagina i.p.v. pop-up (de centered overlay rendert onbetrouwbaar
+        // in deze WebView). We tekenen de maandkeuze gewoon in het scherm.
+        this.navigate('screenRecap');
+        const box = document.getElementById('recapListContent');
+        if (!box) return;
+        const empId = this.currentUser && this.currentUser.robawsEmployeeId;
+        if (!empId || !window.QERecap) { box.innerHTML = '<p style="text-align:center;color:var(--g1,#85847C);font-size:14px;padding:26px 10px">Geen werknemer-koppeling gevonden.</p>'; return; }
+        box.innerHTML = '<div class="spinner"></div>';
+        let cached = [];
+        try { cached = await QERecap.list(empId); } catch (_e) {}
+        const set = {}, items = [];
+        cached.forEach(s => { if (!set[s.ym]) { set[s.ym] = 1; items.push({ ym: s.ym, label: QERecap.monthLabel(s.ym), cached: true }); } });
+        const now = new Date();
+        for (let k = 1; k <= 3; k++) {
+            const d = new Date(now.getFullYear(), now.getMonth() - k, 1);
+            const mm = d.getMonth() + 1;
+            const ym = d.getFullYear() + '-' + (mm < 10 ? '0' : '') + mm;
+            if (!set[ym]) { set[ym] = 1; items.push({ ym: ym, label: QERecap.monthLabel(ym), cached: false }); }
+        }
+        items.sort((a, b) => String(b.ym).localeCompare(String(a.ym)));
+        const rows = items.map(it =>
+            '<button data-ym="' + it.ym + '" style="width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 16px;margin-bottom:10px;border:1px solid var(--b1,#DCD9D0);border-radius:14px;background:var(--card,#FDFCFA);color:var(--ink,#26334B);font:700 16px/1.1 var(--font,inherit);cursor:pointer;-webkit-appearance:none;appearance:none">' +
+            '<span>' + this.escapeHtml(it.label) + '</span>' +
+            '<span style="color:var(--accent,#F99D3E);font-size:20px;font-weight:700">' + (it.cached ? '▸' : '＋') + '</span></button>'
+        ).join('');
+        // v291: het jaaroverzicht staat bovenaan bij de maandrecaps (geen aparte knop meer)
+        const jaarRec = window.QEJaar ? QEJaar.find(empId, this.currentUser && this.currentUser.name) : null;
+        const jaarBtn = jaarRec ? ('<button data-jaar="1" style="width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 16px;margin-bottom:14px;border:1.5px solid var(--accent,#F99D3E);border-radius:14px;background:var(--card,#FDFCFA);color:var(--ink,#26334B);font:800 16px/1.1 var(--font,inherit);cursor:pointer;-webkit-appearance:none;appearance:none"><span>🏆 Jaaroverzicht 2025-2026</span><span style="color:var(--accent,#F99D3E);font-size:20px">→</span></button>') : '';
+        box.innerHTML =
+            '<div style="font-size:22px;font-weight:800;color:var(--ink,#26334B);margin:4px 2px 4px">📅 Maandrecap</div>' +
+            '<div style="font-size:13px;color:var(--g1,#85847C);margin:0 2px 18px;line-height:1.4">Kies een maand om je recap te (her)bekijken. <b style="color:var(--accent,#F99D3E)">▸</b> = klaar · <b style="color:var(--accent,#F99D3E)">＋</b> = nog te berekenen.</div>' +
+            jaarBtn +
+            rows;
+        box.querySelectorAll('button[data-jaar]').forEach(btn => { btn.onclick = () => this.openJaaroverzicht(); });
+        box.querySelectorAll('button[data-ym]').forEach(btn => { btn.onclick = () => this.openRecap(btn.getAttribute('data-ym')); });
+    },
+    _closeRecapChooser() {
+        if (this._recapChooser && this._recapChooser.parentNode) this._recapChooser.parentNode.removeChild(this._recapChooser);
+        this._recapChooser = null;
+    },
+    /** Laad (uit cache of bereken) en toon de recap van één maand. */
+    async openRecap(ym) {
+        const empId = this.currentUser && this.currentUser.robawsEmployeeId;
+        if (!empId || !window.QERecap) return;
+        this._closeRecapChooser();
+        this._showRecapLoading('Recap laden…');
+        let stats = null;
+        try { stats = await QERecap.get(empId, ym, this.currentUser && this.currentUser.name); }
+        catch (e) { this._hideRecapLoading(); if (this.toast) this.toast('Laden mislukt: ' + (e.message || '?'), true); return; }
+        this._hideRecapLoading();
+        if (stats && stats.hasData) this.openRecapStories(stats);
+        else if (this.toast) this.toast('Geen klok-gegevens voor ' + QERecap.monthLabel(ym), true);
+    },
+    // Kleine laad-overlay tijdens het (eenmalige) berekenen van een recap.
+    _showRecapLoading(text) {
+        this._ensureRecapStyles();
+        this._hideRecapLoading();
+        const ov = document.createElement('div');
+        ov.className = 'qr-loading';
+        ov.innerHTML = '<div class="qr-spin"></div><div class="qr-load-txt">' + this.escapeHtml(text || 'Even geduld…') + '</div>';
+        document.body.appendChild(ov);
+        this._recapLoading = ov;
+    },
+    _hideRecapLoading() {
+        if (this._recapLoading && this._recapLoading.parentNode) this._recapLoading.parentNode.removeChild(this._recapLoading);
+        this._recapLoading = null;
+    },
+
+    /** De Spotify-Wrapped-achtige stories-overlay (tik links/rechts). */
+    openRecapStories(stats) {
+        if (!stats) return;
+        try { this._hideRecapLoading(); } catch (_e) {}
+        this._closeRecapStories();
+        const s = stats;
+        const cap = (w) => w ? (w.charAt(0).toUpperCase() + w.slice(1)) : '';
+        const MONTHS = ['januari', 'februari', 'maart', 'april', 'mei', 'juni', 'juli', 'augustus', 'september', 'oktober', 'november', 'december'];
+        const _m0 = parseInt(String(s.ym).split('-')[1], 10) - 1;
+        const nextMonth = MONTHS[(((_m0 + 1) % 12) + 12) % 12] || '';
+
+        const cards = [];
+        // Marble-accenten — de kaart blijft licht (crème); per kaart een zachte
+        // kleur-chip + wash. Getal in navy (--ink), "QE"-label in oranje.
+        const ORANGE = '#F99D3E', NAVY = '#3A4A6B', GREEN = '#2FA36E', INDIGO = '#4457C7', PURPLE = '#8A4BC7', TEAL = '#1FA39A', CORAL = '#E0674B', PINK = '#C7568C';
+        const add = (accent, emoji, big, label, sub) => cards.push({ accent: accent, emoji: emoji, big: String(big), label: label || '', sub: sub || '' });
+        add(NAVY, '📅', cap(s.monthLabel), 'jouw maand in cijfers', 'Tik om te bladeren →');
+        add(INDIGO, '⏱️', s.totalHours + 'u', 'gewerkt deze maand', s.workedDays + ' werkdagen');
+        add(ORANGE, '📊', s.avgHoursPerDay + 'u', 'gemiddeld per dag', s.longestDayHours > 0 ? ('Langste dag: ' + s.longestDayHours + 'u' + (s.longestDayLabel ? ' — ' + s.longestDayLabel : '')) : '');
+        if (s.avgArrivalStr) add(TEAL, '🌅', s.avgArrivalStr, 'je gemiddelde aankomst', s.earliestArrivalStr ? ('Vroegste: ' + s.earliestArrivalStr + (s.earliestArrivalDayLabel ? ' (' + s.earliestArrivalDayLabel + ')' : '')) : '');
+        if (s.avgDepartureStr) add(PURPLE, '🌆', s.avgDepartureStr, 'gemiddeld naar huis', s.latestDepartureStr ? ('Laatste: ' + s.latestDepartureStr + (s.latestDepartureDayLabel ? ' (' + s.latestDepartureDayLabel + ')' : '')) : '');
+        add(s.lateCount === 0 ? GREEN : ORANGE, s.lateCount === 0 ? '⭐' : '⏰', (s.onTimePct != null ? s.onTimePct : 100) + '%', 'op tijd ingeklokt', s.lateCount === 0 ? 'Elke dag stipt!' : (s.onTimeDays + '/' + (s.assessedDays != null ? s.assessedDays : s.workedDays) + ' dagen op tijd'));
+        if (s.extraClockIns > 0) add(GREEN, '🚀', s.extraClockIns + '', 'keer extra ingesprongen', 'buiten je normale start — top!');
+        if (s.overtimeHours > 0) add(CORAL, '🔥', s.overtimeHours + 'u', 'overuren gedraaid', (s.overtimePct || 0) + '% van je uren');
+        if (s.longestStreak >= 2) add(INDIGO, '🔗', s.longestStreak + '', 'dagen op rij gewerkt', 'Je langste reeks');
+        if (s.busiestWeekHours > 0) add(NAVY, '📈', s.busiestWeekHours + 'u', 'je drukste week', s.busiestWeekLabel || '');
+        if ((s.sickCount + s.verlofCount) > 0) add(PURPLE, '🗓️', (s.sickCount + s.verlofCount) + '', [s.sickCount ? (s.sickCount + ' ziek') : '', s.verlofCount ? (s.verlofCount + ' verlof') : ''].filter(Boolean).join(' · '), 'afwezige dagen');
+        if (s.totalKm > 0) add(TEAL, '🚗', s.totalKm + ' km', 'onderweg', '');
+        if (s.fietsDays > 0) add(GREEN, '🚲', s.fietsDays + '', 'dagen met de fiets', 'Groen bezig!');
+        if (s.weekendDaysWorked > 0) add(ORANGE, '🏗️', s.weekendDaysWorked + '', 'weekenddag(en) gewerkt', '');
+        if (s.favWeekday) add(PINK, '❤️', cap(s.favWeekday), 'je favoriete werkdag', s.favWeekdayHours + 'u in totaal');
+        add(ORANGE, '🎉', 'Bedankt!', '', 'Tot in ' + nextMonth + '! Terugblik: knop op de Klok.');
+
+        this._playStories(cards, 'QE · ' + cap(s.monthLabel));
+    },
+
+    /** Speelt een reeks story-kaarten in de fullscreen-overlay (gedeeld door de
+     *  maand- én jaarrecap). card = {accent, emoji, big, label, sub} of
+     *  {accent, html} voor een custom kaart (bv. de maand-grafiek). */
+    _playStories(cards, tag) {
+        if (!cards || !cards.length) return;
+        this._ensureRecapStyles();
+        this._closeRecapStories();
+        const esc = (x) => this.escapeHtml(x);
+        const ov = document.createElement('div');
+        ov.className = 'qr-ov';
+        ov.innerHTML =
+            '<div class="qr-bars" id="qrBars"></div>' +
+            '<button class="qr-x" aria-label="Sluiten">&times;</button>' +
+            '<div class="qr-card" id="qrCard"></div>' +
+            '<div class="qr-tap qr-tap-l" id="qrTapL"></div>' +
+            '<div class="qr-tap qr-tap-r" id="qrTapR"></div>';
+        document.body.appendChild(ov);
+        const bars = ov.querySelector('#qrBars');
+        bars.innerHTML = cards.map(() => '<div class="qr-bar"><i></i></div>').join('');
+        const reduce = document.body.classList.contains('a11y-motion');
+        const DUR = 5200;
+        const state = { idx: -1, timer: null, ov: ov };
+        this._recapState = state;
+        const tagHtml = tag ? ('<div class="qr-tag">' + esc(tag) + '</div>') : '';
+        const render = () => {
+            const c = cards[state.idx];
+            const card = ov.querySelector('#qrCard');
+            card.style.background = c.accent ? (c.accent + '14') : 'var(--bg,#F4F2ED)';
+            card.innerHTML = tagHtml + (c.html != null ? c.html :
+                ('<div class="qr-chip" style="background:' + (c.accent || '#888888') + '2b">' + (c.emoji || '') + '</div>' +
+                 '<div class="qr-big">' + esc(c.big) + '</div>' +
+                 (c.label ? '<div class="qr-label">' + esc(c.label) + '</div>' : '') +
+                 (c.sub ? '<div class="qr-sub">' + esc(c.sub) + '</div>' : '')));
+            if (!reduce) { card.style.animation = 'none'; void card.offsetWidth; card.style.animation = 'qrIn .5s cubic-bezier(.22,1,.36,1)'; }
+            if (c.onShow && !c._shown) { c._shown = true; try { c.onShow(); } catch (_e) {} }
+            const fills = bars.querySelectorAll('.qr-bar > i');
+            fills.forEach((fill, i) => {
+                fill.style.transition = 'none';
+                if (i < state.idx) fill.style.width = '100%';
+                else if (i > state.idx) fill.style.width = '0%';
+                else { fill.style.width = '0%'; void fill.offsetWidth; fill.style.transition = 'width ' + (reduce ? 0 : DUR) + 'ms linear'; fill.style.width = '100%'; }
+            });
+        };
+        const clear = () => { if (state.timer) { clearTimeout(state.timer); state.timer = null; } };
+        const go = (i) => {
+            clear();
+            if (i < 0) i = 0;
+            if (i >= cards.length) { this._closeRecapStories(); return; }
+            state.idx = i; render();
+            if (!reduce) state.timer = setTimeout(() => go(state.idx + 1), DUR);
+        };
+        ov.querySelector('.qr-x').onclick = () => this._closeRecapStories();
+        ov.querySelector('#qrTapR').onclick = () => go(state.idx + 1);
+        ov.querySelector('#qrTapL').onclick = () => go(state.idx - 1);
+        requestAnimationFrame(() => go(0));
+        try { if (window.QEMarble && QEMarble.haptic) QEMarble.haptic('success'); } catch (_e) {}
+    },
+    _closeRecapStories() {
+        const st = this._recapState;
+        if (st) { if (st.timer) clearTimeout(st.timer); if (st.ov && st.ov.parentNode) st.ov.parentNode.removeChild(st.ov); }
+        this._recapState = null;
+    },
+    _ensureRecapStyles() {
+        if (document.getElementById('qrStyles')) return;
+        const st = document.createElement('style');
+        st.id = 'qrStyles';
+        st.textContent =
+            '.qr-ov{position:fixed;inset:0;z-index:100000;background:var(--bg,#F4F2ED);overflow:hidden;display:flex;flex-direction:column;font-family:var(--font,"Archivo",system-ui,-apple-system,sans-serif)}' +
+            '.qr-bars{position:absolute;top:0;left:0;right:0;display:flex;gap:4px;padding:12px 12px;z-index:3}' +
+            '.qr-bar{flex:1;height:3px;border-radius:3px;background:var(--b1,#DCD9D0);overflow:hidden}' +
+            '.qr-bar>i{display:block;height:100%;width:0;background:var(--accent,#F99D3E);border-radius:3px}' +
+            '.qr-x{position:absolute;top:19px;right:12px;z-index:4;background:none;border:none;color:var(--g1,#85847C);font-size:30px;line-height:1;cursor:pointer;-webkit-appearance:none;appearance:none;padding:4px 10px}' +
+            '.qr-card{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:64px 26px 92px;color:var(--ink,#26334B)}' +
+            '.qr-tag{font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent,#F99D3E);margin-bottom:24px}' +
+            '.qr-chip{width:108px;height:108px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:50px;margin-bottom:22px}' +
+            '.qr-big{font-size:clamp(40px,13vw,86px);font-weight:800;line-height:1.02;letter-spacing:-.02em;color:var(--ink,#26334B);max-width:100%;word-break:break-word}' +
+            '.qr-label{font-size:19px;font-weight:600;margin-top:14px;color:var(--ink,#26334B);max-width:84%}' +
+            '.qr-sub{font-size:14px;margin-top:12px;color:var(--g1,#85847C);max-width:84%;line-height:1.45}' +
+            '.qr-tap{position:absolute;top:46px;bottom:0;z-index:2;cursor:pointer}' +
+            '.qr-tap-l{left:0;width:33%}.qr-tap-r{left:33%;right:0}' +
+            '@keyframes qrIn{from{opacity:0;transform:translateY(16px) scale(.98)}to{opacity:1;transform:none}}' +
+            '.qr-chooser{position:fixed;inset:0;z-index:100000;background:rgba(0,18,44,.62);display:flex;align-items:center;justify-content:center;padding:22px;font-family:var(--font,"Archivo",system-ui,sans-serif)}' +
+            '.qr-ch-box{background:var(--card,#FDFCFA);color:var(--ink,#26334B);width:100%;max-width:460px;border-radius:18px;padding:20px 18px;max-height:82vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.42);animation:qrPop .28s cubic-bezier(.22,1,.36,1)}' +
+            '@keyframes qrPop{from{opacity:0;transform:translateY(20px) scale(.96)}to{opacity:1;transform:none}}' +
+            '.qr-ch-head{display:flex;align-items:center;justify-content:space-between;font-size:19px;font-weight:800;margin:0 2px 4px;color:var(--ink,#26334B)}' +
+            '.qr-ch-x{background:none;border:none;font-size:28px;line-height:1;color:var(--g1,#888);cursor:pointer;-webkit-appearance:none;appearance:none}' +
+            '.qr-ch-item{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 15px;margin-top:9px;border:1.5px solid var(--b1,#e5e2da);border-radius:13px;background:var(--bg,#F4F2ED);color:inherit;font:700 15.5px/1 var(--font,inherit);cursor:pointer;-webkit-appearance:none;appearance:none}' +
+            '.qr-ch-arrow{color:var(--accent,#F99D3E);font-size:19px;font-weight:700}' +
+            '.qr-ch-note{font-size:12px;color:var(--g1,#888);margin:0 2px 12px}' +
+            '.qr-loading{position:fixed;inset:0;z-index:99999;background:var(--bg,#F4F2ED);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;color:var(--ink,#26334B);font-family:var(--font,"Archivo",system-ui,sans-serif)}' +
+            '.qr-spin{width:52px;height:52px;border:4px solid var(--b1,#DCD9D0);border-top-color:var(--accent,#F99D3E);border-radius:50%;animation:qrSpin .9s linear infinite}' +
+            '.qr-load-txt{font-size:15px;font-weight:600;text-align:center;padding:0 34px}' +
+            '@keyframes qrSpin{to{transform:rotate(360deg)}}';
+        document.head.appendChild(st);
+    },
+
+    // ============================================================
+    // JAAROVERZICHT 2025-2026 (v290) — eenmalige jaarterugblik vóór het
+    // bouwverlof. Streng bij veel ziekte, trots bij volle aanwezigheid.
+    // Data uit window.QEJaar (gebundeld); Spotify-Wrapped-stories (v292).
+    // ============================================================
+
+    /** Toont automatisch bij de uitklok van 10 juli 2026, 1×. Geeft true
+     *  terug als getoond (dan slaat de maandrecap over). */
+    maybeShowYearRecap() {
+        try {
+            const KEY = 'qe_jaar_shown_2025_2026';
+            if (localStorage.getItem(KEY) === '1') return false;
+            const t = new Date();
+            if (!(t.getFullYear() === 2026 && t.getMonth() === 6 && t.getDate() === 10)) return false;
+            if (!window.QEJaar) return false;
+            const rec = QEJaar.find(this.currentUser && this.currentUser.robawsEmployeeId, this.currentUser && this.currentUser.name);
+            if (!rec) return false;
+            localStorage.setItem(KEY, '1');
+            this.openJaaroverzicht();
+            return true;
+        } catch (e) { console.warn('[Jaar] auto faalde:', e && e.message); return false; }
+    },
+
+    openJaaroverzicht() {
+        if (!window.QEJaar) { if (this.toast) this.toast('Jaaroverzicht niet beschikbaar', true); return; }
+        const r = QEJaar.find(this.currentUser && this.currentUser.robawsEmployeeId, this.currentUser && this.currentUser.name);
+        if (!r) { if (this.toast) this.toast('Geen jaardata voor jou gevonden', true); return; }
+        const cap = (w) => w ? (w.charAt(0).toUpperCase() + w.slice(1)) : '';
+        const nf = (n) => { try { return Number(n).toLocaleString('nl-BE'); } catch (_e) { return String(n); } };
+        const ORANGE = '#F99D3E', NAVY = '#3A4A6B', GREEN = '#2FA36E', INDIGO = '#4457C7', PURPLE = '#8A4BC7', TEAL = '#1FA39A', CORAL = '#E0674B', PINK = '#C7568C', GOLD = '#C9A227';
+        const cards = [];
+        const add = (accent, emoji, big, label, sub) => cards.push({ accent: accent, emoji: emoji, big: String(big), label: label || '', sub: sub || '' });
+        const uren = Math.round(r.gewerkteUren || 0);
+        const urenRank = QEJaar.rankOf(r, 'gewerkteUren', 'desc');
+        const dagRank = QEJaar.rankOf(r, 'gewerkteDagen', 'desc');
+        const tier = this._jaarTier(r);
+        // Intro -> totalen -> maandgrafiek -> hoogtepunten -> aanwezigheid -> ziekte (toon) -> slot.
+        add(NAVY, '🎬', '2025 – 2026', 'jouw jaar bij QE', 'Tik om te bladeren →');
+        add(INDIGO, '⏱️', nf(uren) + ' u', 'gewerkt dit jaar', r.gewerkteDagen + ' dagen · ' + r.aantalWerkMaanden + ' maanden actief');
+        add(ORANGE, '📊', r.gemUrenPerMaand + ' u', 'gemiddeld per maand', r.avgUrenPerDag + ' u op een gewerkte dag');
+        if (r.maanden && r.maanden.length) cards.push({ accent: INDIGO, html: this._jaarMaandChart(r) });
+        if (r.drukste) add(CORAL, '🔥', r.drukste.uren + ' u', cap(r.drukste.label) + ' — je drukste maand', r.drukste.dagen + ' dagen op de baan');
+        if (r.rustigste) add(TEAL, '😌', r.rustigste.uren + ' u', cap(r.rustigste.label) + ' — je rustigste maand', 'Iedereen mag eens ademen.');
+        if (r.langsteDag && r.langsteDag.uren > 0) add(PURPLE, '💪', r.langsteDag.uren + ' u', 'je langste dag', 'op ' + this._jaarDatum(r.langsteDag.datum));
+        if (r.langsteReeks >= 3) add(GREEN, '🔗', r.langsteReeks + '', 'dagen op rij present', 'Je langste reeks zonder afwezigheid — sterk!');
+        if (r.favWeekdag) add(PINK, '❤️', cap(r.favWeekdag), 'jouw dag van het jaar', r.favWeekdagUren + ' u op ' + r.favWeekdag + 'en');
+        if (r.weekendGewerkt > 0) add(ORANGE, '🏗️', r.weekendGewerkt + '', 'weekenddag' + (r.weekendGewerkt === 1 ? '' : 'en') + ' erbij gedaan', 'Als het moest, stond je er.');
+        if (r.km > 0) { const ritten = Math.round(r.km / 300); add(TEAL, '🚗', nf(r.km) + ' km', 'onderweg dit jaar', ritten > 0 ? ('Goed voor ' + ritten + '× Brussel–Parijs') : ''); }
+        add(NAVY, '📅', r.gewerkteDagen + ' / ' + r.werkbareDagen, 'werkbare dagen present', urenRank ? ('Uren: plaats ' + urenRank.rank + ' van ' + urenRank.total + ' in de ploeg' + (urenRank.rank <= 3 ? ' — jij trok de kar 🔥' : '')) : (dagRank ? ('Aanwezigheid: plaats ' + dagRank.rank + ' van ' + dagRank.total) : ''));
+        // Ziekte — de goede HARD complimenteren, de rest strikt NEUTRAAL: enkel het
+        // cijfer, geen oordeel/nudge/troost (niets provocerends). Nooit rood/oranje.
+        const zd = r.ziektedagen;
+        let zCard;
+        if (tier === 'hero') zCard = { accent: GOLD, emoji: '🏆', big: '0', label: 'ziektedagen — het hele jaar paraat', sub: 'Een absolute rots. Chapeau — dít is klasse!' };
+        else if (tier === 'proud') zCard = { accent: GREEN, emoji: '💪', big: zd + '', label: 'ziektedag' + (zd === 1 ? '' : 'en') + ' — bijna altijd present', sub: 'Sterk werk. Dik in orde!' };
+        else zCard = { accent: NAVY, emoji: '📅', big: zd + '', label: 'ziektedag' + (zd === 1 ? '' : 'en') + ' dit jaar', sub: '' };
+        cards.push(zCard);
+        if (r.sociaalVerlof > 0) add(PURPLE, '🤝', r.sociaalVerlof + '', 'dag' + (r.sociaalVerlof === 1 ? '' : 'en') + ' sociaal verlof', '');
+        add(ORANGE, '🌴', 'Fijne vakantie!', '', 'Geniet van het bouwverlof. 🌴 Tot straks!');
+        cards[cards.length - 1].onShow = () => { try { this._playWeekendJingle(); } catch (_e) {} };
+        this._playStories(cards, 'QE · JAAR 25-26');
+    },
+
+    _jaarTier(r) {
+        // Warmte-tier (ALTIJD positief) op basis van de ziektedagen — geen
+        // strafescalatie meer: iedereen mag fijn aan het bouwverlof starten.
+        const zd = r.ziektedagen || 0;
+        if (zd === 0) return 'hero';
+        if (zd <= 9) return 'proud';
+        if (zd <= 19) return 'ok';
+        if (zd <= 39) return 'steady';
+        return 'comeback';
+    },
+
+    /** Custom story-kaart: mini-staafgrafiek van de uren per maand (Marble-licht). */
+    _jaarMaandChart(r) {
+        const M = (r.maanden || []);
+        const mx = Math.max.apply(null, M.map(function (m) { return m.uren; }).concat([1]));
+        const bars = M.map(function (m) {
+            const h = Math.max(3, Math.round(m.uren / mx * 100));
+            const mm = String(m.label).split(' ')[0].slice(0, 3);
+            return '<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:5px;height:100%">' +
+                '<div style="width:72%;max-width:18px;height:' + h + '%;background:var(--accent,#F99D3E);border-radius:3px 3px 0 0"></div>' +
+                '<div style="font-size:9px;color:var(--g1,#85847C)">' + mm + '</div></div>';
+        }).join('');
+        return '<div class="qr-big" style="font-size:24px">Je jaar in maanden</div>' +
+            '<div style="display:flex;align-items:flex-end;gap:5px;height:190px;width:100%;max-width:330px;margin-top:22px">' + bars + '</div>' +
+            '<div class="qr-sub" style="margin-top:16px">Gewerkte uren per maand</div>';
+    },
+
+    _jaarDatum(d) {
+        if (!d) return '';
+        const M = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
+        const p = String(d).split('-');
+        return parseInt(p[2], 10) + ' ' + (M[parseInt(p[1], 10) - 1] || '');
     },
 };
 

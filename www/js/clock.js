@@ -104,7 +104,9 @@ window.QEClock = {
                 method: 'HEAD',
                 signal: controller.signal,
                 cache: 'no-store',
-                headers: RobawsAPI.getHeaders(),
+                // (v307 / 1.x v302) HEAD mag via de replica-pool (alleen de
+                // Date-header is nodig) — spaart de live-dagteller.
+                headers: Object.assign({}, RobawsAPI.getHeaders(), { 'Database-Mode': 'replica' }),
             });
             clearTimeout(timeout);
             const localAfter = Date.now();
@@ -470,6 +472,9 @@ window.QEClock = {
             return;
         }
         this._scanLock = true;
+        // v275: haptiek "NFC-tag gelezen" — dubbele korte tik (Marble-tabel).
+        // No-op in de 1.x-www (geen QEMarble); no-op op iOS/desktop.
+        try { if (window.QEMarble && QEMarble.haptic) QEMarble.haptic('nfcRead'); } catch (_) {}
         // v251: safety-net verruimd van 8s naar 60s. De uitklok-flow kan
         // legitiem lang duren (confirm-modal tot 30s + GPS tot 10s); na 8s
         // kwam een NFC-herlezing dan als parallelle flow binnen → dubbele
@@ -672,10 +677,16 @@ window.QEClock = {
                     const woId = scanResult.workOrderId;
                     const empId = scanResult.employeeId;
                     const afterScan = async () => {
-                        if (!refresh) return;
-                        try { await this.syncWithRobaws(); } catch(_) {}
-                        try { app.updateClockUI(); } catch(_) {}
-                        try { if (app.currentScreen === 'screenClock') app.navigate('screenClock'); } catch(_) {}
+                        if (refresh) {
+                            try { await this.syncWithRobaws(); } catch(_) {}
+                            try { app.updateClockUI(); } catch(_) {}
+                            try { if (app.currentScreen === 'screenClock') app.navigate('screenClock'); } catch(_) {}
+                        }
+                        // v285: na een UITKLOK (celeb) → mogelijk de maandrecap tonen
+                        // (1×/maand, gecachet; doet niets op gewone dagen).
+                        if (scanResult && scanResult.celeb && window.app && typeof app.maybeShowMonthRecap === 'function') {
+                            try { await app.maybeShowMonthRecap(empId); } catch (e) { console.warn('[Recap] maandrecap faalde:', e && e.message); }
+                        }
                     };
                     // v272: de kilometers zijn al VÓÓR de uitklok ingevuld (het
                     // km-formulier is de bevestiging) — hier alleen nog het
@@ -784,11 +795,13 @@ window.QEClock = {
                 if (!m) return 0;
                 return (parseInt(m[1], 10) || 0) * 60 + (parseInt(m[2], 10) || 0);
             };
-            const GRACE_MIN = 5;
-            const isLate = toMinutes(time) > toMinutes(expectedStart) + GRACE_MIN;
+            // v289: "Te laat" = ELKE scan ná het startuur — géén marge op het
+            // label. De 4-min betaal-marge (kwartier-tolerantie bij de clock-out,
+            // TOLERANCE hieronder) staat hier LOS van: bij ≤4 min te laat word je
+            // nog vanaf het startuur betaald, maar je bent wél "te laat".
+            const isLate = toMinutes(time) > toMinutes(expectedStart);
             onTimeLabel = isLate ? 'Te laat' : 'Op tijd';
-            console.log('[Clock] Startuur check:', time, 'vs verwacht:', expectedStart,
-                '(grace ' + GRACE_MIN + 'min) ->', onTimeLabel);
+            console.log('[Clock] Startuur check:', time, 'vs verwacht:', expectedStart, '->', onTimeLabel);
         }
 
         // GPS
@@ -1112,7 +1125,9 @@ window.QEClock = {
         let exPrevHours = null;     // som uren van blokken vóór entryStartMin
         let exUntimed = null;       // [{id, hours, isOver}]
         try {
-            const exRes = await RobawsAPI.get(`work-orders/${session.workOrderId}/time-entries?limit=100`);
+            // (v305 / 1.x v300) bypassCache → LIVE-pool, niet de replica: dit is
+            // de idempotency-read; een verouderde kopie zou dubbel kunnen boeken.
+            const exRes = await RobawsAPI.get(`work-orders/${session.workOrderId}/time-entries?limit=100`, { bypassCache: true });
             const exItems = (exRes.data && (exRes.data.items || exRes.data)) || [];
             const mijn = exItems.filter(te => {
                 const aId = te.articleId || (te.article && te.article.id);
@@ -2039,7 +2054,9 @@ window.QEClock = {
         // hieronder én de L&L-detectie daarna.
         let _teItems = null;
         try {
-            const teRes = await RobawsAPI.get(`work-orders/${wo.id}/time-entries?limit=100`);
+            // (v305 / 1.x v300) bypassCache → LIVE-pool: deze read stuurt de
+            // her-post-beslissing bij sync (idempotency) — moet gezaghebbend zijn.
+            const teRes = await RobawsAPI.get(`work-orders/${wo.id}/time-entries?limit=100`, { bypassCache: true });
             if (teRes.code === 200 && teRes.data && teRes.data.items) _teItems = teRes.data.items;
         } catch (e) {
             console.warn('[Clock] time-entries fetch voor sync mislukt:', e.message);

@@ -174,10 +174,80 @@ const RobawsAPI = {
         }
     },
 
-    /** Rauwe fetch zonder cache (interne helper). */
-    async _rawGet(key) {
+    // ================================================================
+    // DUBBELE API-POOL (v305 / 1.x v300) — Robaws telt de daglimiet PER
+    // MODE (support-artikel "API rate limiting"), live geverifieerd op
+    // onze tenant: live én replica hebben elk 20.000/dag (aparte tellers,
+    // samen 40k); de ~15-20/sec burst-teller is wél gedeeld.
+    //   - live (standaard): lezen + schrijven
+    //   - replica: alleen GET, eventual-consistent kopie
+    //     (header "Database-Mode: replica")
+    // Routering: gewone lees-calls → replica (spaart de live-pool);
+    // schrijf-calls + bypassCache-reads → live. bypassCache betekent in
+    // deze codebase "ik heb gezaghebbend verse data nodig" (vers-vóór-
+    // full-replace-PUT, klok-idempotency, refresh-na-write) — precies wat
+    // een eventual-consistent replica NIET mag leveren.
+    // 429 op replica → call meteen herhalen via live en de replica-pool
+    // tot de reset (of 30 min vangnet) links laten liggen.
+    // ================================================================
+    _REPLICA_LS_KEY: 'qe_replica_exhausted_until',
+    _replicaExhaustedUntil: null,   // ms-epoch; null = nog niet uit localStorage geladen
+    _replicaBlockedUntil() {
+        if (this._replicaExhaustedUntil == null) {
+            let v = 0;
+            try { v = parseInt(localStorage.getItem(this._REPLICA_LS_KEY) || '0', 10) || 0; } catch (_e) {}
+            this._replicaExhaustedUntil = v;
+        }
+        return this._replicaExhaustedUntil;
+    },
+    _markReplicaExhausted(res) {
+        let ms = 30 * 60 * 1000;   // vangnet als de rate-limit-headers niet leesbaar zijn
+        try {
+            const h = res && res.headers;
+            const remaining = h ? parseInt(h.get('X-RateLimit-Daily-Remaining'), 10) : NaN;
+            const reset = h ? parseInt(h.get('X-RateLimit-Daily-Reset'), 10) : NaN;
+            if (remaining > 0) ms = 60 * 1000;   // burst-429 (gedeelde sec-teller), geen dag-uitputting
+            else if (reset > 0) ms = Math.min(reset * 1000, 24 * 60 * 60 * 1000);
+        } catch (_e) {}
+        this._replicaExhaustedUntil = Date.now() + ms;
+        try { localStorage.setItem(this._REPLICA_LS_KEY, String(this._replicaExhaustedUntil)); } catch (_e) {}
+        console.warn('[RobawsAPI] Replica-pool gaf 429 → lees-calls ' + Math.round(ms / 60000) + ' min via live');
+    },
+
+    // (v306 / 1.x v301) Laatst geziene rate-limit-headers per pool — liften
+    // GRATIS mee op elke respons (kost geen extra calls). Voor het
+    // "API-tegoed vandaag" op het Profiel (bureel).
+    _rateStats: { live: null, replica: null },
+    _captureRateHeaders(res, mode) {
+        try {
+            const h = res && res.headers;
+            if (!h) return;
+            const rem = parseInt(h.get('X-RateLimit-Daily-Remaining'), 10);
+            const lim = parseInt(h.get('X-RateLimit-Daily-Limit'), 10);
+            const rst = parseInt(h.get('X-RateLimit-Daily-Reset'), 10);
+            if (isNaN(rem) || isNaN(lim)) return;
+            this._rateStats[mode] = { remaining: rem, limit: lim, resetSec: isNaN(rst) ? null : rst, at: Date.now() };
+        } catch (_e) {}
+    },
+    /** { live, replica } — elk {remaining, limit, resetSec, at} of null (nog geen meting). */
+    getRateStats() {
+        return { live: this._rateStats.live, replica: this._rateStats.replica };
+    },
+
+    /** Rauwe fetch zonder cache (interne helper). live=true = live-pool afdwingen. */
+    async _rawGet(key, live) {
         const url = this.BASE_URL + '/' + key;
-        const res = await this._fetchWithTimeout(url, { headers: this.getHeaders() });
+        const useReplica = !live && Date.now() >= this._replicaBlockedUntil();
+        const headers = this.getHeaders();
+        if (useReplica) headers['Database-Mode'] = 'replica';
+        let res = await this._fetchWithTimeout(url, { headers });
+        this._captureRateHeaders(res, useReplica ? 'replica' : 'live');
+        if (useReplica && res.status === 429) {
+            // Replica-pool op (of burst): markeren + dezelfde call via live.
+            this._markReplicaExhausted(res);
+            res = await this._fetchWithTimeout(url, { headers: this.getHeaders() });
+            this._captureRateHeaders(res, 'live');
+        }
         if (res.status === 204) return { code: 204, data: null };
         const txt = await res.text();
         if (!txt) return { code: res.status, data: null };
@@ -205,8 +275,10 @@ const RobawsAPI = {
             const shared = await this._getInflight[key];
             return this._cloneResult(shared);
         }
-        // 3. Echte fetch (in-flight registreren voor dedup)
-        const p = this._rawGet(key);
+        // 3. Echte fetch (in-flight registreren voor dedup). bypassCache-reads
+        //    gaan via de LIVE-pool (gezaghebbend vers — vers-vóór-PUT e.d.);
+        //    gewone reads via de replica-pool (aparte dagteller).
+        const p = this._rawGet(key, bypass || !!(opts && opts.live));
         this._getInflight[key] = p;
         let result;
         try {
@@ -231,6 +303,7 @@ const RobawsAPI = {
             headers: this.getHeaders(),
             body: JSON.stringify(body),
         });
+        this._captureRateHeaders(res, 'live');
         // 204 No Content of lege body veilig afhandelen
         if (res.status === 204) return { code: 204, data: null };
         const txt = await res.text();
@@ -250,6 +323,7 @@ const RobawsAPI = {
             headers: this.getHeaders(),
             body: JSON.stringify(body),
         });
+        this._captureRateHeaders(res, 'live');
         // PUT returns 204 No Content on success
         if (res.status === 204) return { code: 204, data: null };
         // BUG-fix: bij Cloudflare/HTML 502/504 crashte `await res.json()`
@@ -279,6 +353,677 @@ const RobawsAPI = {
         } catch (e) {
             return { code: res.status, data: { raw: txt } };
         }
+    },
+
+    // ============================================================
+    // v276: VERLOF / TIME-OFF — native Robaws verlofaanvragen.
+    // Alleen "Verlof" is via de app aanvraagbaar (Ziek gaat via bericht,
+    // op vraag van Levi). Categorie + uursoort worden live opgezocht met
+    // een fallback op de bevestigde tenant-ids (Verlof = categorie 2,
+    // uursoort 'verlof' type ABSENCE = 35). Robaws berekent zelf de
+    // durationInMinutes uit het uurrooster. Deze endpoints geven een
+    // page-wrapper terug ({items,totalItems,currentPage,...}), GEEN
+    // {code,data}-lijst — vandaar data.items hieronder.
+    // ============================================================
+    _verlofIds: null,
+    async _resolveVerlofIds() {
+        if (this._verlofIds) return this._verlofIds;
+        let categoryId = '2', hourTypeId = '35';   // bevestigde fallback
+        try {
+            const cats = await this.get('time-off-categories?limit=50', { bypassCache: true });
+            const items = (cats.data && cats.data.items) || [];
+            const verlof = items.find(c => /verlof/i.test(c.name || ''));
+            if (verlof) categoryId = String(verlof.id);
+            const hts = await this.get('hour-types?limit=100', { bypassCache: true });
+            const hitems = (hts.data && hts.data.items) || [];
+            const ht = hitems.find(h => String(h.timeOffCategoryId) === categoryId && /absence/i.test(h.type || ''))
+                || hitems.find(h => String(h.timeOffCategoryId) === categoryId);
+            if (ht) hourTypeId = String(ht.id);
+        } catch (e) { console.warn('[Verlof] ids resolven faalde, fallback gebruikt:', e && e.message); }
+        this._verlofIds = { categoryId, hourTypeId };
+        return this._verlofIds;
+    },
+
+    /** Verlofaanvragen van één werknemer (nieuwste eerst). Pagineert VOLLEDIG
+     *  (page-wrapper, max 100/pagina) en filtert client-side op employeeId —
+     *  anders viel een aanvraag buiten de eerste 100 tenant-brede records.
+     *  Gooit bij een niet-200 status (anders toonde de UI vals "geen aanvragen"
+     *  bij een verlopen token / serverfout). De seen-set + added-guard vangt
+     *  een genegeerde page-param op (geen duplicaten, geen oneindige lus). */
+    async getMyTimeOffRequests(employeeId) {
+        const all = [];
+        const seen = new Set();
+        const SIZE = 100, MAX_PAGES = 30;
+        let page = 0, totalPages = 1;
+        while (page < totalPages && page < MAX_PAGES) {
+            const r = await this.get('time-off-requests?page=' + page + '&size=' + SIZE + '&include=timeOffCategory', { bypassCache: true });
+            if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+            const body = r.data || {};
+            const items = body.items || [];
+            let added = 0;
+            for (const it of items) {
+                const id = String(it.id);
+                if (seen.has(id)) continue;
+                seen.add(id); all.push(it); added++;
+            }
+            totalPages = (body.totalPages != null) ? body.totalPages : 1;
+            page++;
+            if (added === 0) break;   // enkel stoppen bij een genegeerde page-param; page<totalPages bepaalt het echte einde (server kan size lager cappen)   // klaar, of page-param genegeerd
+        }
+        return all
+            .filter(x => String(x.employeeId) === String(employeeId))
+            .sort((a, b) => String(b.fromDate || '').localeCompare(String(a.fromDate || '')));
+    },
+
+    /** Maak een Verlof-aanvraag en dien ze meteen in ter goedkeuring.
+     *  fromDate/toDate = ISO-datetime strings (UTC). Retourneert het
+     *  aangemaakte object of gooit bij een niet-2xx status. */
+    async createVerlofRequest({ employeeId, fromDate, toDate, comment, authorUserId }) {
+        const ids = await this._resolveVerlofIds();
+        const body = {
+            employeeId: String(employeeId),
+            timeOffCategoryId: ids.categoryId,
+            hourTypeId: ids.hourTypeId,
+            fromDate: fromDate,
+            toDate: toDate,
+            startApprovalRequest: true,   // meteen indienen ter goedkeuring
+        };
+        const res = await this.post('time-off-requests', body);
+        if (res.code !== 200 && res.code !== 201) {
+            throw new Error('Robaws gaf status ' + res.code);
+        }
+        const created = res.data || {};
+        // Bewaak tegen een 200 met niet-JSON body (bv. Cloudflare-interstitial):
+        // dan is er niets aangemaakt en mag de UI geen succes tonen.
+        if (!created.id) throw new Error('Onverwacht antwoord van Robaws (geen id)');
+        // Vangnet: als startApprovalRequest niet automatisch indiende en de
+        // aanvraag nog DRAFT is, expliciet de goedkeuringsaanvraag starten.
+        try {
+            if (created.id && created.status === 'DRAFT') {
+                await this.post('time-off-requests/' + created.id + '/start-approval-request', {});
+            }
+        } catch (e) { console.warn('[Verlof] start-approval fallback faalde:', e && e.message); }
+        // De opmerking als ÉCHTE comment posten, toegeschreven aan de aanvrager
+        // (authorUserId = Robaws userId). NIET via body.comment: dat wordt door
+        // Robaws aan de gedeelde API-gebruiker toegeschreven — vandaar dat de
+        // opmerking vroeger als "Rolf" (de sleutel-eigenaar) verscheen.
+        if (comment) {
+            try {
+                await this.postTimeOffComment(created.id, comment, authorUserId);
+            } catch (e) { console.warn('[Verlof] opmerking posten faalde:', e && e.message); }
+        }
+        return created;
+    },
+
+    // v277 (Fase 2): VERLOF GOEDKEUREN (bureel). Een ingediende verlofaanvraag
+    // genereert een approval-request met resourceUnderApprovalRef =
+    // /time-off-requests/{id}. Goedkeuren/weigeren gaat via
+    // POST /approval-requests/{approvalId}/accept|reject (body {reason}) —
+    // dat zet de verlofstatus (bevestigd: reject -> REJECTED). NIET via PATCH
+    // status (dat wordt genegeerd) en time-off zit niet in de status-PATCH.
+    /** Openstaande verlof-goedkeuringen waar de INGELOGDE gebruiker (myUserId =
+     *  Robaws userId) zélf nog moet beslissen — zelfde flow en zelfde regel als
+     *  de facturen: alles komt eerst bij Rolf, die keurt goed/af en verwijst
+     *  door (add-approver); pas dan krijgt de volgende AWAITING_DECISION. De
+     *  gedeelde sleutel is Rolf (userId 2), dus een server-side "van mij"-filter
+     *  zou Rolfs lijst geven — daarom CLIENT-SIDE filteren op userStates.
+     *  Zonder myUserId: fail-closed (lege lijst).
+     *  excludeEmployeeId: sluit de eigen aanvragen uit (vier-ogen — je keurt
+     *  je eigen verlof niet goed; voorkomt ook een vastlopende 4xx). */
+    async getPendingLeaveApprovals(excludeEmployeeId, myUserId) {
+        const uid = (myUserId != null && myUserId !== '') ? String(myUserId) : null;
+        if (!uid) { console.warn('[Goedkeuring] geen userId meegegeven — geen verlof-goedkeuringen getoond'); return []; }
+        const all = [];
+        const seen = new Set();
+        const SIZE = 100, MAX_PAGES = 20;
+        let page = 0, totalPages = 1;
+        while (page < totalPages && page < MAX_PAGES) {
+            const r = await this.get('approval-requests?open=true&include=userStates&page=' + page + '&size=' + SIZE, { bypassCache: true });
+            if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+            const body = r.data || {};
+            const items = body.items || [];
+            let added = 0;
+            for (const a of items) { const id = String(a.id); if (seen.has(id)) continue; seen.add(id); all.push(a); added++; }
+            totalPages = (body.totalPages != null) ? body.totalPages : 1;
+            page++;
+            if (added === 0) break;   // enkel stoppen bij een genegeerde page-param; page<totalPages bepaalt het echte einde (server kan size lager cappen)
+        }
+        // Enkel verlofaanvragen waar JIJ nog moet beslissen (AWAITING_DECISION);
+        // andermans goedkeuringen vallen weg — vóór de verrijking, dat spaart
+        // meteen ook API-calls uit.
+        const timeOff = all.filter(a =>
+            /^\/time-off-requests\/\d+/.test(a.resourceUnderApprovalRef || '') &&
+            Array.isArray(a.userStates) &&
+            a.userStates.some(s => String(s.userId) === uid && String(s.status) === 'AWAITING_DECISION')
+        );
+        const out = [];
+        for (const a of timeOff) {
+            const torId = String(a.resourceUnderApprovalRef).split('/').pop();
+            let tor = null;
+            try {
+                const g = await this.get('time-off-requests/' + torId + '?include=timeOffCategory,employee', { bypassCache: true });
+                if (g.code === 200) tor = g.data;
+            } catch (e) { /* aanvraag kon niet geladen worden — overslaan */ }
+            if (tor && (tor.status === 'SUBMITTED' || tor.status === 'WAITING')) {
+                if (excludeEmployeeId != null && String(tor.employeeId) === String(excludeEmployeeId)) continue;
+                out.push({ approvalId: String(a.id), torId: torId, request: tor });
+            }
+        }
+        out.sort((x, y) => String(x.request.fromDate || '').localeCompare(String(y.request.fromDate || '')));
+        return out;
+    },
+
+    /** Generiek: keur een approval-request goed (accept) of weiger (reject).
+     *  LET OP: de beslissing wordt geregistreerd op de gebruiker van de gedeelde
+     *  API-sleutel (kantoor), NIET op de ingelogde app-gebruiker — de accept/
+     *  reject-endpoints hebben geen per-gebruiker-veld. */
+    async decideApproval(approvalId, approve, reason) {
+        const action = approve ? 'accept' : 'reject';
+        const res = await this.post('approval-requests/' + approvalId + '/' + action, { reason: reason || '' });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) {
+            throw new Error('Robaws gaf status ' + res.code);
+        }
+        return true;
+    },
+    /** Verlof-goedkeuring — alias op decideApproval (zelfde endpoint). */
+    async decideLeaveApproval(approvalId, approve, reason) {
+        return this.decideApproval(approvalId, approve, reason);
+    },
+
+    // v278 (Aanvragen-tab): verlofsaldo + chat + factuur-goedkeuringen.
+    /** Verlofbudget (uren/jaar) van een werknemer. Robaws exposeert geen apart
+     *  budget-endpoint; we lezen een extraField met 'verlofbudget'/'verlofuren'
+     *  in de naam van de fiche. Retourneert een getal (uren) of null. */
+    async getEmployeeVerlofBudget(employeeId) {
+        try {
+            const r = await this.get('employees/' + employeeId, { bypassCache: true });
+            const d = r.data || {};
+            const ef = d.extraFields || {};
+            for (const name of Object.keys(ef)) {
+                if (/verlof.?budget|verlof.?uren/i.test(name)) {
+                    const fld = ef[name] || {};
+                    const v = (fld.numberValue != null ? fld.numberValue
+                        : fld.intValue != null ? fld.intValue
+                        : fld.stringValue != null ? fld.stringValue : fld.value);
+                    const n = parseFloat(String(v == null ? '' : v).replace(',', '.'));
+                    if (!isNaN(n)) return n;
+                }
+            }
+        } catch (e) { console.warn('[Verlof] budget lezen faalde:', e && e.message); }
+        return null;
+    },
+
+    /** Werkdagen (ma-vr) in een periode × 8u — schatting als Robaws de
+     *  durationInMinutes (nog) niet berekende. */
+    _estimateLeaveHours(fromISO, toISO) {
+        try {
+            const f = new Date(fromISO), t = new Date(toISO);
+            f.setHours(12, 0, 0, 0); t.setHours(12, 0, 0, 0);
+            let days = 0;
+            for (const d = new Date(f); d <= t; d.setDate(d.getDate() + 1)) {
+                const wd = d.getDay();
+                if (wd !== 0 && wd !== 6) days++;
+            }
+            return days * 8;
+        } catch (e) { return 0; }
+    },
+
+    /** Gebruikte verlofuren in een jaar (som van GOEDGEKEURDE aanvragen).
+     *  Gebruikt durationInMinutes indien ingevuld, anders een werkdag-
+     *  schatting (anders telde een goedgekeurde aanvraag met lege duur 0u
+     *  → saldo te hoog). */
+    async getVerlofUsedHours(employeeId, year) {
+        const yr = year || new Date().getFullYear();
+        let used = 0;
+        try {
+            const reqs = await this.getMyTimeOffRequests(employeeId);
+            for (const r of reqs) {
+                if (String(r.status || '').toUpperCase() !== 'APPROVED') continue;
+                if (new Date(r.fromDate).getFullYear() !== yr) continue;
+                const mins = parseFloat(r.durationInMinutes || 0) || 0;
+                used += mins > 0 ? (mins / 60) : this._estimateLeaveHours(r.fromDate, r.toDate);
+            }
+        } catch (e) { console.warn('[Verlof] gebruik berekenen faalde:', e && e.message); }
+        return Math.round(used * 100) / 100;
+    },
+
+    /** Chat/commentaar van een verlofaanvraag (oudste eerst). Gooit bij een
+     *  niet-200 status (anders toonde de chat vals "geen berichten"). */
+    async getTimeOffComments(torId) {
+        const r = await this.get('time-off-requests/' + torId + '/comments?include=author', { bypassCache: true });
+        if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+        const arr = Array.isArray(r.data) ? r.data : ((r.data && r.data.items) || []);
+        return arr.slice().sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+    },
+
+    /** Voeg een comment toe aan een verlofaanvraag (authorId = Robaws userId). */
+    async postTimeOffComment(torId, content, authorId) {
+        const body = { content: String(content) };
+        if (authorId != null) body.authorId = String(authorId);
+        const res = await this.post('time-off-requests/' + torId + '/comments', body);
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return res.data;
+    },
+
+    /** Openstaande factuur-goedkeuringen (aankoopfacturen) waar de INGELOGDE
+     *  gebruiker (myUserId = Robaws userId) zélf nog moet beslissen — voor teller
+     *  + lijst. BELANGRIJK: de gedeelde API-sleutel is Rolf (userId 2), dus een
+     *  server-side "van mij"-filter zou Rolfs lijst geven. Daarom filteren we
+     *  CLIENT-SIDE op userStates. Zonder myUserId: fail-closed (lege lijst) —
+     *  nooit per ongeluk alles tonen. */
+    async getPurchaseInvoiceApprovals(myUserId) {
+        const uid = (myUserId != null && myUserId !== '') ? String(myUserId) : null;
+        if (!uid) { console.warn('[Goedkeuring] geen userId meegegeven — geen factuur-goedkeuringen getoond'); return []; }
+        const all = [];
+        const seen = new Set();
+        const SIZE = 100, MAX_PAGES = 20;
+        let page = 0, totalPages = 1;
+        while (page < totalPages && page < MAX_PAGES) {
+            const r = await this.get('approval-requests?open=true&include=userStates,supplier&page=' + page + '&size=' + SIZE, { bypassCache: true });
+            if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+            const body = r.data || {};
+            const items = body.items || [];
+            let added = 0;
+            for (const a of items) { const id = String(a.id); if (seen.has(id)) continue; seen.add(id); all.push(a); added++; }
+            totalPages = (body.totalPages != null) ? body.totalPages : 1;
+            page++;
+            if (added === 0) break;
+        }
+        // Enkel aankoopfacturen waar JIJ nog moet beslissen (AWAITING_DECISION);
+        // andermans goedkeuringen (bv. Rolf/Els) vallen weg.
+        return all.filter(a =>
+            /^\/purchase-invoices\/\d+/.test(a.resourceUnderApprovalRef || '') &&
+            Array.isArray(a.userStates) &&
+            a.userStates.some(s => String(s.userId) === uid && String(s.status) === 'AWAITING_DECISION')
+        );
+    },
+
+    /** Detail van één approval-request incl. de goedkeurders
+     *  (userStates: [{userId, status: ACCEPTED|AWAITING_DECISION|REJECTED}]). */
+    async getApprovalDetail(approvalId) {
+        const r = await this.get('approval-requests/' + approvalId + '?include=supplier,userStates', { bypassCache: true });
+        if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+        return r.data || null;
+    },
+
+    /** De document-id (meestal de PDF) van een aankoopfactuur ophalen. */
+    async getPurchaseInvoiceDocumentId(invoiceId) {
+        const r = await this.get('purchase-invoices/' + invoiceId, { bypassCache: true });
+        if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+        return (r.data && r.data.documentId) ? String(r.data.documentId) : null;
+    },
+
+    /** Voeg een extra goedkeurder (Robaws userId) toe aan een approval-request
+     *  (POST .../add-approver, geverifieerd → 204). */
+    async addApprovalApprover(approvalId, userId) {
+        const res = await this.post('approval-requests/' + approvalId + '/add-approver', { userId: String(userId) });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) {
+            throw new Error('Robaws gaf status ' + res.code);
+        }
+        return true;
+    },
+
+    /** Bureel-gebruikers voor de goedkeurder-picker uit de EMPLOYEES-map:
+     *  [{userId, name, email}] — alleen wie rol 'bureel' + een userId heeft. */
+    getBureelApprovers() {
+        const out = [];
+        const seen = new Set();
+        for (const [email, e] of Object.entries(this.EMPLOYEES || {})) {
+            if (e && e.role === 'bureel' && e.userId != null && !seen.has(String(e.userId))) {
+                seen.add(String(e.userId));
+                out.push({ userId: String(e.userId), name: e.name || email, email });
+            }
+        }
+        return out.sort((a, b) => a.name.localeCompare(b.name));
+    },
+
+    /** Naam bij een Robaws userId (voor het tonen van goedkeurders). */
+    nameForUserId(userId) {
+        const uid = String(userId);
+        for (const [email, e] of Object.entries(this.EMPLOYEES || {})) {
+            if (e && String(e.userId) === uid) return e.name || email;
+        }
+        return 'Gebruiker ' + uid;
+    },
+
+    // ============================================================
+    // v288: AANKOOPFACTUUR-DETAIL — volledige factuur (lijnen + relaties),
+    // project-toewijzing per lijn (merge-patch, geen full replace) en
+    // veld-bewerking via merge-patch (geverifieerd → 204; géén full PUT).
+    // ============================================================
+    async patchMerge(endpoint, body) {
+        this._invalidateCache(endpoint);
+        const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
+        const headers = Object.assign({}, this.getHeaders(), { 'Content-Type': 'application/merge-patch+json' });
+        const res = await this._fetchWithTimeout(url, { method: 'PATCH', headers, body: JSON.stringify(body) });
+        if (res.status === 204) return { code: 204, data: null };
+        const txt = await res.text();
+        try { return { code: res.status, data: txt ? JSON.parse(txt) : null }; }
+        catch (e) { return { code: res.status, data: { raw: txt } }; }
+    },
+
+    async getPurchaseInvoiceFull(invoiceId) {
+        const r = await this.get('purchase-invoices/' + invoiceId + '?include=lineItems,supplier,assignedUser,journal,paymentCondition', { bypassCache: true });
+        if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+        return r.data || null;
+    },
+
+    /** Wijs een project (of null = wissen) toe aan één factuurlijn. */
+    async setLineItemProject(invoiceId, lineId, projectId) {
+        const res = await this.patchMerge('purchase-invoices/' + invoiceId + '/line-items/' + lineId,
+            { projectId: (projectId != null && projectId !== '') ? String(projectId) : null });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** Bewerk factuur-basisvelden (merge-patch — enkel de gewijzigde velden). */
+    async patchPurchaseInvoice(invoiceId, changes) {
+        const res = await this.patchMerge('purchase-invoices/' + invoiceId, changes || {});
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** Projecten zoeken voor de toewijs-picker (searchText + lokale filter). */
+    async searchProjects(query, limit) {
+        const q = query ? ('&searchText=' + encodeURIComponent(query)) : '';
+        const r = await this.get('projects?page=0&size=' + (limit || 25) + q, { bypassCache: true });
+        if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+        const data = r.data || {};
+        const items = data.items || (data.data && data.data.items) || (Array.isArray(data) ? data : []);
+        const out = items.map(p => ({ id: String(p.id), logicId: p.logicId || '', name: p.planningName || p.name || p.title || '' }));
+        if (query) {
+            const ql = query.toLowerCase();
+            const f = out.filter(p => (p.logicId + ' ' + p.name).toLowerCase().indexOf(ql) !== -1);
+            if (f.length) return f;
+        }
+        return out;
+    },
+
+    /** Zoek één project op zijn logicId (bv. "P260022"); null als geen exacte hit. */
+    async getProjectByLogicId(logicId) {
+        const norm = String(logicId || '').toUpperCase().replace(/[\s-]/g, '');
+        if (!norm) return null;
+        const list = await this.searchProjects(norm, 10);
+        return list.find(p => String(p.logicId || '').toUpperCase().replace(/[\s-]/g, '') === norm) || null;
+    },
+
+    /** Kleine keuzelijsten voor het bewerk-paneel. */
+    async getJournals() {
+        const r = await this.get('journals?page=0&size=100', { bypassCache: false });
+        if (r.code !== 200) return [];
+        return ((r.data && r.data.items) || []).map(j => ({ id: String(j.id), name: j.name || j.code || ('Dagboek ' + j.id) }));
+    },
+    async getPaymentConditions() {
+        const r = await this.get('payment-conditions?page=0&size=100', { bypassCache: false });
+        if (r.code !== 200) return [];
+        return ((r.data && r.data.items) || []).map(p => ({ id: String(p.id), name: p.name || ('Voorwaarde ' + p.id) }));
+    },
+
+    // ============================================================
+    // v305: FACTUUR-DETAIL PARITEIT met Robaws — verkooporder-koppeling op
+    // lijnen, opmerkingen (chat) en taken op de aankoopfactuur.
+    // ============================================================
+
+    /** Verkooporders zoeken voor de order-picker (searchText + page-wrapper). */
+    async searchSalesOrders(query, limit) {
+        const q = query ? ('&searchText=' + encodeURIComponent(query)) : '';
+        const r = await this.get('sales-orders?page=0&size=' + (limit || 25) + q, { bypassCache: true });
+        if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+        const data = r.data || {};
+        const items = data.items || (data.data && data.data.items) || (Array.isArray(data) ? data : []);
+        const out = items.map(o => ({
+            id: String(o.id),
+            logicId: o.logicId || '',
+            name: o.title || o.clientReference || '',
+            status: o.status || '',
+            date: o.date || '',
+            client: (o.client && o.client.name) || '',
+        }));
+        if (query) {
+            const ql = query.toLowerCase();
+            const f = out.filter(o => (o.logicId + ' ' + o.name + ' ' + o.client).toLowerCase().indexOf(ql) !== -1);
+            if (f.length) return f;
+        }
+        return out;
+    },
+
+    /** Zoek één verkooporder op zijn logicId (bv. "R250004"); null als geen exacte hit. */
+    async getSalesOrderByLogicId(logicId) {
+        const norm = String(logicId || '').toUpperCase().replace(/[\s-]/g, '');
+        if (!norm) return null;
+        const list = await this.searchSalesOrders(norm, 10);
+        return list.find(o => String(o.logicId || '').toUpperCase().replace(/[\s-]/g, '') === norm) || null;
+    },
+
+    /** Koppel een verkooporder (of null = wissen) aan één factuurlijn. */
+    async setLineItemSalesOrder(invoiceId, lineId, salesOrderId) {
+        const res = await this.patchMerge('purchase-invoices/' + invoiceId + '/line-items/' + lineId,
+            { salesOrderId: (salesOrderId != null && salesOrderId !== '') ? String(salesOrderId) : null });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** Opmerkingen (chat) op een aankoopfactuur — kale array, zelfde comment-bron
+     *  als verlof; sorteer oud→nieuw. */
+    async getInvoiceComments(invoiceId) {
+        const r = await this.get('purchase-invoices/' + invoiceId + '/comments?include=author', { bypassCache: true });
+        if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+        const arr = Array.isArray(r.data) ? r.data : ((r.data && r.data.items) || []);
+        return arr.slice().sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+    },
+
+    /** Voeg een opmerking toe aan een aankoopfactuur (authorId = Robaws userId,
+     *  anders wordt hij aan de gedeelde sleutel-eigenaar toegeschreven). */
+    async postInvoiceComment(invoiceId, content, authorId) {
+        const body = { content: String(content) };
+        if (authorId != null) body.authorId = String(authorId);
+        const res = await this.post('purchase-invoices/' + invoiceId + '/comments', body);
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return res.data;
+    },
+
+    /** Taken gekoppeld aan een resource (bv. "/purchase-invoices/123"). */
+    async getTasksForResource(resourceRef) {
+        const r = await this.get('tasks?page=0&size=100&relatedResource=' + encodeURIComponent(resourceRef), { bypassCache: true });
+        if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
+        const data = r.data || {};
+        const arr = data.items || (Array.isArray(data) ? data : []);
+        return arr.map(t => ({
+            id: String(t.id),
+            title: t.title || '',
+            description: t.description || '',
+            status: t.status || '',
+            assignedUserId: t.assignedUserId != null ? String(t.assignedUserId) : null,
+            reportingUserId: t.reportingUserId != null ? String(t.reportingUserId) : null,
+            deadline: t.deadline || null,
+        }));
+    },
+
+    /** Maak een taak op een resource (status default "Te doen"). */
+    async createTask(opts) {
+        const o = opts || {};
+        const body = { title: String(o.title || '') };
+        if (o.description) body.description = String(o.description);
+        if (o.assignedUserId != null && o.assignedUserId !== '') body.assignedUserId = String(o.assignedUserId);
+        if (o.reportingUserId != null && o.reportingUserId !== '') body.reportingUserId = String(o.reportingUserId);
+        if (o.relatedResource) body.relatedResource = String(o.relatedResource);
+        if (o.deadline) body.deadline = String(o.deadline);
+        const res = await this.post('tasks', body);
+        if (res.code !== 200 && res.code !== 201) throw new Error('Robaws gaf status ' + res.code);
+        return res.data;
+    },
+
+    /** Zet de status van een taak ("Te doen" / "Gedaan"). */
+    async setTaskStatus(taskId, status) {
+        const res = await this.patchMerge('tasks/' + taskId, { status: String(status) });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** Verwijder een taak. */
+    async deleteTask(taskId) {
+        try { this._invalidateCache('tasks/' + taskId); } catch (_e) {}
+        const url = this.BASE_URL + '/tasks/' + taskId;
+        const res = await this._fetchWithTimeout(url, { method: 'DELETE', headers: this.getHeaders() });
+        if (res.status !== 200 && res.status !== 204) throw new Error('Robaws gaf status ' + res.status);
+        return true;
+    },
+
+    // ============================================================
+    // MATERIEEL VERHUUR / UITLEEN (v282) — reserveringssysteem bovenop het
+    // native Robaws-materieelregister (/materials). Robaws heeft geen
+    // reservatie-API; /planning-items dragen wél materialIds maar worden er
+    // in de praktijk niet voor gebruikt en zijn niet betrouwbaar op materiaal
+    // filterbaar. Daarom bewaren we de reserveringen als compacte JSON in de
+    // extraField "Reserveringen" van élk materiaal (co-located → snelle
+    // beschikbaarheid, geen wankele list-filters, één bron van waarheid).
+    // Statussen:
+    //   AANGEVRAAGD → GOEDGEKEURD (blokkeert datums) | GEWEIGERD | GEANNULEERD
+    //   GOEDGEKEURD → IN_GEBRUIK → TERUGGEBRACHT
+    // Enkel GOEDGEKEURD + IN_GEBRUIK blokkeren de beschikbaarheid.
+    // Levi maakt op /materials twee extraFields aan: "Uitleenbaar" (ja/nee) en
+    // "Reserveringen" (tekst/memo, door de app beheerd). "Type" (bestaand) =
+    // categorie. PUT = full-replace (zelfde patroon als _savePinToRobaws).
+    // ============================================================
+    MATERIEEL: {
+        RES_FIELD: 'Reserveringen',
+        LENDABLE_FIELD: 'Uitleenbaar',
+        TYPE_FIELD: 'Type',
+        GROUP: 'QE Werkbon app',
+        BLOCKING: ['GOEDGEKEURD', 'IN_GEBRUIK'],
+    },
+
+    /** Lees een extraField-waarde robuust (alle Robaws-varianten). */
+    _efValue(obj, fieldName) {
+        const ef = (obj && obj.extraFields) || {};
+        let f = ef[fieldName];
+        if (f === undefined) {
+            const low = String(fieldName).toLowerCase();
+            for (const k of Object.keys(ef)) { if (k.toLowerCase() === low) { f = ef[k]; break; } }
+        }
+        if (f == null) return null;
+        if (typeof f !== 'object') return f;
+        return (f.stringValue != null) ? f.stringValue
+            : (f.value != null) ? f.value
+            : (f.booleanValue != null) ? f.booleanValue
+            : (f.numberValue != null) ? f.numberValue
+            : (f.intValue != null) ? f.intValue : null;
+    },
+
+    /** Alle materialen (page-wrapper, ~26). offset-paginering met vangnet. */
+    async getMaterials(opts) {
+        const all = []; const SIZE = 100; let offset = 0;
+        for (let i = 0; i < 20; i++) {
+            const r = await this.get('materials?limit=' + SIZE + '&offset=' + offset, opts);
+            if (r.code !== 200) throw new Error('Materialen laden mislukt (' + r.code + ')');
+            const body = r.data || {};
+            const items = body.items || (Array.isArray(body) ? body : (body.data || []));
+            all.push(...items);
+            if (items.length < SIZE) break;
+            offset += SIZE;
+        }
+        return all;
+    },
+
+    async _getMaterieelFresh(materialId) {
+        const res = await this.get('materials/' + materialId, { bypassCache: true });
+        if (res.code !== 200 || !res.data) throw new Error('Materiaal niet gevonden (' + res.code + ')');
+        const body = res.data;
+        return (body && body.id != null) ? body : (body.data || body);
+    },
+
+    _materieelUitleenbaar(m) {
+        const v = this._efValue(m, this.MATERIEEL.LENDABLE_FIELD);
+        if (v === true) return true;
+        return /^(ja|true|1|yes|ok|x|✓|waar)$/i.test(String(v == null ? '' : v).trim());
+    },
+    _materieelCategorie(m) {
+        return this._efValue(m, this.MATERIEEL.TYPE_FIELD) || 'Overig';
+    },
+    /** Reserveringen-array uit de extraField-JSON (robuust; [] bij leeg/kapot). */
+    _materieelReserveringen(m) {
+        const raw = this._efValue(m, this.MATERIEEL.RES_FIELD);
+        if (!raw) return [];
+        try { const a = JSON.parse(String(raw)); return Array.isArray(a) ? a : []; }
+        catch (e) { console.warn('[Materieel] Reserveringen-JSON onleesbaar voor materiaal #' + (m && m.id)); return []; }
+    },
+
+    _resNewId() { return 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); },
+    _rangesOverlap(aFrom, aTo, bFrom, bTo) { return aFrom <= bTo && bFrom <= aTo; },
+
+    /** Botsende blokkerende reserveringen voor [from,to] (optioneel resId negeren). */
+    materieelConflicts(reserveringen, from, to, ignoreId) {
+        return (reserveringen || []).filter(r =>
+            r && String(r.id) !== String(ignoreId == null ? '' : ignoreId) &&
+            this.MATERIEEL.BLOCKING.indexOf(r.status) !== -1 &&
+            this._rangesOverlap(from, to, r.from, r.to));
+    },
+
+    /** Afgeleide beschikbaarheids-status van een materiaal op 'todayStr' (YYYY-MM-DD). */
+    materieelStatus(reserveringen, todayStr) {
+        const blocking = (reserveringen || []).filter(r => this.MATERIEEL.BLOCKING.indexOf(r.status) !== -1);
+        const active = blocking.find(r => r.from <= todayStr && todayStr <= r.to);
+        if (active) return { state: 'IN_GEBRUIK', res: active };
+        const upcoming = blocking.filter(r => r.from > todayStr).sort((a, b) => String(a.from).localeCompare(String(b.from)))[0];
+        if (upcoming) return { state: 'GERESERVEERD', res: upcoming };
+        return { state: 'BESCHIKBAAR', res: null };
+    },
+
+    // /materials-GET expandt relaties (article/supplier/assigned*/stockLocation/
+    // company/_metadata) die je NIET mag terugsturen bij een full-replace PUT.
+    // Schrijf-test bevestigd: opgeschoonde body → 204 + alle velden intact.
+    // Alleen de geëxpandeerde relatie-OBJECTEN + read-only audit-velden droppen.
+    // De scalaire spiegel-ids (articleId/supplierId/assignedEmployeeId/
+    // stockLocationId/…) BLIJVEN staan, zodat de koppelingen behouden blijven.
+    _MATERIEEL_PUT_DROP: ['article', 'supplier', 'assignedProject', 'assignedEmployee', 'assignedClient', 'assignedEndClient', 'assignedSubcontractor', 'stockLocation', 'company', '_metadata', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy', 'logicId'],
+
+    /** Vervang de Reserveringen-extraField op een VERS opgehaald materiaal en PUT (opgeschoonde full-replace). */
+    async _putMaterieelReserveringen(mat, arr) {
+        const body = {};
+        const drop = this._MATERIEEL_PUT_DROP;
+        for (const k of Object.keys(mat)) { if (drop.indexOf(k) === -1) body[k] = mat[k]; }
+        body.extraFields = Object.assign({}, mat.extraFields || {});
+        body.extraFields[this.MATERIEEL.RES_FIELD] = {
+            type: 'TEXT',
+            group: this.MATERIEEL.GROUP,
+            stringValue: JSON.stringify(arr),
+        };
+        const put = await this.put('materials/' + mat.id, body);
+        if (put.code !== 200 && put.code !== 204) throw new Error('Opslaan mislukt (' + put.code + ')');
+        return arr;
+    },
+
+    /** Nieuwe reservering toevoegen (GET vers → append → PUT). */
+    async addMaterieelReservering(materialId, res) {
+        const mat = await this._getMaterieelFresh(materialId);
+        const arr = this._materieelReserveringen(mat);
+        arr.push(res);
+        await this._putMaterieelReserveringen(mat, arr);
+        return res;
+    },
+    /** Bestaande reservering patchen (beslissing/ophalen/terugbrengen/annuleren). */
+    async patchMaterieelReservering(materialId, resId, patch) {
+        const mat = await this._getMaterieelFresh(materialId);
+        const arr = this._materieelReserveringen(mat);
+        const i = arr.findIndex(r => String(r.id) === String(resId));
+        if (i === -1) throw new Error('Reservering niet gevonden');
+        arr[i] = Object.assign({}, arr[i], patch);
+        await this._putMaterieelReserveringen(mat, arr);
+        return arr[i];
+    },
+
+    /** Alle openstaande aanvragen (AANGEVRAAGD) over alle materialen — bureel-teller/lijst. */
+    async getMaterieelAanvragen() {
+        const mats = await this.getMaterials({ bypassCache: true });
+        const out = [];
+        for (const m of mats) {
+            for (const r of this._materieelReserveringen(m)) {
+                if (r && r.status === 'AANGEVRAAGD') {
+                    out.push(Object.assign({ materialId: m.id, materialName: m.name, brand: m.brand }, r));
+                }
+            }
+        }
+        return out.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
     },
 
     async uploadFile(endpoint, file, fileName) {
@@ -994,6 +1739,53 @@ const RobawsAPI = {
             if (pin) emp.extraFields['Pincode'] = { type: 'TEXT', group: 'QE Werkbon app', stringValue: String(pin) };
         });
         return { id: newId };
+    },
+
+    // ================================================================
+    // (v308 / 1.x v303) ONBOARDING-CHECK — één read-only statusfoto van
+    // alles wat een werknemer nodig heeft om de app te gebruiken.
+    // Geverifieerd (10 juli 2026): de user↔fiche-koppeling ligt op de
+    // USER (user.employeeId); de fiche toont hem niet. POST/PATCH op
+    // /users geeft 403 met onze key — login-users blijven handwerk in
+    // Robaws-web; de app VINDT en verifieert de koppeling alleen.
+    // ================================================================
+    async adminGetOnboardingStatus(employeeId) {
+        const empRes = await this.get('employees/' + employeeId, { bypassCache: true });
+        if (empRes.code !== 200 || !empRes.data) throw new Error('Fiche niet gevonden (' + empRes.code + ')');
+        const emp = empRes.data;
+        const email = String(emp.email || '').trim().toLowerCase();
+        const statusStr = String(emp.status || '').toLowerCase();
+        const pinVal = this._efValue(emp, 'Pincode');
+        const roleLabel = emp.planningGroupName || emp.planningGroup || '';
+        const roleOk = !!(emp.employeeRoleId || roleLabel);
+        // Gekoppelde login-user zoeken: users-scan (klein bestand, filters
+        // worden door Robaws genegeerd) — match op employeeId, dan e-mail.
+        let user = null;
+        try {
+            let page = 0;
+            do {
+                const r = await this.get('users?limit=100&offset=' + (page * 100), { bypassCache: true });
+                if (r.code !== 200 || !r.data) break;
+                const list = r.data.items || (Array.isArray(r.data) ? r.data : []);
+                if (!list.length) break;
+                const empIdStr = String(employeeId);
+                user = list.find(u => String(u.employeeId || (u.employee && u.employee.id) || '') === empIdStr)
+                    || (email ? list.find(u => String(u.email || '').toLowerCase() === email) : null) || null;
+                if (user) break;
+                page++;
+                if (page >= (r.data.totalPages || 1)) break;
+            } while (page < 5);
+        } catch (_e) {}
+        return {
+            naam: [emp.firstName, emp.lastName].filter(Boolean).join(' ') || emp.name || ('#' + employeeId),
+            checks: {
+                email:  { ok: !!email, value: email },
+                actief: { ok: !statusStr.includes('stopgezet'), value: emp.status || 'actief' },
+                rol:    { ok: roleOk, value: roleLabel || (emp.employeeRoleId ? ('rol-id ' + emp.employeeRoleId) : '') },
+                user:   { ok: !!user, value: user ? ((user.fullName || user.email || 'user') + ' (#' + user.id + ')') : '', userId: user ? user.id : null },
+                pin:    { ok: !!(pinVal && String(pinVal).trim()) },
+            },
+        };
     },
 
     // Fallback login als Robaws onbereikbaar is.
@@ -1775,6 +2567,35 @@ const RobawsAPI = {
     // =============================================
     // PLANNING
     // =============================================
+    /** (v307 / 1.x v302) Lichte poll-teller: aantal open planning-items
+     *  (zonder werkbon) voor een datum, ZONDER de dure verrijking van
+     *  getPlanning (detail-GET per item + klantdata). De 5-min-poll heeft
+     *  alleen dit aantal nodig — zelfde datum-filter + zelfde werkbon-set,
+     *  dus de telling is identiek aan getPlanning's items.filter(!hasWerkbon). */
+    async getOpenPlanningCount(employeeId, date, userId = null) {
+        const yesterday = this._localDateStr(null, -1);
+        const cutoff = (date && date < yesterday) ? date : yesterday;
+        const all = []; const seen = new Set();
+        let offset = 0; const PAGE = 100;
+        for (let p = 0; p < 30; p++) {
+            const r = await this.get(`planning-items?employeeId=${employeeId}&limit=${PAGE}&offset=${offset}&sort=startDate:desc`);
+            if (r.code !== 200) throw new Error('Kon planning niet ophalen');
+            const items = (r.data && r.data.items) || [];
+            if (!items.length) break;
+            let added = 0;
+            for (const it of items) { const k = String(it.id); if (seen.has(k)) continue; seen.add(k); all.push(it); added++; }
+            const lastDate = ((items[items.length - 1].startDate || '') + '').split('T')[0];
+            if (lastDate < cutoff) break;
+            if (added === 0) break;
+            if (items.length < PAGE) break;
+            offset += PAGE;
+        }
+        const dayItems = all.filter(it => ((it.startDate || '') + '').split('T')[0] === date);
+        if (!dayItems.length) return 0;
+        const met = await this._getPlanningIdsWithWorkOrders(userId);
+        return dayItems.filter(it => !met.has(String(it.id))).length;
+    },
+
     async getPlanning(employeeId, date, userId = null) {
         // v138: GEEN whitelist meer — elke datum wordt geaccepteerd en strikt
         // gefilterd. Voorheen werd elke datum buiten {gisteren, vandaag, morgen}

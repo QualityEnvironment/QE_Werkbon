@@ -1,0 +1,1011 @@
+﻿/* =========================================================
+   QE WERKBON 2.0 — MARBLE DESIGN-LAAG  (v260)
+   Bron: "QE Werkbon 2.0 Marble.dc.html" + "Handoff QE Werkbon 2.0"
+   (Claude Designer-project, juli 2026).
+
+   Geladen NA app.css en redesign.css. Werkwijze: de bestaande
+   --qe-*-variabelen worden geREMAPT naar de Marble-tokens en de
+   kerncomponenten worden herstijld — de JS-motor, alle id's en
+   klassen blijven ongewijzigd (zelfde app, nieuw kleed).
+
+   Thema's: licht (default) en donker (body.dark-mode).
+   Toegankelijkheid: body.a11y-scale-groot/-xl (UI-zoom), a11y-bold,
+   a11y-contrast, a11y-motion, a11y-cvd-palette — zie sectie 17.
+   Merk-accent #F99D3E blijft identiek in beide thema's.
+   QR-codes blijven ALTIJD op puur wit (scanbaarheid).
+   ========================================================= */
+
+/* ----- FONT: Archivo (variabel, gebundeld — werkt offline) ----- */
+@font-face {
+    font-family: 'Archivo';
+    src: url('../assets/fonts/archivo-var.woff2') format('woff2');
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* =========================================================
+   1 · TOKENS (licht)
+   ========================================================= */
+:root {
+    /* Marble-kern */
+    --bg:      #F4F2ED;
+    --card:    #FDFCFA;
+    --ink:     #26334B;
+    --txt2:    #3A4356;
+    --wash:    #EFEDE6;
+    --g1:      #85847C;
+    --g2:      #5F5E56;
+    --g3:      #A3A29A;
+    --l1:      #E4E1D9;
+    --l2:      #EBE8E0;
+    --cb:      #E9E6DE;
+    --b1:      #DCD9D0;
+    --b2:      #CAC7BE;
+    --b3:      #BFBDB4;
+    --btn:     #26334B;
+    --btnfg:   #FFFFFF;
+    --purple2: #6A2C91;
+    --pwash:   #F4EFF8;
+    --pborder: #D9CFE4;
+    --green2:  #3E7A54;
+    --gwash:   #EDF3EE;
+    --amber:   #D97E24;
+    --amber2:  #A65E12;
+    --awash2:  #F7E9D8;
+    --aborder2:#E9CBA6;
+    --red2:    #B4372F;
+    --rwash:   #F6E7E5;
+    --accent:  #F99D3E;   /* merk-accent — identiek in beide thema's */
+    --scrim:   rgba(38,51,75,0.45);
+
+    /* Bestaande --qe-* hermappen → alle inline styles volgen vanzelf */
+    --qe-orange:       #F99D3E;
+    --qe-orange-light: var(--awash2);
+    --qe-orange-dark:  var(--amber2);
+    --qe-purple:       var(--purple2);
+    --qe-purple-light: var(--pwash);
+    --qe-darkblue:     var(--ink);
+    --qe-light:        var(--wash);
+    --qe-white:        var(--card);
+    --qe-grey:         var(--g1);
+    --qe-grey-light:   var(--l1);
+    --qe-green:        var(--green2);
+    --qe-green-light:  var(--gwash);
+    --qe-red:          var(--red2);
+    --qe-red-light:    var(--rwash);
+
+    /* redesign.css-laag mee hermappen */
+    --qe-hairline:      var(--l1);
+    --qe-hairline-soft: var(--l2);
+    --qe-ink:           var(--ink);
+    --qe-muted:         var(--g2);
+    --qe-hint:          var(--g3);
+
+    --font: 'Archivo', 'Roboto', sans-serif;
+    --ease-marble: cubic-bezier(0.22, 1, 0.36, 1);
+    --shadow-sm: 0 1px 4px rgba(38,51,75,0.04);
+    --shadow-md: 0 2px 10px rgba(38,51,75,0.05);   /* kaart-schaduw uit de spec */
+    --shadow-lg: 0 12px 32px rgba(38,51,75,0.14);
+    --r-sm: 10px;   /* inputs */
+    --r-md: 14px;   /* kaarten */
+    --r-lg: 14px;
+}
+
+/* ----- TOKENS (donker) — zelfde UI, alleen variabelen omgezet ----- */
+body.dark-mode {
+    --bg:      #1B1C19;
+    --card:    #242522;
+    --ink:     #E6E4DB;
+    --txt2:    #C9C7BC;
+    --wash:    #232420;
+    --g1:      #98968A;
+    --g2:      #B3B1A5;
+    --g3:      #6E6D65;
+    --l1:      #34352F;
+    --l2:      #2E2F2A;
+    --cb:      #323330;
+    --b1:      #3A3B36;
+    --b2:      #45463F;
+    --b3:      #52534B;
+    --btn:     #E6E4DB;
+    --btnfg:   #1B1C19;
+    --purple2: #B491CE;
+    --pwash:   #2C2733;
+    --pborder: #453A52;
+    --green2:  #7FB894;
+    --gwash:   #222A24;
+    --amber:   #E09B52;
+    --amber2:  #DFA35F;
+    --awash2:  #322A1F;
+    --aborder2:#54452E;
+    --red2:    #D97A70;
+    --rwash:   #332423;
+    --scrim:   rgba(0,0,0,0.55);
+    --shadow-sm: 0 1px 4px rgba(0,0,0,0.3);
+    --shadow-md: 0 2px 10px rgba(0,0,0,0.35);
+    --shadow-lg: 0 12px 32px rgba(0,0,0,0.5);
+}
+
+/* =========================================================
+   2 · BASIS — typografie & vlakken
+   ========================================================= */
+body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--ink);
+}
+h1, h2, h3 { font-weight: 500; letter-spacing: -0.4px; }
+/* Cijfers springen nooit (uren, bedragen, timers) */
+.he-duration, .wo-time, .t-hour, #timerValue, .qe-countup,
+.day-hours-row span:last-child, .ws-total, td.text-right {
+    font-variant-numeric: tabular-nums;
+}
+
+/* (v281) Werf-modus verwijderd — de UI-schaal zit nu in Toegankelijkheid
+   (body.a11y-scale-groot / .a11y-scale-xl, zie sectie 17). */
+
+/* =========================================================
+   3 · TOPBAR — licht en minimaal (was navy)
+   ========================================================= */
+.app-header {
+    background: var(--bg);
+    color: var(--ink);
+    box-shadow: none;
+    border-bottom: 1px solid var(--l1);
+}
+.app-header .header-title { color: var(--ink); font-weight: 600; letter-spacing: 0.2px; }
+.app-header .header-back {
+    background: none;
+    border: 1px solid var(--b1);
+    color: var(--g2);
+}
+/* elementen die op de navy balk wit waren → ink */
+.app-header [style*="color:#fff"], .app-header [style*="color: #fff"],
+.app-header [style*="color:white"], .app-header [style*="color: white"] {
+    color: var(--ink) !important;
+}
+.app-header [style*="rgba(255,255,255"] { background: var(--wash) !important; }
+
+/* =========================================================
+   4 · BOTTOM-NAV — vlak, hairline, ink-actief
+   ========================================================= */
+.bottom-nav {
+    background: var(--card);
+    border-top: 1px solid var(--l1);
+    box-shadow: none;
+}
+.nav-item { color: var(--g3); }
+.nav-item.active { color: var(--ink); }
+.nav-item.active::after { background: var(--accent); }
+
+/* =========================================================
+   5 · KAARTEN & LIJSTEN
+   ========================================================= */
+.card {
+    background: var(--card);
+    border: 1px solid var(--cb);
+    border-radius: 14px;
+    box-shadow: var(--shadow-md);
+}
+.card-clickable:active { background: var(--wash); transform: scale(0.994); }
+
+/* Planning: terug LOSSE kaarten met ruime tijd-kolom (Marble) —
+   de v187 vlakke-lijst-look wordt hier bewust teruggedraaid. */
+#workorderList { background: transparent; border: 0; border-radius: 0; overflow: visible; }
+#workorderList > .card {
+    border: 1px solid var(--cb);
+    border-radius: 14px;
+    margin: 0 0 12px;
+    background: var(--card);
+    box-shadow: var(--shadow-md);
+    padding: 18px;
+}
+#workorderList > .card:active { background: var(--wash); }
+.wo-time .t-hour {
+    font-size: 24px;
+    font-weight: 400;
+    letter-spacing: -0.5px;
+    color: var(--ink);
+}
+.wo-time .t-label { color: var(--g3); }
+.wo-info h3 { font-size: 16px; font-weight: 600; letter-spacing: -0.2px; color: var(--ink); }
+.wo-info .wo-address { color: var(--g2); }
+.wo-type { background: transparent !important; color: var(--g1) !important; font-weight: 600; padding-left: 0; }
+.wo-type.onderhoud   { background: transparent !important; color: var(--green2) !important; }
+.wo-type.herstelling { background: transparent !important; color: var(--amber) !important; }
+.wo-type.installatie { background: transparent !important; color: var(--purple2) !important; }
+.wo-regie-tag { color: var(--amber); }
+.wo-nav-btn { border: 1px solid var(--b1); color: var(--g2); background: none; border-radius: 50%; }
+
+/* Sectielabels: 12px 600, kapitaal, letterspacing 0.5 */
+.section-header .section-title, .ws-header, .ua-group-title {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--g1);
+}
+.werkbon-summary { border: 1px solid var(--cb); border-radius: 14px; background: var(--card); }
+.werkbon-summary .ws-header {
+    background: var(--card) !important;
+    color: var(--g1) !important;
+    border-bottom: 1px solid var(--l2);
+}
+
+/* Hairline-lijsten binnen schermen (geen geneste kaarten) */
+.hour-entry, .material-item {
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--l2);
+    border-radius: 0;
+    box-shadow: none;
+}
+.info-row { border-bottom: 1px solid var(--l2); }
+
+/* =========================================================
+   6 · KNOPPEN — primair bewust hoekig (2px), ink op licht
+   ========================================================= */
+.btn { border-radius: 2px; box-shadow: none; font-weight: 600; }
+.btn-primary { background: var(--btn); color: var(--btnfg); }
+.btn-primary:active { background: var(--txt2); transform: scale(0.98); }
+body.dark-mode .btn-primary:active { background: #CFCDC2; }
+.btn-outline {
+    background: none;
+    border: 1px solid var(--b2);
+    color: var(--ink);
+}
+.btn-outline:active { background: var(--wash); }
+.btn-success { background: var(--green2) !important; color: #fff; }
+.btn-danger, .btn-red { background: var(--red2); color: #fff; }
+/* Chips en ronde knoppen behouden hun ronding */
+.date-chip, .payment-method-btn, .qty-btn, .nav-item, .wo-nav-btn { border-radius: 24px; }
+.payment-method-btn { border-radius: 12px; border-color: var(--b1); }
+.payment-method-btn[style*="background: var(--qe-purple)"] { border-radius: 12px; }
+
+/* Datumchips: rond 24px, actief = wash + ink-rand */
+.date-chip {
+    background: var(--card);
+    border: 1px solid var(--b1);
+    color: var(--g2);
+    box-shadow: none;
+}
+.date-chip.active {
+    background: var(--wash);
+    border-color: var(--ink);
+    color: var(--ink);
+    font-weight: 600;
+}
+
+/* =========================================================
+   7 · TABS — tekst + 2px underline in ink
+   ========================================================= */
+.tabs { border-bottom: 1px solid var(--l1); background: transparent; }
+.tab-btn { color: var(--g1); font-weight: 600; }
+.tab-btn.active { color: var(--ink); background: transparent; }
+.tab-btn.active::after { background: var(--ink); height: 2px; }
+
+/* =========================================================
+   8 · FORMULIEREN
+   ========================================================= */
+.form-input, input[type="text"], input[type="time"], input[type="date"],
+input[type="number"], input[type="email"], input[type="password"], select, textarea {
+    background: var(--card);
+    border: 1px solid var(--b1);
+    border-radius: 10px;
+    color: var(--ink);
+    font-family: var(--font);
+}
+.form-input:focus, input:focus, select:focus, textarea:focus {
+    border-color: var(--ink);
+    box-shadow: 0 0 0 3px rgba(38,51,75,0.08);
+}
+::placeholder { color: var(--g3); }
+
+/* =========================================================
+   9 · MODALS, TOASTS, OVERLAYS
+   ========================================================= */
+#modalOverlay, .qe-scan-backdrop { background: var(--scrim); backdrop-filter: blur(4px); }
+.modal-content, .qe-scan-card {
+    background: var(--card);
+    color: var(--ink);
+    border: 1px solid var(--cb);
+    border-radius: 14px;
+    box-shadow: var(--shadow-lg);
+}
+.toast {
+    background: var(--ink);
+    color: var(--bg);
+    border-radius: 10px;
+    box-shadow: var(--shadow-lg);
+    font-weight: 500;
+}
+body.dark-mode .toast { background: var(--card); color: var(--ink); border: 1px solid var(--cb); }
+
+/* QR-codes ALTIJD op puur wit — ook in dark-mode (scanbaarheid) */
+img[src*="qrserver"], img[src*="quickchart"], img[alt*="QR"] {
+    background: #FFFFFF !important;
+    border-radius: 12px;
+    padding: 8px;
+}
+
+/* =========================================================
+   10 · SKELETONS & EMPTY STATES
+   ========================================================= */
+.qe-skel { background: linear-gradient(100deg, var(--l2) 30%, var(--wash) 50%, var(--l2) 70%); background-size: 200% 100%; }
+body.dark-mode .qe-skel { background: linear-gradient(100deg, #2A2B27 30%, #32332E 50%, #2A2B27 70%); background-size: 200% 100%; }
+.qe-skel-row { border-bottom: 1px solid var(--l2); }
+.empty-state { color: var(--g1); }
+.empty-state h3 { color: var(--g2); font-weight: 500; }
+.empty-state .empty-icon svg { color: var(--b2); }
+
+/* =========================================================
+   11 · MOTION — Marble-specs
+   ========================================================= */
+@keyframes mbIn   { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: none; } }
+@keyframes mbUp   { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes mbSoft { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* Schermwissel: 18px slide-in van rechts + fade, 450ms */
+.screen { animation: mbIn 0.45s var(--ease-marble); }
+
+/* Lijstitems staggeren 80ms */
+#workorderList > .card { animation: mbUp 0.5s var(--ease-marble) both; }
+#workorderList > .card:nth-child(1) { animation-delay: 0.00s; }
+#workorderList > .card:nth-child(2) { animation-delay: 0.08s; }
+#workorderList > .card:nth-child(3) { animation-delay: 0.16s; }
+#workorderList > .card:nth-child(4) { animation-delay: 0.24s; }
+#workorderList > .card:nth-child(5) { animation-delay: 0.32s; }
+#workorderList > .card:nth-child(6) { animation-delay: 0.40s; }
+#workorderList > .card:nth-child(n+7) { animation-delay: 0.46s; }
+
+/* Klok-status stip pulseert zachtjes */
+#clockStatusIcon { animation: mbSoft 2.4s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+    .screen, #workorderList > .card, #clockStatusIcon { animation: none !important; }
+}
+
+/* =========================================================
+   12 · SCHERMTITELS & DETAIL-KOP (Marble-typografie)
+   ========================================================= */
+#headerDate { color: var(--g1); font-size: 13px; }
+#detailTitle { font-weight: 600; letter-spacing: -0.4px; }
+#detailRegieBanner {
+    background: var(--awash2) !important;
+    color: var(--amber2) !important;
+    border-radius: 10px 10px 0 0;
+    font-size: 12.5px;
+    letter-spacing: 0.3px;
+}
+#wbOrderBanner { background: var(--ink) !important; color: var(--bg) !important; }
+
+/* Login: navy paneel blijft — met Marble-tinten */
+.login-screen, #loginScreen { background: var(--ink); }
+.login-card { background: var(--card); border-radius: 14px; box-shadow: var(--shadow-lg); }
+
+/* Statusbalk-kaarten (klok) volgen kaartstijl */
+#clockStatusBar { border: 1px solid var(--cb); box-shadow: var(--shadow-md); }
+
+/* =========================================================
+   13 · DARK-MODE OVERRIDES
+   De oude dark-mode-laag in app.css (v1) zet hardgecodeerde
+   navy-tinten op componenten; hier zetten we die om naar de
+   Marble-donkertokens (deze file laadt als laatste → wint).
+   ========================================================= */
+body.dark-mode .app-header { background: var(--bg) !important; color: var(--ink); border-bottom-color: var(--l1); }
+body.dark-mode .login-screen, body.dark-mode #loginScreen { background: #14151A; }
+body.dark-mode .card,
+body.dark-mode .login-card { background: var(--card); border-color: var(--cb); box-shadow: var(--shadow-md); }
+body.dark-mode .form-input,
+body.dark-mode select.form-input,
+body.dark-mode input, body.dark-mode select, body.dark-mode textarea {
+    background: var(--card); border-color: var(--b1); color: var(--ink);
+}
+body.dark-mode .form-input::placeholder { color: var(--g3); }
+body.dark-mode .btn-outline { border-color: var(--b2); color: var(--ink); }
+body.dark-mode .btn-outline:hover { background: var(--wash); }
+body.dark-mode .tab-btn { color: var(--g1); }
+body.dark-mode .tab-btn.active { color: var(--ink); border-bottom-color: var(--ink); }
+body.dark-mode .tab-btn.active::after { background: var(--ink); }
+body.dark-mode .tabs { border-bottom-color: var(--l1); }
+body.dark-mode .date-strip button, body.dark-mode .date-chip { color: var(--g2); background: var(--card); border-color: var(--b1); }
+body.dark-mode .date-strip button.active, body.dark-mode .date-chip.active { background: var(--wash); border-color: var(--ink); color: var(--ink); }
+body.dark-mode .hour-entry, body.dark-mode .material-item { background: transparent; border-color: var(--l2); }
+body.dark-mode .timer-display { background: var(--card); }
+body.dark-mode .section-header h2, body.dark-mode .section-header h3 { color: var(--ink); }
+body.dark-mode .info-row { border-color: var(--l2); }
+body.dark-mode a { color: var(--purple2); }
+body.dark-mode .werkbon-summary { background: var(--card); border-color: var(--cb); }
+body.dark-mode .ws-header { background: var(--card); color: var(--g1); }
+body.dark-mode table th { background: var(--wash); color: var(--g1); }
+body.dark-mode table td { border-color: var(--l2); color: var(--txt2); }
+body.dark-mode #detailHeader { background: var(--card) !important; }
+body.dark-mode .search-box { background: var(--card); }
+body.dark-mode .qty-btn { background: var(--wash); color: var(--ink); border-color: var(--b1); }
+
+/* =========================================================
+   14 · SCHERM-FIJNSLIJP (v265)
+   Correcties op JS-gegenereerde inline-styles en app.css-
+   regels die de token-remap niet raakte (screenshots Levi
+   7 juli): header-leesbaarheid, datumchips, sectielabels,
+   paarse CTA's → Marble.
+   ========================================================= */
+
+/* --- Topbar: alles wat op de navy balk wit was → Marble-grijs.
+       De naam ("Levi — Bureel") verhuist naar Profiel: alleen de
+       avatar blijft, zodat de titel niet meer afkapt. --- */
+.app-header .header-profile { color: var(--ink); }
+.app-header .header-profile:active { background: var(--wash); }
+.app-header .header-user-text { display: none; }
+.app-header .header-date { color: var(--g1); opacity: 1; margin-right: 12px; }
+.app-header .header-avatar { background: var(--wash); border: 1px solid var(--b2); }
+.header-avatar-fallback { color: var(--g1); }
+.app-header .header-back:active { background: var(--wash); }
+.app-header .header-title { font-size: 15px; }
+
+/* --- Datumchips: compacte horizontale pills i.p.v. hoge blokken --- */
+.date-strip { gap: 8px; padding: 4px 0 14px; }
+.date-chip {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 9px 14px;
+    border-radius: 24px;
+    border-width: 1px;
+    text-align: left;
+    box-shadow: none;
+}
+.date-chip .d-day { font-size: 11px; font-weight: 600; letter-spacing: 0.5px; color: var(--g1); }
+.date-chip .d-num { font-size: 14px; font-weight: 600; line-height: 1; color: var(--ink); }
+.date-chip .d-month { display: none; }
+.date-chip .d-label { font-size: 12px; font-weight: 500; margin-top: 0; color: var(--g2); }
+.date-chip.active .d-day, .date-chip.active .d-label { color: var(--ink); }
+.date-chip.today .d-num { color: var(--accent); }
+
+/* --- Sectielabels: overal 12px 600 kapitaal grijs (Marble) —
+       ook de plain <h2>/<h3> zonder .section-title en de paarse
+       .detail-section h3 ("KLANTGEGEVENS") --- */
+.section-header h2, .section-header h3, .detail-section h3 {
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--g1) !important;
+}
+body.dark-mode .section-header h2, body.dark-mode .section-header h3,
+body.dark-mode .detail-section h3 { color: var(--g1) !important; }
+.section-header .badge {
+    background: transparent;
+    color: var(--g1);
+    border: 1px solid var(--b1);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 8px;
+}
+
+/* --- Toggles: aan = ink (was paars) --- */
+.toggle-switch input:checked + .toggle-slider { background: var(--ink); }
+
+/* --- Klok-statusbar: neutrale basis (JS zet de status-dot) --- */
+#clockStatusText { color: var(--ink); }
+#clockStatusSub { color: var(--g1); opacity: 1 !important; }
+#clockStatusAction { color: var(--g2); opacity: 1 !important; font-weight: 500; }
+
+/* --- Paarse CTA's uit JS-templates → Marble-knoppen ---
+       "Navigeer" (werfadres) en terminal-bevestigen: navy hoekig;
+       "BTW tarief aanpassen": outline hoekig; BTW-rij: wash. */
+#clientInfo a[href*="maps"] {
+    background: var(--btn) !important;
+    color: var(--btnfg) !important;
+    border-radius: 2px !important;
+    padding: 8px 12px !important;
+}
+#btnConfirmTerminal {
+    background: var(--btn) !important;
+    color: var(--btnfg) !important;
+    border-radius: 2px !important;
+}
+.btw-change-btn {
+    border: 1px solid var(--b2) !important;
+    border-radius: 2px !important;
+    background: none !important;
+    color: var(--ink) !important;
+}
+.info-row.btw-row { background: var(--wash) !important; }
+#clientVatDisplay { color: var(--ink) !important; }
+
+/* --- Betaalmethode-wissel-kaart (blauwe gradient) → wash-kaart --- */
+.card[onclick*="openChangePaymentMethodModal"] {
+    background: var(--wash) !important;
+    border-left: 3px solid var(--ink) !important;
+}
+
+/* =========================================================
+   15 · 1-OP-1 REPLICA (v266) — login, topbar, nav, tutorial,
+   loader, wipe, schermkoppen, overgangen (prototype
+   "QE Werkbon 2.0 Marble.dc.html")
+   ========================================================= */
+
+/* --- extra keyframes uit het prototype --- */
+@keyframes mbLine     { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes mbCheck    { from { stroke-dashoffset: 60; } to { stroke-dashoffset: 0; } }
+@keyframes mbScale    { from { transform: scale(0.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+@keyframes mbSheet    { from { transform: translateY(100%); } to { transform: none; } }
+@keyframes mbSpin     { to { transform: rotate(360deg); } }
+@keyframes mbDot      { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
+@keyframes mbDim      { from { opacity: 0; } to { opacity: 1; } }
+@keyframes mbWipe     { 0% { transform: translateY(101%); } 32% { transform: translateY(0); } 68% { transform: translateY(0); } 100% { transform: translateY(-101%); } }
+@keyframes mbWipeLogo { 0% { opacity: 0; transform: scale(0.82); } 34% { opacity: 1; transform: scale(1); } 62% { opacity: 1; transform: scale(1); } 88% { opacity: 0; transform: scale(1.06); } 100% { opacity: 0; } }
+@keyframes mbWipeLine { 0% { transform: scaleX(0); } 36% { transform: scaleX(0); } 58% { transform: scaleX(1); } 100% { transform: scaleX(1); } }
+
+/* --- schermkop: kleine grijze regel + 34px Archivo-titel --- */
+.mb-head { margin-bottom: 22px; }
+.mb-head-sub { font-size: 13px; color: var(--g1); margin-bottom: 2px; }
+.mb-head-title { font: 400 34px var(--font); letter-spacing: -1px; color: var(--ink); }
+/* Alleen de schermen waar de oude section-header een TITEL-duplicaat is —
+   op Planning/Klok zijn section-headers inhoudslabels en blijven ze staan.
+   (v268: zonder :first-of-type — sinds de mb-head het eerste div-kind is,
+   matchte die pseudo nooit meer en stonden er dubbele koppen.) */
+#screenProfile > .section-header,
+#screenUitgevoerd > .section-header,
+#screenAdmin > .section-header,
+#screenUrenAnalyse > .section-header,
+#screenAfwezigheid > .section-header { display: none; }
+
+/* --- schermovergang: elke navigatie glijdt binnen zoals het prototype --- */
+.screen.active { animation: mbIn 0.45s cubic-bezier(0.22, 1, 0.36, 1); }
+
+/* --- topbar 1:1: QE-woordmerk · klok-status · i-knop · avatar --- */
+.app-header .header-qe { font-size: 13px; font-weight: 600; letter-spacing: 0.3px; color: var(--ink); }
+.app-header .header-back.visible + .header-qe { display: none; }
+.app-header .header-title, .app-header .header-date { display: none !important; }
+.app-header .header-right { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+#headerClockStatus { font-size: 11.5px; font-weight: 600; color: var(--g1); }
+.app-header .header-info {
+    width: 32px; height: 32px; border-radius: 50%;
+    border: 1px solid var(--b1); background: none; color: var(--g2);
+    font: 600 13px var(--font); cursor: pointer; flex-shrink: 0;
+}
+.app-header .header-info:active { background: var(--wash); }
+.app-header .header-profile { margin-left: 0; margin-right: 0; padding: 0; }
+.app-header .header-avatar { width: 32px; height: 32px; }
+
+/* --- bottom-nav 1:1: geen iconen, 5px status-dot boven het label --- */
+.bottom-nav { background: var(--navbg, rgba(244, 242, 237, 0.94)); backdrop-filter: blur(10px); }
+.bottom-nav .nav-item svg { display: none; }
+.bottom-nav .nav-item {
+    flex-direction: column; gap: 5px;
+    font: 600 12px var(--font); color: var(--g3);
+    padding: 14px 4px 10px; transition: color 0.3s;
+}
+.bottom-nav .nav-item::before {
+    content: ''; width: 5px; height: 5px; border-radius: 50%;
+    background: transparent; transition: background 0.3s;
+}
+.bottom-nav .nav-item.active { color: var(--ink); }
+.bottom-nav .nav-item.active::before { background: var(--accent); }
+.bottom-nav .nav-item.active::after { display: none; }
+body.dark-mode .bottom-nav { background: var(--navbg, rgba(27, 28, 25, 0.94)); }
+
+/* --- tabs: underline is ORANJE zoals het prototype (was ink) --- */
+.tab-btn.active::after { background: var(--accent) !important; }
+body.dark-mode .tab-btn.active { border-bottom-color: var(--accent); }
+
+/* --- inklapbare/verschijnende elementen: zachte reveal (mbUp) --- */
+.tab-content.active, #loginPinConfirmGroup, #updateStatus, #roleSwitchNote,
+#clockActiveSession, #clockCompletedSection, #uaActions, #planDescriptionSection,
+#wbPaymentMethodSection, #pendingPaymentsBanner > * {
+    animation: mbUp 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.modal-overlay { animation: mbDim 0.25s ease-out; }
+.modal-sheet { animation: mbSheet 0.35s cubic-bezier(0.22, 1, 0.36, 1); background: var(--bg); border-radius: 18px 18px 0 0; }
+
+/* --- spinner → Marble-loader (ring + QE-logo-tegel), overal waar .spinner staat --- */
+.spinner {
+    position: relative; width: 96px; height: 96px; margin: 40px auto;
+    border: 2px solid var(--l1); border-radius: 50%;
+    animation: none;
+}
+.spinner::before {
+    content: ''; position: absolute; inset: -2px; border-radius: 50%;
+    border: 2.5px solid transparent; border-top-color: var(--accent);
+    animation: mbSpin 1.1s linear infinite;
+}
+.spinner::after {
+    content: ''; position: absolute; inset: 0; margin: auto;
+    width: 58px; height: 58px; border-radius: 15px;
+    background: var(--card) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'%3E%3Crect x='44' y='35' width='110' height='110' rx='2' fill='%23F99D3E'/%3E%3Cpath d='M91.9 147 L96.8 143.3 L103.5 140 L110.1 138.4 L116.8 138 L123.4 139.4 L130 141.3 L136.6 144 L143.2 146.6 L149.8 148.6 L156.4 150 L163 151 L164.7 152 L163 153.3 L156.4 155.6 L149.8 157 L143.2 156.6 L136.6 155 L130 152.3 L123.4 150 L116.8 148 L110.1 147.3 L103.5 147.3 L96.8 148 Z' fill='%236A2C91'/%3E%3Ccircle cx='80.5' cy='89.8' r='37' fill='none' stroke='%236A2C91' stroke-width='21'/%3E%3C/svg%3E") center/38px 38px no-repeat;
+    border: 1px solid var(--cb); box-shadow: 0 6px 18px rgba(38, 51, 75, 0.1);
+}
+
+/* --- volledige overlays (loader / succes) --- */
+.mb-fullveil {
+    position: fixed; inset: 0; z-index: 99990;
+    background: var(--scrim, rgba(244, 242, 237, 0.9));
+    -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    animation: mbDim 0.2s ease-out;
+}
+.mb-loaderring { position: relative; width: 96px; height: 96px; display: flex; align-items: center; justify-content: center; }
+.mb-spinsvg { position: absolute; inset: 0; animation: mbSpin 1.1s linear infinite; }
+.mb-loaderlogo {
+    width: 58px; height: 58px; border-radius: 15px;
+    background: var(--card); border: 1px solid var(--cb);
+    box-shadow: 0 6px 18px rgba(38, 51, 75, 0.1);
+    display: flex; align-items: center; justify-content: center;
+}
+.mb-loadertxt { display: flex; align-items: baseline; gap: 2px; margin-top: 22px; font: 500 15px var(--font); color: var(--ink); }
+.mb-dot  { font: 700 15px var(--font); color: var(--accent); animation: mbDot 1.3s infinite; }
+.mb-dot2 { animation-delay: 0.22s; }
+.mb-dot3 { animation-delay: 0.44s; }
+.mb-gradline { width: 44px; height: 2px; background: linear-gradient(90deg, #F99D3E, var(--purple2)); margin-top: 14px; transform-origin: center; animation: mbLine 0.6s ease-out both; }
+.mb-loadersub { font-size: 12px; color: var(--g1); margin-top: 12px; }
+
+.mb-succes { background: var(--bg); z-index: 99985; animation: mbDim 0.3s ease-out; }
+.mb-succircle {
+    width: 104px; height: 104px; border-radius: 50%; background: #26334B;
+    display: flex; align-items: center; justify-content: center;
+    animation: mbScale 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.mb-checkpath { animation: mbCheck 0.55s ease-out 0.35s both; }
+.mb-suctitle { font: 400 28px var(--font); letter-spacing: -0.8px; color: var(--ink); margin-top: 24px; animation: mbUp 0.5s cubic-bezier(0.22, 1, 0.36, 1) 0.25s both; }
+.mb-sucsub { font-size: 13.5px; color: var(--g1); margin-top: 8px; text-align: center; padding: 0 40px; animation: mbUp 0.5s cubic-bezier(0.22, 1, 0.36, 1) 0.35s both; }
+.mb-succes .mb-gradline { margin-top: 20px; animation-delay: 0.5s; }
+
+/* --- login-wipe (navy overlay met logo + begroeting) --- */
+#mbWipe {
+    position: fixed; inset: 0; z-index: 99995; background: #26334B;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    transform: translateY(101%);
+    animation: mbWipe 1.5s cubic-bezier(0.65, 0, 0.35, 1) both;
+    pointer-events: none;
+}
+.mb-wipeinner { display: flex; flex-direction: column; align-items: center; animation: mbWipeLogo 1.5s ease-out both; }
+.mb-wipelogo {
+    width: 96px; height: 96px; border-radius: 22px; background: #fff;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 14px 36px rgba(0, 8, 26, 0.35);
+}
+.mb-wipehi { font: 400 20px var(--font); letter-spacing: -0.4px; color: #fff; margin-top: 18px; }
+.mb-wipesub { font-size: 12px; color: rgba(255, 255, 255, 0.55); margin-top: 4px; }
+.mb-wipeline { width: 52px; height: 2px; background: linear-gradient(90deg, #F99D3E, #6A2C91); margin-top: 16px; transform-origin: center; animation: mbWipeLine 1.5s cubic-bezier(0.65, 0, 0.35, 1) both; }
+
+/* --- login 1:1: strip, logo, underline-velden, hoekige knop --- */
+#loginScreen.mb-login {
+    position: fixed; inset: 0; z-index: 100;
+    background: var(--bg);
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 40px;
+}
+#loginScreen.mb-login.hidden { display: none; }
+.mb-login-strip {
+    position: absolute; top: 0; left: 0; bottom: 0; width: 6px;
+    background: linear-gradient(#F99D3E, #6A2C91);
+}
+.mb-login-logo { width: 58px; height: 58px; margin-bottom: 26px; animation: mbUp 0.6s cubic-bezier(0.22, 1, 0.36, 1); }
+.mb-login-title { font: 400 36px var(--font); letter-spacing: -1.2px; color: var(--ink); animation: mbUp 0.6s cubic-bezier(0.22, 1, 0.36, 1) 0.08s both; }
+.mb-login-sub { font-size: 14px; color: var(--g1); margin: 6px 0 36px; animation: mbUp 0.6s cubic-bezier(0.22, 1, 0.36, 1) 0.16s both; }
+.mb-login-form { animation: mbUp 0.6s cubic-bezier(0.22, 1, 0.36, 1) 0.24s both; }
+.mb-login-input {
+    width: 100%; box-sizing: border-box;
+    padding: 14px 2px;
+    border: none !important; border-bottom: 1px solid var(--b2) !important;
+    border-radius: 0 !important;
+    background: none !important;
+    font: 400 16px var(--font); color: var(--ink);
+    margin-bottom: 20px; outline: none;
+}
+.mb-login-input:focus { border-bottom-color: var(--ink) !important; box-shadow: none !important; }
+.mb-login-pin { font: 400 20px var(--font); letter-spacing: 12px; }
+.mb-login-label { font-size: 11.5px; font-weight: 600; color: var(--g1); letter-spacing: 0.5px; text-transform: uppercase; }
+.mb-login-step2head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 16px; font-size: 13px; color: var(--g1); }
+#loginEmailDisplay { color: var(--ink); font-weight: 500; }
+.mb-login-error { color: var(--red2); font-size: 13px; min-height: 16px; margin-bottom: 10px; }
+.mb-login-btn {
+    width: 100%; padding: 17px; border: none; border-radius: 2px;
+    background: var(--btn); color: var(--btnfg);
+    font: 600 14px var(--font); cursor: pointer; margin-top: 14px;
+}
+.mb-login-btn:active { opacity: 0.85; }
+.mb-login-back {
+    width: 100%; margin-top: 10px; padding: 12px;
+    border: none; background: none; color: var(--g1);
+    font: 500 12.5px var(--font); cursor: pointer;
+}
+
+/* --- tutorial: bottom-sheet + oranje highlight-ring --- */
+#mbTut { position: fixed; inset: 0; z-index: 99900; }
+#mbTutScrim { position: absolute; inset: 0; background: rgba(38, 51, 75, 0.55); animation: mbDim 0.25s ease-out; }
+#mbTutRing {
+    position: fixed; box-sizing: border-box; display: none;
+    border: 2px solid #F99D3E; border-radius: 12px;
+    box-shadow: 0 0 0 9999px rgba(38, 51, 75, 0.55);
+    pointer-events: none;
+    transition: top 0.35s cubic-bezier(0.22, 1, 0.36, 1), left 0.35s cubic-bezier(0.22, 1, 0.36, 1),
+                width 0.35s cubic-bezier(0.22, 1, 0.36, 1), height 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+#mbTutSheet {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    background: var(--bg); border-radius: 18px 18px 0 0;
+    padding: 18px 24px calc(24px + var(--safe-bottom, 0px));
+    animation: mbSheet 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+    box-shadow: 0 -8px 30px rgba(38, 51, 75, 0.18);
+}
+.mb-tuthdr { display: flex; align-items: center; justify-content: space-between; }
+.mb-tutkicker { font-size: 11px; font-weight: 600; letter-spacing: 1.5px; color: #F99D3E; }
+.mb-tutclose {
+    width: 28px; height: 28px; border: none; border-radius: 50%;
+    background: var(--wash); color: var(--g2); cursor: pointer; font-size: 13px;
+}
+#mbTutBody { animation: mbUp 0.3s cubic-bezier(0.22, 1, 0.36, 1); min-height: 96px; }
+.mb-tuttitle { font: 400 21px var(--font); letter-spacing: -0.5px; color: var(--ink); margin: 12px 0 8px; }
+.mb-tuttext { font-size: 13.5px; line-height: 1.62; color: var(--txt2); }
+.mb-tutdots { display: flex; align-items: center; gap: 6px; margin: 14px 0 16px; }
+.mb-tutdot { width: 6px; height: 6px; border-radius: 3px; background: var(--b2); cursor: pointer; transition: all 0.3s; }
+.mb-tutdot.on { width: 22px; background: #F99D3E; }
+.mb-tuttour {
+    width: 100%; margin-bottom: 10px; padding: 12px;
+    border: 1px dashed #F99D3E; border-radius: 2px; background: none;
+    color: var(--amber2); font: 600 12.5px var(--font); cursor: pointer;
+}
+.mb-tutbtns { display: flex; gap: 10px; }
+.mb-tutprev {
+    padding: 14px 22px; border: 1px solid var(--b1); border-radius: 2px;
+    background: none; color: var(--g2); font: 600 13px var(--font); cursor: pointer;
+}
+.mb-tutnext {
+    flex: 1; padding: 14px; border: none; border-radius: 2px;
+    background: var(--btn); color: var(--btnfg); font: 600 13.5px var(--font); cursor: pointer;
+}
+
+/* =========================================================
+   16 · KLOK / PROFIEL / UITKLOK-OVERLAYS (v267)
+   + fix: login boven de bottom-nav
+   ========================================================= */
+
+/* --- login moet ALLES afdekken (nav + header waren zichtbaar) --- */
+#loginScreen.mb-login { z-index: 99940; }
+
+/* --- prototype-wash-tokens die de basislaag nog niet had --- */
+:root {
+    --awash:    #F7F1E4;
+    --aborder:  #EADFC6;
+    --awash2:   #F7E9D8;
+    --aborder2: #E9CBA6;
+    --ambertxt: #6B5B3E;
+    --gwash:    #EDF3EE;
+    --gborder1: #BBD8C5;
+    --gborder2: #CFE0D3;
+    --pwash:    #F4EFF8;
+    --pborder:  #D9CFE4;
+    --rwash:    rgba(180, 55, 47, 0.10);
+    --wash2:    #EDEBE4;
+}
+body.dark-mode {
+    --awash:    #2F2A1E;
+    --aborder:  #504733;
+    --awash2:   #332B20;
+    --aborder2: #5A4B2F;
+    --ambertxt: #C4B491;
+    --gwash:    #242B25;
+    --gborder1: #3C4F41;
+    --gborder2: #3C4F41;
+    --pwash:    #2C2531;
+    --pborder:  #4A3D57;
+    --rwash:    #332423;
+    --wash2:    #31322C;
+}
+
+/* --- extra prototype-keyframes (vrijdag/NFC) --- */
+@keyframes mbRipple  { 0% { transform: scale(0.72); opacity: 0.7; } 100% { transform: scale(2.05); opacity: 0; } }
+@keyframes mbConf    { 0% { transform: translateY(-30px) rotate(0deg); opacity: 0; } 8% { opacity: 1; } 100% { transform: translateY(105vh) rotate(300deg); opacity: 0; } }
+@keyframes mbStar    { 0%, 100% { opacity: 0.15; transform: scale(0.8); } 50% { opacity: 0.9; transform: scale(1.15); } }
+@keyframes mbSun     { from { transform: translate(-50%, 84px); } to { transform: translate(-50%, 14px); } }
+@keyframes mbSunGlow { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.65; } }
+@keyframes mbRays    { to { transform: rotate(360deg); } }
+@keyframes mbFriBtn  { from { opacity: 0; } to { opacity: 1; } }
+
+/* --- profiel: Marble-rijen in gegroepeerde kaarten --- */
+.mb-prowcard { border-radius: 14px; }
+.mb-prow {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    padding: 14px 0; border-bottom: 1px solid var(--l2); cursor: pointer;
+}
+.mb-prow:active { opacity: 0.75; }
+.mb-prow-t { font-size: 14px; font-weight: 600; color: var(--ink); }
+.mb-prow-s { font-size: 12px; color: var(--g1); margin-top: 1px; }
+.mb-prow-arrow { color: var(--g1); flex-shrink: 0; }
+.mb-minibtn {
+    padding: 8px 14px; border: 1px solid var(--b1); border-radius: 2px;
+    background: none; color: var(--g2); font: 500 12px var(--font); cursor: pointer; flex-shrink: 0;
+}
+.mb-minibtn:active { background: var(--wash); }
+.mb-avatar56.profile-photo {
+    width: 56px !important; height: 56px !important;
+    border: 1px solid var(--b1) !important; background: var(--wash) !important;
+    font: 500 20px var(--font);
+}
+.mb-avatar56 .profile-photo-fallback { font-size: 20px; color: var(--g1); }
+.mb-pininput {
+    width: 100%; box-sizing: border-box; padding: 12px; margin-bottom: 8px;
+    border: 1px solid var(--b1); border-radius: 8px; background: none;
+    font: 500 15px var(--font); text-align: center; letter-spacing: 6px;
+    color: var(--ink); outline: none;
+}
+
+/* --- uitklok-overlays: dagoverzicht (weekdag) + vrijdag --- */
+#mbDay, #mbFri {
+    position: fixed; inset: 0; z-index: 99985;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    animation: mbDim 0.4s ease-out; cursor: pointer; overflow: hidden;
+}
+#mbDay { background: linear-gradient(180deg, #26334B, #3A3450); }
+#mbFri { background: linear-gradient(180deg, #1B2438 0%, #26334B 55%, #3A3450 100%); }
+.mb-daycircle {
+    width: 104px; height: 104px; border-radius: 50%;
+    background: rgba(255, 255, 255, 0.1); border: 1.5px solid rgba(255, 255, 255, 0.3);
+    display: flex; align-items: center; justify-content: center; margin-bottom: 22px;
+    animation: mbScale 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.mb-daytitle { font: 400 30px var(--font); letter-spacing: -1px; color: #fff; animation: mbUp 0.55s cubic-bezier(0.22, 1, 0.36, 1) 0.35s both; }
+.mb-daysub { font-size: 13.5px; color: rgba(255, 255, 255, 0.65); margin-top: 8px; text-align: center; padding: 0 34px; line-height: 1.6; animation: mbUp 0.55s cubic-bezier(0.22, 1, 0.36, 1) 0.5s both; }
+.mb-dayline { width: 52px; height: 2px; background: linear-gradient(90deg, #F99D3E, #6A2C91); margin-top: 24px; transform-origin: center; animation: mbLine 0.6s ease-out 0.9s both; }
+.mb-dayhint { font-size: 11.5px; color: rgba(255, 255, 255, 0.4); margin-top: 16px; animation: mbFriBtn 0.8s ease-out 1.6s both; }
+#mbFriDeco { position: absolute; inset: 0; pointer-events: none; }
+.mb-star { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: #fff; animation: mbStar 2s ease-in-out infinite; }
+.mb-conf { position: absolute; top: -20px; border-radius: 2px; animation-name: mbConf; animation-timing-function: linear; animation-iteration-count: infinite; }
+.mb-frisun { position: relative; width: 220px; height: 110px; overflow: hidden; margin-bottom: 26px; }
+.mb-frisun-glow {
+    position: absolute; left: 50%; bottom: 0; transform: translate(-50%, 14px);
+    width: 170px; height: 170px; border-radius: 50%;
+    background: radial-gradient(circle, rgba(249, 157, 62, 0.55), transparent 65%);
+    filter: blur(10px); animation: mbSunGlow 3s ease-in-out infinite;
+}
+.mb-frisun-rays { position: absolute; left: 50%; bottom: -96px; width: 190px; height: 190px; margin-left: -95px; animation: mbRays 26s linear infinite; opacity: 0.5; }
+.mb-frisun-ball {
+    position: absolute; left: 50%; bottom: 0; width: 76px; height: 76px; border-radius: 50%;
+    background: linear-gradient(180deg, #F9B25E, #E88A2A);
+    animation: mbSun 1.6s cubic-bezier(0.22, 1, 0.36, 1) 0.3s both;
+}
+.mb-frisun-hor { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: rgba(255, 255, 255, 0.3); }
+.mb-fritit { font: 400 32px var(--font); letter-spacing: -1px; color: #fff; animation: mbUp 0.6s cubic-bezier(0.22, 1, 0.36, 1) 1s both; text-align: center; padding: 0 24px; }
+.mb-frisub { font-size: 13.5px; color: rgba(255, 255, 255, 0.65); margin-top: 8px; text-align: center; padding: 0 34px; line-height: 1.6; animation: mbUp 0.6s cubic-bezier(0.22, 1, 0.36, 1) 1.25s both; }
+.mb-friline { animation-delay: 2s; }
+.mb-frihint { animation-delay: 2.4s; }
+
+/* --- NFC-scanoverlay ("Even geduld…") → navy fullscreen met ripple --- */
+#scanLoading.qe-scan-backdrop { background: rgba(38, 51, 75, 0.96) !important; }
+#scanLoading .qe-scan-card {
+    background: none !important; box-shadow: none !important; border: none !important;
+    max-width: none !important;
+}
+#scanLoading .qe-scan-icon-wrap {
+    position: relative; color: #F99D3E !important;
+    width: 74px !important; height: 74px !important; margin: 0 auto 24px;
+    border: 1.5px solid rgba(255, 255, 255, 0.25) !important; border-radius: 50% !important;
+    display: flex; align-items: center; justify-content: center;
+    background: none !important;
+}
+#scanLoading .qe-scan-icon-wrap::before,
+#scanLoading .qe-scan-icon-wrap::after {
+    content: ''; position: absolute; inset: -23px; border-radius: 50%;
+    border: 1.5px solid rgba(249, 157, 62, 0.55);
+    animation: mbRipple 1.6s ease-out infinite;
+}
+#scanLoading .qe-scan-icon-wrap::after { animation-delay: 0.55s; }
+#scanLoading .qe-scan-title { color: #fff !important; font: 400 26px var(--font) !important; letter-spacing: -0.5px !important; }
+#scanLoading .qe-scan-msg { color: rgba(255, 255, 255, 0.75) !important; }
+#scanLoading .qe-scan-sub { color: rgba(255, 255, 255, 0.55) !important; }
+
+/* --- klok: hero-kaart en week-lijst in dark-mode netjes --- */
+body.dark-mode #clockHeroCard { background: var(--card); }
+#clockHistory .card { border: 1px solid var(--cb); }
+
+/* --- FAB "Nieuwe werkbon" (techniekers): navy Marble i.p.v. oud donkerblauw --- */
+#newWoFab {
+    background: var(--btn) !important;
+    color: var(--btnfg) !important;
+    border-radius: 16px !important;
+    box-shadow: var(--shadow-lg) !important;
+}
+
+/* --- bevestigings-modal (clock.js _showConfirmModal): Marble-kaart --- */
+.qe-confirm-card { font-family: var(--font); border: 1px solid var(--cb); }
+.qe-confirm-card #qeModalOk { border-radius: 2px !important; font-family: var(--font); }
+.qe-confirm-card #qeModalCancel { border-radius: 2px !important; font-family: var(--font); }
+
+/* --- km-bevestigingsscherm (fullscreen): Marble-inputs + veilige onderrand --- */
+#kmPromptModal input[type="number"] { border-color: var(--b1) !important; background: var(--card); color: var(--ink); }
+#kmPromptModal label { color: var(--g1) !important; }
+#kmPromptModal #kmPromptSubmit { font-family: var(--font); }
+#kmPromptModal > div > div:last-child { padding-bottom: calc(20px + var(--safe-bottom, 0px)) !important; }
+
+/* --- v278: Aanvragen-tab — sub-tabs, tellers, placeholder --- */
+.mb-subtabs {
+    display: flex; gap: 6px; margin-bottom: 16px;
+    border-bottom: 1px solid var(--l1); padding-bottom: 0;
+}
+.mb-subtab {
+    background: none; border: none; cursor: pointer;
+    padding: 6px 2px 11px; margin-right: 14px;
+    font: 600 14px var(--font); color: var(--g3);
+    position: relative;
+}
+.mb-subtab.active { color: var(--ink); }
+.mb-subtab.active::after {
+    content: ''; position: absolute; left: 0; right: 0; bottom: -1px;
+    height: 2px; background: var(--accent);
+}
+.mb-count {
+    display: inline-block; font-size: 11px; font-weight: 700;
+    color: #fff; background: var(--accent); border-radius: 10px;
+    padding: 1px 7px; margin-left: 4px; vertical-align: 1px;
+}
+.mb-placeholder {
+    text-align: center; color: var(--g1); font-size: 13.5px;
+    padding: 40px 24px; line-height: 1.6;
+    border: 1px dashed var(--b2); border-radius: 14px; background: var(--wash);
+}
+
+/* --- aanpassing-aanvraag: reden-rijen selecteren in ink (motor zet paars;
+       deze overrides winnen van de inline JS-styles) — prototype reqReasons --- */
+#aanpassingRedenen .aanp-reden { border-color: var(--cb) !important; background: var(--card); }
+#aanpassingRedenen .aanp-reden.sel { border-color: var(--ink) !important; background: var(--wash) !important; }
+#aanpassingRedenen .aanp-dot { border-color: var(--b2) !important; }
+#aanpassingRedenen .aanp-reden.sel .aanp-dot {
+    border-color: var(--ink) !important;
+    background: var(--btn) !important;
+    box-shadow: inset 0 0 0 3px var(--card) !important;
+}
+
+/* ============================================================
+   17. TOEGANKELIJKHEID (v280) — schaal, vet, contrast, minder
+   beweging, kleurvriendelijk palet + kleurcorrectie. Alles wordt
+   aangestuurd door body-classes uit app._applyA11y(); zonder die
+   classes verandert er niets. De oude werf-modus is opgegaan in
+   de schaal "Groot" (zelfde zoom ×1,12).
+   ============================================================ */
+
+/* Tekst- & knopgrootte */
+body.a11y-scale-groot { zoom: 1.12; }
+body.a11y-scale-xl    { zoom: 1.28; }
+
+/* Vetgedrukte tekst — normale tekst zwaarder, kop/nadruk extra zwaar */
+body.a11y-bold, body.a11y-bold * { font-weight: 600 !important; }
+body.a11y-bold h1, body.a11y-bold h2, body.a11y-bold h3,
+body.a11y-bold strong, body.a11y-bold b { font-weight: 800 !important; }
+
+/* Hoog contrast — donkerder secundaire tekst + zichtbare kaartranden */
+body.a11y-contrast { --g1: #2c2c28; --b1: #7d7a70; }
+body.dark-mode.a11y-contrast { --g1: #dad8cf; --b1: #6d6d66; }
+body.a11y-contrast .card { border: 1px solid var(--b1); }
+
+/* Minder beweging — animaties/overgangen praktisch uit */
+body.a11y-motion *, body.a11y-motion *::before, body.a11y-motion *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+}
+
+/* Kleurvriendelijk palet (Okabe-Ito): "groen" → blauw, "rood" →
+   vermiljoen — onderscheidbaar bij rood-groenblindheid. */
+body.a11y-cvd-palette {
+    --green2: #0072B2; --gwash: #DCEBF5;
+    --red2:   #D55E00; --rwash: #F6E1D3;
+    --qe-green: #0072B2; --qe-red: #D55E00;
+}
+
+/* Profiel-groepen: openklikbare accordeon-kaarten (v281) */
+.pg-group { margin-bottom: 12px; }
+.pg-group-head {
+    width: 100%; display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; cursor: pointer; border: none; text-align: left;
+    font: inherit; color: var(--ink);
+    -webkit-appearance: none; appearance: none;
+}
+.pg-group-title { font-size: 15px; font-weight: 600; }
+.pg-group-chev { font-size: 15px; color: var(--g1); flex-shrink: 0; line-height: 1; }
+.pg-group-body { margin-top: 8px; }
