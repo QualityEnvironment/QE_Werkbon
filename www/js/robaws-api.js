@@ -975,7 +975,8 @@ const RobawsAPI = {
     // Alleen de geëxpandeerde relatie-OBJECTEN + read-only audit-velden droppen.
     // De scalaire spiegel-ids (articleId/supplierId/assignedEmployeeId/
     // stockLocationId/…) BLIJVEN staan, zodat de koppelingen behouden blijven.
-    _MATERIEEL_PUT_DROP: ['article', 'supplier', 'assignedProject', 'assignedEmployee', 'assignedClient', 'assignedEndClient', 'assignedSubcontractor', 'stockLocation', 'company', '_metadata', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy', 'logicId'],
+    // v311-hotfix: 'logicId' UIT de drop-lijst (ontbreken = nummer gewist, 4 aug).
+    _MATERIEEL_PUT_DROP: ['article', 'supplier', 'assignedProject', 'assignedEmployee', 'assignedClient', 'assignedEndClient', 'assignedSubcontractor', 'stockLocation', 'company', '_metadata', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy'],
 
     /** Vervang de Reserveringen-extraField op een VERS opgehaald materiaal en PUT (opgeschoonde full-replace). */
     async _putMaterieelReserveringen(mat, arr) {
@@ -2177,11 +2178,17 @@ const RobawsAPI = {
         const body = { ...existing.data, ...updates };
         // Verwijder metadata velden die niet in PUT mogen
         delete body._metadata;
-        delete body.logicId;
         delete body.createdAt;
         delete body.updatedAt;
+        // v311-hotfix: logicId blijft in de body (ontbreken = nummer gewist, 4 aug).
         console.log('[RobawsAPI] Tijdsregistratie updaten:', id, JSON.stringify(updates));
-        return await this.put(`time-registrations/${id}`, body);
+        let tr = await this.put(`time-registrations/${id}`, body);
+        if (tr.code === 400 || tr.code === 422) {
+            const zonder = { ...body };
+            delete zonder.logicId;
+            tr = await this.put(`time-registrations/${id}`, zonder);
+        }
+        return tr;
     },
 
     /**
@@ -4698,8 +4705,13 @@ const RobawsAPI = {
                     delete body.updatedAt;
                     delete body.createdBy;
                     delete body.updatedBy;
-                    delete body.logicId;
-                    await this.put(`work-orders/${workOrderId}`, body);
+                    // v311-hotfix: logicId (werkbon-nummer) MOET mee — zie factuurnummers 4 aug.
+                    let sp = await this.put(`work-orders/${workOrderId}`, body);
+                    if (sp.code === 400 || sp.code === 422) {
+                        const zonder = { ...body };
+                        delete zonder.logicId;
+                        await this.put(`work-orders/${workOrderId}`, zonder);
+                    }
                 }
             } catch(e) { /* niet fataal */ }
         }
@@ -4834,8 +4846,17 @@ const RobawsAPI = {
             delete body.updatedAt;
             delete body.createdBy;
             delete body.updatedBy;
-            delete body.logicId;
-            const put = await this.put(`sales-invoices/${invoiceId}`, body);
+            // v311-hotfix (4 aug): logicId (factuurNUMMER) MOET mee — Robaws
+            // wist het nummer als het veld in de full-replace ontbreekt en
+            // deelt het daarna zelfs opnieuw uit. Huidige waarde terugsturen;
+            // weigert Robaws dat ooit (400/422): één herkansing zonder.
+            let put = await this.put(`sales-invoices/${invoiceId}`, body);
+            if (put.code === 400 || put.code === 422) {
+                const zonder = Object.assign({}, body);
+                delete zonder.logicId;
+                console.warn('[RobawsAPI] status-PUT met logicId geweigerd (' + put.code + ') — herkansing zonder');
+                put = await this.put(`sales-invoices/${invoiceId}`, zonder);
+            }
             if (put.code !== 200 && put.code !== 204) {
                 return { ok: false, error: 'status-PUT faalde (code ' + put.code + ')' };
             }
