@@ -56,7 +56,9 @@
         screenGoedkeuren:  { sub: 'Verlof · Facturen · Materieel', title: 'Goedkeuren' },
         screenFactuurDetail:{ sub: 'Aankoopfactuur goedkeuren', title: 'Factuur' },
         screenMaterieelDetail:{ sub: 'Reserveren & beschikbaarheid', title: 'Materieel' },
-        screenMaterieelAanvragen:{ sub: 'Jouw materieel-aanvragen', title: 'Vorige aanvragingen' }
+        screenMaterieelAanvragen:{ sub: 'Jouw materieel-aanvragen', title: 'Vorige aanvragingen' },
+        screenHandleiding: { sub: 'Alles over de app · typ om te zoeken', title: 'Handleiding' }
+        /* screenHandleidingH: hoofdstuk rendert zijn eigen Marble-kop */
         // screenDagoverzicht: kop wordt door loadDagoverzicht zelf gerenderd (maand + pijltjes)
         // detail/werkbon/betaal-schermen: hebben hun eigen kop
     };
@@ -173,6 +175,7 @@
             '    <div id="mbTutBody"><div class="mb-tuttitle" id="mbTutTitle"></div><div class="mb-tuttext" id="mbTutText"></div></div>' +
             '    <div class="mb-tutdots" id="mbTutDots"></div>' +
             '    <button class="mb-tuttour" id="mbTutTourBtn" onclick="QEMarble.startTour()">Volledige rondleiding door de app</button>' +
+            '    <button class="mb-tuttour" id="mbTutHlBtn" onclick="QEMarble.tutClose(); if (window.app && app.openHandleiding) app.openHandleiding();">Handleiding openen (doorzoekbaar)</button>' +
             '    <div class="mb-tutbtns">' +
             '      <button class="mb-tutprev" id="mbTutPrev" onclick="QEMarble.tutPrev()">Vorige</button>' +
             '      <button class="mb-tutnext" id="mbTutNext" onclick="QEMarble.tutNext()">Volgende</button>' +
@@ -193,7 +196,8 @@
             ['Je dagplanning', 'Hier staan de werkorders van vandaag, in volgorde van je route. Met de chips bovenaan wissel je van dag. Tik op een werkorder om hem te openen.', '#dateStrip'],
             ['Klok-status', 'De kaart bovenaan toont of je in- of uitgeklokt bent. Tik erop om naar het klokscherm te gaan.', '#clockStatusBar'],
             ['Bellen & navigeren', 'De knoppen op elke kaart bellen de klant of openen Google Maps — zonder de werkorder te openen.', '#workorderList'],
-            ['Badges', '"Regie" betekent tijd & materiaal aanrekenen. "In bewerking" wil zeggen dat je al uren of materiaal registreerde.', '#workorderList']
+            ['Badges', '"Regie" betekent tijd & materiaal aanrekenen. "In bewerking" wil zeggen dat je al uren of materiaal registreerde.', '#workorderList'],
+            ['Wacht', 'De balk met het schildje toont wie deze week de wacht heeft. Tik erop voor de komende weken. Heb jij de wacht, dan kleurt hij oranje.', '#wachtBanner']
         ] },
         screenDetail: { name: 'WERKORDER', steps: [
             ['Vier tabbladen', 'Info toont de klant en de taak, Uren registreert je tijd, Materiaal je artikels, en Foto’s je bewijsfoto’s.', '#detailTabs'],
@@ -205,6 +209,7 @@
         ] },
         screenWerkbon: { name: 'WERKBON', steps: [
             ['Controle', 'Controleer de uren (afgerond voor facturatie), materialen en het totaal incl. BTW.'],
+            ['Korting', 'Krijgt de klant korting? Tik onder het totaal op "+ Korting toevoegen" — percentage of een bedrag in euro (dat is wat de klant écht minder betaalt). De korting komt als aparte lijn op de factuur en het betaalbedrag past zich meteen aan.', '#btnWbKorting'],
             ['Geen factuur', 'Voor garantie of terugkomwerk vink je "Geen factuur maken" aan — de werkbon wordt dan zonder factuur verstuurd.', '#wbNoInvoice', 'label'],
             ['Betaalwijze', 'QR is het snelst: de klant scant en de betaling wordt direct bevestigd. Bancontact stuurt het bedrag rechtstreeks naar de betaalterminal. Overschrijving en cash kunnen ook.', '#wbPaymentMethodSection'],
             ['Ondertekenen', 'De knop onderaan opent de handtekening; daarna wordt alles naar Robaws gestuurd.']
@@ -220,7 +225,7 @@
         screenDagoverzicht: { name: 'MIJN UREN', steps: [
             ['Maandoverzicht', 'De cijfers bovenaan tellen je maand op; met de pijltjes blader je naar vorige maanden. Je komt hier via de knop op het Klok-scherm.', '#mbUrenStats'],
             ['Dagdetail', 'Elke rij is een dag met het type uren. Ziekte of verlof staat er ook tussen.'],
-            ['Aanpassing vragen', 'Klopt iets niet? Tik op de registratie en kies een reden ("Vergeten in te klokken", "Verkeerd tijdstip", …) — je aanvraag gaat als taak naar Vince.']
+            ['Aanpassing vragen', 'Klopt iets niet? Tik op de dag en kies een reden ("Vergeten in te klokken", "Verkeerd tijdstip", …) — je aanvraag gaat als taak naar Vince.']
         ] },
         screenUitgevoerd: { name: 'UITGEVOERD', steps: [
             ['Afgewerkte werkbonnen', 'De laatste 7 dagen, met uren, artikels en betaalstatus.', '#uitgevoerdList'],
@@ -272,9 +277,13 @@
             ['✓ Controleren', 'De wizard checkt e-mail, status, rol, login-koppeling en PIN van een werknemer — en repareert met één tik wat kan. "+ Nieuw" maakt een fiche en opent meteen die checklist.'],
             ['Robaws', 'Alles wordt live in Robaws bewaard. Alleen de login-gebruiker zelf maak je in Robaws-web aan (Instellingen → Gebruikers, veld "Werknemer" = de fiche).']
         ] },
+        screenHandleiding: { name: 'HANDLEIDING', steps: [
+            ['Zoeken', 'Typ twee letters of meer — je zoekt meteen door alle hoofdstukken, stappen, vragen en de woordenlijst. Tik een resultaat om er rechtstreeks naartoe te springen.', '#hlZoekInput'],
+            ['Hoofdstukken', 'Of blader gewoon: elk hoofdstuk legt één ding uit, stap voor stap, met vragen en antwoorden onderaan. Achteraan vind je de woordenlijst en het spiekbriefje.']
+        ] },
         screenUrenAnalyse: { name: 'UREN-ANALYSE', steps: [
             ['Maandmatrix', 'Per werknemer: werkuren, overuren, kilometers en afwezigheden — rechtstreeks uit de klok-registraties.', '#uaContent'],
-            ['Excel-export', 'De knop onderaan genereert het maandbestand voor de boekhouding. Alleen Levi & Vince zien dit scherm.', '#uaActions']
+            ['Excel-export', 'Onderaan twee knoppen: Excel op dit toestel, of "Naar Robaws (PC)" — dan staat het bestand meteen als document op je werknemersfiche, klaar om op de computer te openen. Alleen Levi & Vince zien dit scherm.', '#uaActions']
         ] }
     };
     var TOUR_BASE = ['screenPlanning', 'screenClock', 'screenDagoverzicht', 'screenUitgevoerd', 'screenAanvragen', 'screenProfile'];
@@ -320,6 +329,8 @@
         }
         document.getElementById('mbTutDots').innerHTML = dots;
         document.getElementById('mbTutTourBtn').style.display = tut.full ? 'none' : 'block';
+        var hlBtn = document.getElementById('mbTutHlBtn');
+        if (hlBtn) hlBtn.style.display = tut.full ? 'none' : 'block';
         var atLast = tut.step >= cfg.steps.length - 1;
         document.getElementById('mbTutPrev').style.display = (tut.step > 0 || (tut.full && pos > 0)) ? 'inline-block' : 'none';
         document.getElementById('mbTutNext').textContent = !atLast ? 'Volgende'

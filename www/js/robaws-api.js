@@ -12,27 +12,218 @@ const RobawsAPI = {
     // === CACHE ===
     _articleCache: null,       // Alle artikelen (1x geladen)
     _articleCacheLoading: false,
-    API_KEY: 'KBM8UEKYPLHIXDHIQ1IL',
-    API_SECRET: 'xmFYgMmDi4xFLiPZy8qCslSKbCmSDIgIErmTWJZ5',
+    // v336 — CUTOVER: geen sleutels meer in de bundel. Ál het verkeer draait
+    // op de ALGEMENE key uit de Worker-kluis (apikey:standaard = het API-only
+    // account met admin-rol), opgehaald bij de login en bewaard in
+    // localStorage `qe_api_alg`. De persoonlijke kluis-key blijft de
+    // handtekening voor goedkeuren/mailen. Deze twee velden blijven bestaan
+    // als noodklep: vul ze alleen tijdelijk in als de kluis onbereikbaar is.
+    API_KEY: '',
+    API_SECRET: '',
 
-    // Eén gedeelde API-key voor de hele app (per-werknemer keys teruggedraaid).
-    USER_API_KEYS: {},
+    // v315: per-werknemer API-keys uit de WORKER-KLUIS (Cloudflare KV) — er
+    // staan geen persoonlijke keys in code of bundel. Bij het inloggen
+    // controleert de Worker e-mail + PIN en geeft hij de eigen key terug;
+    // die bewaren we in localStorage zodat de app offline blijft starten.
+    // v330 — HYBRIDE MODEL: de persoonlijke key is alléén nog de
+    // HANDTEKENING voor goedkeuren/afkeuren (_personalFetch); ál het andere
+    // verkeer loopt op de gedeelde API_KEY hieronder (volle rechten, replica,
+    // 20k-maatwerklimiet). Persoonlijke keys hebben dus enkel het
+    // goedkeuringen-recht nodig — géén werknemers-/planning-/facturen-rechten
+    // (en de werknemer ziet in Robaws-web dus ook niets extra).
+    USER_API_KEYS: {},          // legacy (leeg laten — keys komen uit de Worker, nooit uit code)
+    WORKER_AUTH_URL: 'https://qe-mollie-webhook.levi-957.workers.dev',
     _activeKey: null,
     _activeSecret: null,
-    setActiveCredentialsFor(email) {
-        const c = this.USER_API_KEYS[String(email || '').toLowerCase().trim()] || null;
-        this._activeKey = (c && c.key) || null;
-        this._activeSecret = (c && c.secret) || null;
+    _activeSoort: null,   // 'persoon' | 'rol' (v320) — alleen persoons-keys mogen goedkeuren
+    _algKey: null,        // v333: de ALGEMENE kluis-key = het API-account
+    _algSecret: null,     //       (monteurs+techniekers) — al het gewone verkeer
+    _credRestoreDone: false,
+    setActiveCredentials(key, secret, email, soort) {
+        this._activeKey = key || null;
+        this._activeSecret = secret || null;
+        this._activeSoort = soort || 'persoon';
+        this._credRestoreDone = true;
+        try {
+            if (key && secret) {
+                localStorage.setItem('qe_api_cred', JSON.stringify({ email: String(email || '').toLowerCase().trim(), key, secret, soort: this._activeSoort }));
+            }
+        } catch (_e) {}
     },
-    clearActiveCredentials() {
+    /** v333: algemene key (API-account uit de kluis, apikey:standaard) —
+     *  vervangt Rolfs bundel-key voor ál het gewone verkeer. */
+    setAlgemeneCredentials(key, secret) {
+        this._algKey = key || null;
+        this._algSecret = secret || null;
+        try {
+            if (key && secret) localStorage.setItem('qe_api_alg', JSON.stringify({ key, secret }));
+        } catch (_e) {}
+    },
+    clearAlgemeneCredentials(wipeStorage) {
+        this._algKey = null;
+        this._algSecret = null;
+        if (wipeStorage) { try { localStorage.removeItem('qe_api_alg'); } catch (_e) {} }
+    },
+    setActiveCredentialsFor(email) {  // legacy-naam; werkt alleen nog op de (lege) map
+        const c = this.USER_API_KEYS[String(email || '').toLowerCase().trim()] || null;
+        if (c) this.setActiveCredentials(c.key, c.secret, email);
+    },
+    clearActiveCredentials(wipeStorage) {
         this._activeKey = null;
         this._activeSecret = null;
+        this._activeSoort = null;
+        this._credRestoreDone = true;
+        if (wipeStorage) { try { localStorage.removeItem('qe_api_cred'); } catch (_e) {} }
     },
+    /** v316: is er een kluis-key actief (persoons- óf rol-key)? */
+    hasPersonalKey() {
+        this._authPair();  // triggert de lazy restore na een app-herstart
+        return !!this._activeKey;
+    },
+
+    /** v320: is er een PERSOONS-key actief? Alleen dan handelt de API als de
+     *  ingelogde gebruiker zelf — vereist voor goedkeuren. Een rol-key
+     *  (API Monteur / API Technieker) telt hier bewust NIET mee. */
+    hasOwnKey() {
+        this._authPair();
+        return !!this._activeKey && this._activeSoort !== 'rol';
+    },
+
+    /** v318/v330: KLUIS-ZELFTEST. Sinds het hybride model (v330) loopt al het
+     *  gewone verkeer op de gedeelde key — de persoonlijke key is alleen nog
+     *  de handtekening voor goedkeuringen. De test proeft dus:
+     *  (a) de GEDEELDE key op de kernmodules, en
+     *  (b) de PERSOONLIJKE key alléén op approval-requests (het enige recht
+     *      dat een persoonlijke key nodig heeft).
+     *  Handmatig aanroepen kan altijd via de console: RobawsAPI.kluisZelftest() */
+    async kluisZelftest() {
+        const user = this.getLoggedInUser && this.getLoggedInUser();
+        const empId = (user && user.robawsEmployeeId) || '1';
+        const probes = [
+            ['fiche (werknemers lezen)', `employees/${empId}`],
+            ['planning',                 `planning-items?employeeId=${empId}&limit=1&sort=startDate:desc`],
+            ['artikels',                 'articles?limit=1'],
+            ['verkoopfacturen',          'sales-invoices?limit=1'],
+        ];
+        const out = [];
+        const algBron = this.isApiAccountActief() ? 'API-account (kluis)' : 'bundel-key (OVERGANGSMODUS — Rolfs account!)';
+        console.log('[Kluis-zelftest] start — hybride model: gewoon verkeer = ' + algBron
+            + (this.hasPersonalKey() ? ', eigen key = handtekening (goedkeuren/mailen)' : ', geen eigen key'));
+        out.push('[algemeen] ' + algBron);
+        for (const [naam, ep] of probes) {
+            try {
+                const r = await this.get(ep, { bypassCache: true });  // gedeelde key, live + vers
+                out.push('[gedeeld] ' + naam + ' → ' + r.code + (r.code === 200 ? ' ✓' : ' ✗'));
+            } catch (e) {
+                out.push('[gedeeld] ' + naam + ' → FOUT: ' + ((e && e.message) || '?'));
+            }
+            await new Promise(r => setTimeout(r, 400));  // rustig aan (burst)
+        }
+        // Persoonlijke key: alleen de identiteits-rechten testen
+        // (goedkeuren + mailen — v332: mails vertrekken ook op eigen naam).
+        if (this.hasPersonalKey()) {
+            try {
+                const r = await this._personalFetch('GET', 'approval-requests?limit=1');
+                out.push('[eigen key] goedkeuringen → ' + r.code + (r.code === 200 ? ' ✓ (beslissen op eigen naam werkt)' : ' ✗ — key mist het goedkeuringen-recht'));
+            } catch (e) {
+                out.push('[eigen key] goedkeuringen → FOUT: ' + ((e && e.message) || '?'));
+            }
+            out.push('[eigen key] mails: vertrekken op eigen naam; mist de key het mail-recht dan valt de app terug op het kantoor-account (zie console bij het versturen)');
+        }
+        // v319: rate-headers — daglimiet-tegoed van de gedeelde key.
+        try {
+            const rs = this.getRateStats();
+            const f = (s) => s ? (s.remaining + ' van ' + s.limit + ' over') : 'geen meting';
+            out.push('tegoed live: ' + f(rs.live) + ' · replica: ' + f(rs.replica));
+        } catch (_e) {}
+        console.log('[Kluis-zelftest] resultaat:\n  ' + out.join('\n  '));
+        return out;
+    },
+
     _authPair() {
+        if (!this._credRestoreDone) {
+            // Lazy restore na een app-herstart: eigen key terugzetten als hij
+            // bij de ingelogde gebruiker hoort (offline-start blijft werken).
+            this._credRestoreDone = true;
+            try {
+                const raw = localStorage.getItem('qe_api_cred');
+                if (raw) {
+                    const c = JSON.parse(raw);
+                    const u = JSON.parse(localStorage.getItem('qe_user') || 'null');
+                    const em = u ? String(u.email || '').toLowerCase().trim() : '';
+                    if (c && c.key && c.secret && (!em || em === String(c.email || '').toLowerCase().trim())) {
+                        this._activeKey = c.key;
+                        this._activeSecret = c.secret;
+                        this._activeSoort = c.soort || 'persoon';
+                    }
+                }
+            } catch (_e) {}
+        }
+        // v330 — HYBRIDE SLEUTELS: al het gewone verkeer loopt ALTIJD op de
+        // ALGEMENE key; de persoonlijke kluis-key is enkel nog een
+        // HANDTEKENING voor identiteits-acties (goedkeuren/mailen) via
+        // _personalPair(). Zo hoeven persoonlijke keys géén werknemers-/
+        // lees-rechten meer — en zien werknemers in Robaws-web niets extra.
+        // v333 (regel Levi): de algemene key = het API-ACCOUNT uit de kluis
+        // (apikey:standaard, komt bij elke login mee als `algemeen`) — NOOIT
+        // Rolfs account. De bundel-key hieronder is alleen nog de terugval
+        // zolang de kluis geen standaard-entry heeft of vóór de eerste login
+        // op een nieuwe Worker (overgangsmodus).
+        if (!this._algKey) {
+            try {
+                const a = JSON.parse(localStorage.getItem('qe_api_alg') || 'null');
+                if (a && a.key && a.secret) { this._algKey = a.key; this._algSecret = a.secret; }
+            } catch (_e) {}
+        }
+        // v336: zonder kluis-key én zonder noodklep-key kán er niets werken —
+        // één duidelijke waarschuwing i.p.v. mysterieuze 401's.
+        if (!this._algKey && !this.API_KEY && !this._geenKeyGemeld) {
+            this._geenKeyGemeld = true;
+            console.warn('[RobawsAPI] GEEN API-key actief — log opnieuw in zodat de app de sleutel uit de kluis kan ophalen.');
+        }
         return {
-            key: this._activeKey || this.API_KEY,
-            secret: this._activeSecret || this.API_SECRET,
+            key: this._algKey || this.API_KEY,
+            secret: this._algSecret || this.API_SECRET,
         };
+    },
+
+    /** v333: draait het gewone verkeer op het API-account (kluis) of nog op
+     *  de bundel-key (Rolfs account — overgangsmodus)? */
+    isApiAccountActief() {
+        this._authPair();
+        return !!this._algKey;
+    },
+
+    /** v330: de persoonlijke kluis-key (of null) — alleen voor acties waar
+     *  de identiteit van de beslisser telt. */
+    _personalPair() {
+        this._authPair();  // triggert de lazy restore
+        if (!this._activeKey || !this._activeSecret) return null;
+        return { key: this._activeKey, secret: this._activeSecret, soort: this._activeSoort };
+    },
+
+    /** v330: request met de PERSOONLIJKE key (live, nooit replica — replica
+     *  is een per-key-recht dat persoonlijke keys niet hebben, v316-les).
+     *  Retourneert {code, data} zoals get/post. */
+    async _personalFetch(method, endpoint, body) {
+        const p = this._personalPair();
+        if (!p) throw new Error('geen persoonlijke key actief');
+        const headers = {
+            'Authorization': 'Basic ' + btoa(p.key + ':' + p.secret),
+            'X-Tenant': this.TENANT,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        };
+        const opts = { method, headers };
+        if (body !== undefined) opts.body = JSON.stringify(body);
+        let res = await this._fetchWithTimeout(this.BASE_URL + '/' + endpoint, opts);
+        if (res.status === 429) {  // burst per key — één herkansing
+            await new Promise(r => setTimeout(r, 1200));
+            res = await this._fetchWithTimeout(this.BASE_URL + '/' + endpoint, opts);
+        }
+        let data = null;
+        try { data = await res.json(); } catch (_e) {}
+        return { code: res.status, data: (data && data.data !== undefined) ? data.data : data };
     },
     TENANT: 'qualityenvironment',
 
@@ -200,18 +391,25 @@ const RobawsAPI = {
         }
         return this._replicaExhaustedUntil;
     },
-    _markReplicaExhausted(res) {
+    _markReplicaExhausted(res, status) {
         let ms = 30 * 60 * 1000;   // vangnet als de rate-limit-headers niet leesbaar zijn
-        try {
-            const h = res && res.headers;
-            const remaining = h ? parseInt(h.get('X-RateLimit-Daily-Remaining'), 10) : NaN;
-            const reset = h ? parseInt(h.get('X-RateLimit-Daily-Reset'), 10) : NaN;
-            if (remaining > 0) ms = 60 * 1000;   // burst-429 (gedeelde sec-teller), geen dag-uitputting
-            else if (reset > 0) ms = Math.min(reset * 1000, 24 * 60 * 60 * 1000);
-        } catch (_e) {}
+        if (status === 401 || status === 403) {
+            // v316: deze KEY mag (nog) niet op de replica-pool — dat is een
+            // per-key-recht bij Robaws (gezien bij persoonlijke kluis-keys).
+            // Lang blokkeren: dit lost een dagreset niet op.
+            ms = 12 * 60 * 60 * 1000;
+        } else {
+            try {
+                const h = res && res.headers;
+                const remaining = h ? parseInt(h.get('X-RateLimit-Daily-Remaining'), 10) : NaN;
+                const reset = h ? parseInt(h.get('X-RateLimit-Daily-Reset'), 10) : NaN;
+                if (remaining > 0) ms = 60 * 1000;   // burst-429 (gedeelde sec-teller), geen dag-uitputting
+                else if (reset > 0) ms = Math.min(reset * 1000, 24 * 60 * 60 * 1000);
+            } catch (_e) {}
+        }
         this._replicaExhaustedUntil = Date.now() + ms;
         try { localStorage.setItem(this._REPLICA_LS_KEY, String(this._replicaExhaustedUntil)); } catch (_e) {}
-        console.warn('[RobawsAPI] Replica-pool gaf 429 → lees-calls ' + Math.round(ms / 60000) + ' min via live');
+        console.warn('[RobawsAPI] Replica-pool gaf ' + (status || 429) + ' → lees-calls ' + Math.round(ms / 60000) + ' min via live');
     },
 
     // (v306 / 1.x v301) Laatst geziene rate-limit-headers per pool — liften
@@ -242,9 +440,29 @@ const RobawsAPI = {
         if (useReplica) headers['Database-Mode'] = 'replica';
         let res = await this._fetchWithTimeout(url, { headers });
         this._captureRateHeaders(res, useReplica ? 'replica' : 'live');
-        if (useReplica && res.status === 429) {
-            // Replica-pool op (of burst): markeren + dezelfde call via live.
-            this._markReplicaExhausted(res);
+        if (useReplica && (res.status === 429 || res.status === 401 || res.status === 403)) {
+            // 429 = replica-pool op (of burst) · 401/403 = deze key mag (nog)
+            // niet op de replica (per-key-recht; persoonlijke kluis-keys!).
+            // In beide gevallen: markeren + dezelfde call via live.
+            this._markReplicaExhausted(res, res.status);
+            res = await this._fetchWithTimeout(url, { headers: this.getHeaders() });
+            this._captureRateHeaders(res, 'live');
+        }
+        if (res.status === 401 && this._activeKey && !this._personalKeyWarned) {
+            // v316: eigen kluis-key wordt ook op LIVE geweigerd → foute
+            // key/secret in de KV-entry. Eén keer melden, terugvallen op de
+            // gedeelde key en de call herhalen zodat de app blijft werken.
+            this._personalKeyWarned = true;
+            console.error('[RobawsAPI] Eigen API-key geweigerd (401) — terugval op de gedeelde key; controleer de kluis-entry');
+            try { if (window.app && app.toast) app.toast('Je eigen API-key wordt geweigerd — controleer de kluis-entry. De app gebruikt tijdelijk de gedeelde key.', true); } catch (_e) {}
+            this.clearActiveCredentials(true);
+            res = await this._fetchWithTimeout(url, { headers: this.getHeaders() });
+            this._captureRateHeaders(res, 'live');
+        }
+        if (res.status === 429) {
+            // v318: burst-429 op live (seconde-teller per key) — de app-start
+            // vuurt veel reads tegelijk af. Even ademen en 1× herhalen.
+            await new Promise(r => setTimeout(r, 1200));
             res = await this._fetchWithTimeout(url, { headers: this.getHeaders() });
             this._captureRateHeaders(res, 'live');
         }
@@ -298,12 +516,26 @@ const RobawsAPI = {
     async post(endpoint, body) {
         this._invalidateCache(endpoint);   // v184: cache van het betrokken record wissen
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
-        const res = await this._fetchWithTimeout(url, {   // v207: timeout
+        let res = await this._fetchWithTimeout(url, {   // v207: timeout
             method: 'POST',
             headers: this.getHeaders(),
             body: JSON.stringify(body),
         });
         this._captureRateHeaders(res, 'live');
+        if (res.status === 429) {
+            // v324: burst-429 (seconde-teller per key) — 1× ademen en herhalen.
+            // Een 429 is per definitie NIET verwerkt, dus geen dubbele-write-
+            // risico (timeouts/5xx herhalen we bewust NIET). De uitklok vuurt
+            // 6-12 writes in enkele seconden — dit was dé bron van "werkuren
+            // POST (429)"-fouten, zeker rond 16u op de gedeelde veldwerk-key.
+            await new Promise(r => setTimeout(r, 1200));
+            res = await this._fetchWithTimeout(url, {
+                method: 'POST',
+                headers: this.getHeaders(),
+                body: JSON.stringify(body),
+            });
+            this._captureRateHeaders(res, 'live');
+        }
         // 204 No Content of lege body veilig afhandelen
         if (res.status === 204) return { code: 204, data: null };
         const txt = await res.text();
@@ -318,12 +550,22 @@ const RobawsAPI = {
     async put(endpoint, body) {
         this._invalidateCache(endpoint);   // v184: cache van het betrokken record wissen
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
-        const res = await this._fetchWithTimeout(url, {   // v207: timeout
+        let res = await this._fetchWithTimeout(url, {   // v207: timeout
             method: 'PUT',
             headers: this.getHeaders(),
             body: JSON.stringify(body),
         });
         this._captureRateHeaders(res, 'live');
+        if (res.status === 429) {
+            // v324: burst-429 — 1× herhalen (idempotent: 429 = niet verwerkt)
+            await new Promise(r => setTimeout(r, 1200));
+            res = await this._fetchWithTimeout(url, {
+                method: 'PUT',
+                headers: this.getHeaders(),
+                body: JSON.stringify(body),
+            });
+            this._captureRateHeaders(res, 'live');
+        }
         // PUT returns 204 No Content on success
         if (res.status === 204) return { code: 204, data: null };
         // BUG-fix: bij Cloudflare/HTML 502/504 crashte `await res.json()`
@@ -342,10 +584,18 @@ const RobawsAPI = {
     async del(endpoint) {
         this._invalidateCache(endpoint);
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
-        const res = await this._fetchWithTimeout(url, {
+        let res = await this._fetchWithTimeout(url, {
             method: 'DELETE',
             headers: this.getHeaders(),
         });
+        if (res.status === 429) {
+            // v324: burst-429 — 1× herhalen (idempotent: 429 = niet verwerkt)
+            await new Promise(r => setTimeout(r, 1200));
+            res = await this._fetchWithTimeout(url, {
+                method: 'DELETE',
+                headers: this.getHeaders(),
+            });
+        }
         if (res.status === 204) return { code: 204, data: null };
         const txt = await res.text();
         try {
@@ -513,21 +763,62 @@ const RobawsAPI = {
         return out;
     },
 
+    /** Eigenaar van de gedeelde API-sleutel (rolf@qe.be — het kantoor-account).
+     *  Robaws registreert élke accept/reject op DIT account; beslissen "namens"
+     *  iemand anders kan niet (live getest 10/7/2026: userId in body, query én
+     *  header worden genegeerd — 204 no-op; PATCH userStates → 403). */
+    KEY_OWNER_USER_ID: '2',
+
     /** Generiek: keur een approval-request goed (accept) of weiger (reject).
-     *  LET OP: de beslissing wordt geregistreerd op de gebruiker van de gedeelde
-     *  API-sleutel (kantoor), NIET op de ingelogde app-gebruiker — de accept/
-     *  reject-endpoints hebben geen per-gebruiker-veld. */
-    async decideApproval(approvalId, approve, reason) {
+     *  v330 — hybride sleutels:
+     *  - Is er een PERSOONS-key uit de kluis, dan beslissen we DAARMEE: de
+     *    API handelt dan als de ingelogde gebruiker zelf en de beslissing
+     *    komt op zíjn naam. Naverificatie op zijn eigen userState.
+     *  - Zonder eigen key geldt de oude Rolf-regel: de gedeelde key beslist
+     *    altijd als de sleutel-eigenaar (Rolf) — voor iedere andere
+     *    goedkeurder gooien we een duidelijke fout VÓÓR de POST (die zou een
+     *    stille no-op zijn). */
+    async decideApproval(approvalId, approve, reason, asUserId) {
         const action = approve ? 'accept' : 'reject';
-        const res = await this.post('approval-requests/' + approvalId + '/' + action, { reason: reason || '' });
+        const uid = (asUserId != null && asUserId !== '') ? String(asUserId) : null;
+        const eigenKey = this.hasOwnKey();
+
+        // v333: draait het gewone verkeer op het API-account, dan bestaat de
+        // oude Rolf-uitzondering niet meer (beslissen met het API-account zou
+        // als "API"-gebruiker registreren = betekenisloos). Zonder eigen key
+        // dus altijd de duidelijke fout. In bundel-overgangsmodus (algemene
+        // key = Rolfs account) blijft de oude Rolf-regel gelden.
+        if (!eigenKey) {
+            const rolfModus = !this.isApiAccountActief();
+            if (!rolfModus || (uid && uid !== String(this.KEY_OWNER_USER_ID))) {
+                throw new Error('deze goedkeuring wacht op jou persoonlijk; er is nog geen eigen API-key actief voor jouw login — vraag een kluis-key aan of keur goed/af in Robaws zelf');
+            }
+        }
+
+        const res = eigenKey
+            ? await this._personalFetch('POST', 'approval-requests/' + approvalId + '/' + action, { reason: reason || '' })
+            : await this.post('approval-requests/' + approvalId + '/' + action, { reason: reason || '' });
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) {
             throw new Error('Robaws gaf status ' + res.code);
         }
+        // Naverificatie: een accept door wie al besliste is een stille 204-no-op —
+        // check dat de BESLISSER (eigen user of Rolf) nu écht beslist heeft.
+        const verwachtUid = (eigenKey && uid) ? uid : String(this.KEY_OWNER_USER_ID);
+        try {
+            const chk = await this.get('approval-requests/' + approvalId + '?include=userStates', { bypassCache: true });
+            const st = ((chk.data && chk.data.userStates) || []).find(s => String(s.userId) === verwachtUid);
+            if (st && String(st.status) === 'AWAITING_DECISION') {
+                throw new Error('Robaws registreerde de beslissing niet');
+            }
+        } catch (e) {
+            if (e && /registreerde/.test(e.message || '')) throw e;
+            /* de verificatie-read zelf faalde — de beslissing gaf wél 2xx, doorgaan */
+        }
         return true;
     },
-    /** Verlof-goedkeuring — alias op decideApproval (zelfde endpoint). */
-    async decideLeaveApproval(approvalId, approve, reason) {
-        return this.decideApproval(approvalId, approve, reason);
+    /** Verlof-goedkeuring — alias op decideApproval (zelfde endpoint + regel). */
+    async decideLeaveApproval(approvalId, approve, reason, asUserId) {
+        return this.decideApproval(approvalId, approve, reason, asUserId);
     },
 
     // v278 (Aanvragen-tab): verlofsaldo + chat + factuur-goedkeuringen.
@@ -721,6 +1012,27 @@ const RobawsAPI = {
         const res = await this.patchMerge('purchase-invoices/' + invoiceId, changes || {});
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
         return true;
+    },
+
+    /** v340: alle projecten (lite) voor naam-herkenning op facturen —
+     *  cache 1 uur; max 2 pagina's à 100 (ruim boven het actieve bestand). */
+    async getAllProjectsLite() {
+        const nu = Date.now();
+        if (this._projAllCache && (nu - this._projAllCache.at) < 3600e3) return this._projAllCache.items;
+        const alles = [];
+        for (let page = 0; page < 2; page++) {
+            const r = await this.get('projects?page=' + page + '&size=100');
+            if (r.code !== 200) break;
+            const data = r.data || {};
+            const items = data.items || (data.data && data.data.items) || [];
+            for (const p of items) {
+                const naam = (p.planningName || p.name || p.title || '').trim();
+                if (naam) alles.push({ id: String(p.id), logicId: p.logicId || '', name: naam });
+            }
+            if (items.length < 100) break;
+        }
+        this._projAllCache = { at: nu, items: alles };
+        return alles;
     },
 
     /** Projecten zoeken voor de toewijs-picker (searchText + lokale filter). */
@@ -975,7 +1287,8 @@ const RobawsAPI = {
     // Alleen de geëxpandeerde relatie-OBJECTEN + read-only audit-velden droppen.
     // De scalaire spiegel-ids (articleId/supplierId/assignedEmployeeId/
     // stockLocationId/…) BLIJVEN staan, zodat de koppelingen behouden blijven.
-    // v311-hotfix: 'logicId' UIT de drop-lijst (ontbreken = nummer gewist, 4 aug).
+    // v323: 'logicId' UIT de drop-lijst — sinds 4 aug wist Robaws het nummer
+    // als het veld in een full-replace-PUT ontbreekt (zie factuurnummers).
     _MATERIEEL_PUT_DROP: ['article', 'supplier', 'assignedProject', 'assignedEmployee', 'assignedClient', 'assignedEndClient', 'assignedSubcontractor', 'stockLocation', 'company', '_metadata', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy'],
 
     /** Vervang de Reserveringen-extraField op een VERS opgehaald materiaal en PUT (opgeschoonde full-replace). */
@@ -1102,6 +1415,21 @@ const RobawsAPI = {
     async _resolveUserIdForEmployee(employeeId, emailHint) {
         if (!employeeId) return null;
         const empIdStr = String(employeeId);
+
+        // 0) v335: EMPLOYEES-map eerst — geen API-call nodig én immuun voor
+        // een API-account zonder gebruikers-leesrecht (/users geeft dan
+        // stille lege lijsten, waardoor stappen 2-4 droogvallen — zo verloor
+        // Bjorn zijn userId na de overstap op het API-account). De map wordt
+        // onderhouden; nieuwe medewerkers vallen door naar de dynamische
+        // stappen hieronder.
+        try {
+            const hint = String(emailHint || '').toLowerCase().trim();
+            for (const [em, e] of Object.entries(this.EMPLOYEES)) {
+                if (String(e.employeeId) === empIdStr || (hint && em === hint)) {
+                    if (e.userId != null) return e.userId;
+                }
+            }
+        } catch (_e) {}
 
         // 1) Probeer via /employees/{id}
         try {
@@ -1247,6 +1575,49 @@ const RobawsAPI = {
         const emailLower = email.toLowerCase().trim();
         console.log('[RobawsAPI] Login poging voor:', emailLower);
 
+        // v315: eigen API-key ophalen uit de Worker-kluis. De Worker checkt
+        // e-mail + PIN met het API-account; antwoorden dragen v:'auth1' —
+        // een oude Worker (zonder kluis) of netwerkfout wordt genegeerd en
+        // de bestaande flow loopt gewoon door (gedeelde of bewaarde key).
+        try {
+            const wres = await this._fetchWithTimeout(this.WORKER_AUTH_URL + '/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: emailLower, pin: String(pin) }),
+            }, 8000);
+            let wj = null;
+            try { wj = await wres.json(); } catch (_e) {}
+            if (wj && wj.v === 'auth1') {
+                if (wres.status === 401) return { success: false, error: 'PIN onjuist' };
+                if (wres.status === 429) return { success: false, error: 'Te veel pogingen — probeer over een kwartier opnieuw.' };
+                if (wres.status === 403) return { success: false, error: 'Dit account is stopgezet. Neem contact op met kantoor.' };
+                // v333: de algemene key (API-account, apikey:standaard) komt
+                // bij elke login mee — dat is voortaan het gewone verkeer.
+                if (wres.ok && wj.algemeen && wj.algemeen.key && wj.algemeen.secret) {
+                    this.setAlgemeneCredentials(wj.algemeen.key, wj.algemeen.secret);
+                    console.log('[RobawsAPI] Algemene key = API-account (kluis)');
+                } else if (wres.ok) {
+                    this.clearAlgemeneCredentials(true);  // overgangsmodus: bundel-key
+                }
+                if (wres.ok && wj.key && wj.secret) {
+                    this.setActiveCredentials(wj.key, wj.secret, emailLower, wj.soort);
+                    console.log('[RobawsAPI] Eigen API-key actief (Worker-kluis' + (wj.soort === 'rol' ? ' · rol-key' : '') + ')');
+                } else if (wres.ok) {
+                    // Kluis kent deze werknemer (nog) niet → geen handtekening-key
+                    this.clearActiveCredentials(true);
+                }
+                // 404 (niet gevonden): de gewone flow hieronder doet zijn
+                // eigen zoektocht + nette foutafhandeling.
+            }
+        } catch (_e) {
+            console.warn('[RobawsAPI] Worker-kluis niet bereikbaar — verder met bestaande credentials');
+        }
+        // v336 (cutover): zonder sleutel is inloggen zinloos — meld het
+        // eerlijk i.p.v. verderop te stranden op mysterieuze 401's.
+        if (!this._algKey && !this.API_KEY) {
+            return { success: false, error: 'Geen verbinding met de sleutelkluis — controleer je internetverbinding en probeer opnieuw.' };
+        }
+
         // Stap 1: Zoek de werknemer op email in Robaws.
         // v132: retry 1x bij transient failure + 3e fallback zonder status-filter
         // zodat ook niet-"actieve" werknemers gevonden worden.
@@ -1337,6 +1708,37 @@ const RobawsAPI = {
                     }
                 } catch(e) {
                     console.warn('[RobawsAPI] Directe employee lookup faalde:', e && e.message);
+                }
+            }
+        }
+        if (!employee && this.hasPersonalKey && this.hasPersonalKey()) {
+            // v317: fiche onvindbaar MET een persoonlijke kluis-key terwijl de
+            // Worker hem wél vindt = de key mist het werknemers-leesrecht
+            // (403 geeft lege resultaten, geen thrown error — dus geen
+            // fallback hierboven). De login mag daar nooit op stranden:
+            // eigen key laten vallen, melden, en 1× opnieuw zoeken met de
+            // gedeelde key (cache bewaart alleen 200-antwoorden, dus de
+            // herkansing is gegarandeerd vers).
+            // v319: éérst het echte statusnummer vastleggen (403 = rechten,
+            // 429 = limiet van de key op) — daarna pas de key laten vallen.
+            try {
+                const probeId = (this.EMPLOYEES[emailLower] && this.EMPLOYEES[emailLower].employeeId) || '1';
+                const probe = await this.get(`employees/${probeId}`, { bypassCache: true });
+                console.warn('[RobawsAPI] Diagnose eigen key: employees/' + probeId + ' → status ' + probe.code);
+            } catch (pe) {
+                console.warn('[RobawsAPI] Diagnose eigen key: employees/{id} → FOUT: ' + ((pe && pe.message) || '?'));
+            }
+            console.warn('[RobawsAPI] Fiche onvindbaar met persoonlijke key — terugval op de gedeelde key');
+            this.clearActiveCredentials(true);
+            try { if (window.app && app.toast) app.toast('Je eigen API-key mist leesrechten (werknemers) — controleer het key-profiel in Robaws. Je bent ingelogd op de gedeelde key.', true); } catch (_e) {}
+            try { employee = await fetchEmployee(); } catch (_e) {}
+            if (!employee) {
+                const mapped2 = this.EMPLOYEES[emailLower];
+                if (mapped2 && mapped2.employeeId) {
+                    try {
+                        const dr = await this.get(`employees/${mapped2.employeeId}`, { bypassCache: true });
+                        if (dr.code === 200 && dr.data) employee = dr.data;
+                    } catch (_e) {}
                 }
             }
         }
@@ -1498,6 +1900,12 @@ const RobawsAPI = {
         // zodat de login-flow niet wacht op de download). Tijdens app-gebruik
         // gebruikt get-avatar gewoon de lokale cache.
         this.refreshAvatarFromRobaws(emailLower, employee.id).catch(() => {});
+
+        // v318: met een eigen kluis-key na 5 s de zelftest draaien (console)
+        // — de opstart-vloed is dan voorbij en we zien per module de status.
+        if (this.hasPersonalKey && this.hasPersonalKey()) {
+            setTimeout(() => { this.kluisZelftest().catch(() => {}); }, 5000);
+        }
 
         return { success: true, user };
     },
@@ -1686,6 +2094,101 @@ const RobawsAPI = {
         return map;
     },
 
+    // ============================================================
+    // WACHT (v314) — leeslaag op de bestaande Robaws-wachtplanning.
+    // Bureel plant de wacht als planning-items met planningTypeId 40
+    // ("Wacht"): één item per DAG, summary "NAAM: WACHT",
+    // employeeIds = ["<empId>"] (live geverifieerd 3 aug 2026; de
+    // fromDate/toDate-filter op /planning-items werkt server-side).
+    // De app leest alleen — plannen blijft in Robaws-web.
+    // ============================================================
+
+    WACHT_TYPE_ID: '40',
+    _wachtCache: null,  // { at, weken }
+
+    /** Wachtweken vanaf maandag van deze week, `wekenVooruit` weken ver.
+     *  Resultaat: [{ maandag:'YYYY-MM-DD', zondag:'YYYY-MM-DD',
+     *                employeeIds:['12'], namen:['Olivier'] }] — alleen weken
+     *  waarvoor écht wacht gepland staat. Cache 30 min (replica-reads). */
+    async getWachtPlanning(wekenVooruit = 8) {
+        const now = Date.now();
+        if (this._wachtCache && (now - this._wachtCache.at) < 30 * 60 * 1000) {
+            return this._wachtCache.weken;
+        }
+
+        const pad = (n) => String(n).padStart(2, '0');
+        const dstr = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+        const vandaag = new Date();
+        const maandag = new Date(vandaag);
+        maandag.setDate(vandaag.getDate() - ((vandaag.getDay() + 6) % 7));
+        const tot = new Date(maandag);
+        tot.setDate(maandag.getDate() + wekenVooruit * 7 - 1);
+
+        // Venster ophalen (server-side datumfilter) + client-side op type 40
+        // filteren — de planningTypeId-parameter wordt server-side genegeerd.
+        const PAGE = 100;
+        let items = [];
+        for (let offset = 0; offset < 600; offset += PAGE) {
+            const res = await this.get(`planning-items?limit=${PAGE}&offset=${offset}&fromDate=${dstr(maandag)}&toDate=${dstr(tot)}`);
+            if (res.code !== 200 || !res.data || !Array.isArray(res.data.items)) break;
+            items = items.concat(res.data.items);
+            if (res.data.items.length < PAGE) break;
+        }
+        const wachtItems = items.filter(it => String(it.planningTypeId) === this.WACHT_TYPE_ID);
+
+        // Per week (maandag-sleutel) de werknemer(s) verzamelen. Eén dag-item
+        // per dag → per week tellen we per employeeId hoeveel dagen.
+        const weken = {};
+        for (const it of wachtItems) {
+            const s = String(it.startDate || '').substring(0, 10);
+            if (!s) continue;
+            const d = new Date(s + 'T12:00:00');
+            const ma = new Date(d);
+            ma.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+            const key = dstr(ma);
+            if (!weken[key]) weken[key] = { maandag: key, _emp: {}, _summary: {} };
+            const ids = Array.isArray(it.employeeIds) ? it.employeeIds : (it.employeeId != null ? [it.employeeId] : []);
+            for (const id of ids) {
+                const sid = String(id);
+                weken[key]._emp[sid] = (weken[key]._emp[sid] || 0) + 1;
+                if (it.summary) weken[key]._summary[sid] = String(it.summary);
+            }
+        }
+
+        // Namen opzoeken: live werknemerslijst, terugval op de summary
+        // ("OLIVIER: WACHT" → "Olivier").
+        let naamById = {};
+        try {
+            const list = await this.getActiveEmployees();
+            for (const e of list) {
+                const id = String(e.robawsEmployeeId ?? e.id ?? '');
+                if (id && e.name) naamById[id] = e.name;
+            }
+        } catch (_e) { /* terugval op summary */ }
+        const uitSummary = (s) => {
+            const ruw = String(s || '').split(':')[0].trim();
+            if (!ruw) return null;
+            return ruw.charAt(0).toUpperCase() + ruw.slice(1).toLowerCase();
+        };
+
+        const lijst = Object.values(weken)
+            .sort((a, b) => a.maandag < b.maandag ? -1 : 1)
+            .map(w => {
+                const ids = Object.keys(w._emp).sort((a, b) => w._emp[b] - w._emp[a]);
+                const zo = new Date(w.maandag + 'T12:00:00');
+                zo.setDate(zo.getDate() + 6);
+                return {
+                    maandag: w.maandag,
+                    zondag: dstr(zo),
+                    employeeIds: ids,
+                    namen: ids.map(id => naamById[id] || uitSummary(w._summary[id]) || ('Werknemer ' + id)),
+                };
+            });
+
+        this._wachtCache = { at: now, weken: lijst };
+        return lijst;
+    },
+
     /** Vers ophalen → muteer → full-replace PUT. */
     async _adminMutateEmployee(employeeId, mutate) {
         const res = await this.get(`employees/${employeeId}`, { bypassCache: true });
@@ -1777,6 +2280,15 @@ const RobawsAPI = {
                 if (page >= (r.data.totalPages || 1)) break;
             } while (page < 5);
         } catch (_e) {}
+        // v315: eigen API-key in de Worker-kluis? (soft-check — een oude of
+        // onbereikbare Worker geeft geen v:'auth1' → known:false, rij verborgen)
+        let apiKeyOk = null;
+        try {
+            const r = await this._fetchWithTimeout(this.WORKER_AUTH_URL + '/auth/haskey?employeeId=' + encodeURIComponent(employeeId), {}, 6000);
+            const j = await r.json();
+            if (j && j.v === 'auth1') apiKeyOk = !!j.aanwezig;
+        } catch (_e) {}
+
         return {
             naam: [emp.firstName, emp.lastName].filter(Boolean).join(' ') || emp.name || ('#' + employeeId),
             checks: {
@@ -1785,6 +2297,7 @@ const RobawsAPI = {
                 rol:    { ok: roleOk, value: roleLabel || (emp.employeeRoleId ? ('rol-id ' + emp.employeeRoleId) : '') },
                 user:   { ok: !!user, value: user ? ((user.fullName || user.email || 'user') + ' (#' + user.id + ')') : '', userId: user ? user.id : null },
                 pin:    { ok: !!(pinVal && String(pinVal).trim()) },
+                apiKey: { ok: apiKeyOk === true, known: apiKeyOk !== null },
             },
         };
     },
@@ -1929,8 +2442,18 @@ const RobawsAPI = {
             throw e;
         }
         const items = res.data.items || res.data || [];
-        // Zoek alle documents met "foto/photo/profile/avatar" in de naam
-        const photos = items.filter(d => /foto|photo|profile|avatar/i.test(d.name || d.fileName || ''));
+        // Zoek alle documents met "foto/photo/profile/avatar" in de naam.
+        // (v312 / 1.x v306) Sinds v311 draagt de fiche óók andere documenten
+        // (uren-exports). Extra eis: het document moet een AFBEELDING zijn
+        // (contentType image/* óf een afbeeldings-extensie) — een pdf/xlsx die
+        // toevallig "foto" in de naam heeft kan dus nooit als avatar gekozen
+        // worden. Live geverifieerd veld-schema: {name, contentType}.
+        const photos = items.filter(d => {
+            const nm = String(d.name || d.fileName || '');
+            if (!/foto|photo|profile|avatar/i.test(nm)) return false;
+            const ct = String(d.contentType || d.mimeType || '').toLowerCase();
+            return ct.indexOf('image/') === 0 || /\.(jpe?g|png|webp|gif|heic)$/i.test(nm);
+        });
         if (!photos.length) return null;  // explicit: geen foto in Robaws
 
         // Sorteer op createdAt desc (nieuwste eerst). Bij gelijke createdAt:
@@ -2180,7 +2703,8 @@ const RobawsAPI = {
         delete body._metadata;
         delete body.createdAt;
         delete body.updatedAt;
-        // v311-hotfix: logicId blijft in de body (ontbreken = nummer gewist, 4 aug).
+        // v323: logicId blijft in de body — ontbreken = nummer gewist (zelfde
+        // bug als de factuurnummers, 4 aug). Weigert Robaws hem: 1× zonder.
         console.log('[RobawsAPI] Tijdsregistratie updaten:', id, JSON.stringify(updates));
         let tr = await this.put(`time-registrations/${id}`, body);
         if (tr.code === 400 || tr.code === 422) {
@@ -4134,7 +4658,7 @@ const RobawsAPI = {
         clientId: passedClientId = null, companyId: passedCompanyId = null,
         salesOrderId = null, paymentMethod = null, notes = '',
         materials = [], hours = [], onderhoud = false, hoursPrerounded = false,
-        userId = null, installationIds = [] }) {
+        userId = null, installationIds = [], korting = null }) {
 
         const toStr = v => (v == null || v === '') ? null : String(v);
 
@@ -4145,6 +4669,11 @@ const RobawsAPI = {
         if (vatTariffId == null || String(vatTariffId) === '') {
             return { success: false, error: 'Geen BTW-tarief meegegeven — factuur niet aangemaakt. Stel het BTW-tarief van de klant in (info-tab → BTW wijzigen).' };
         }
+
+        // v324 (afspraak "B&B", 4 aug): korting = altijd ÉÉN duidelijke
+        // negatieve factuurlijn (zie blok 3d verderop). De v322-route via het
+        // native per-lijn discount-veld is bewust teruggedraaid: Levi wil de
+        // korting als leesbare lijn op de factuur, met eigen tekst erbij.
 
         // v112: Postcode van de werf — bewaard in functie-scope. Wordt gevuld
         // wanneer we het installatie-adres ophalen voor `siteAddress`, en later
@@ -4483,6 +5012,30 @@ const RobawsAPI = {
             }
         }
 
+        // 3d (v324, afspraak "B&B"): KORTING = altijd ÉÉN duidelijke negatieve
+        // lijn met de tekst van de technieker erbij, zelfde BTW-tarief.
+        // `korting.bedrag` is het excl-bedrag dat de app berekende: bij een
+        // percentage recht op het subtotaal; bij een vast bedrag zó gekozen
+        // dat het incl-totaal met exact het gevraagde bedrag daalt (de klant
+        // betaalt écht "€15 minder"). Preview = factuur = betaalbedrag.
+        if (korting && Number(korting.bedrag) > 0) {
+            const kortingLine = {
+                type: 'LINE',
+                quantity: 1,
+                description: (korting.label || 'Korting') + (korting.reden ? ' — ' + korting.reden : ''),
+                price: -Math.abs(Math.round(Number(korting.bedrag) * 100) / 100),
+                vatTariffId: toStr(vatTariffId),
+            };
+            if (woSalesOrderId) kortingLine.orderId = woSalesOrderId;
+            const kortingRes = await this.post(`sales-invoices/${invoiceId}/line-items`, kortingLine);
+            if (kortingRes.code === 201 || kortingRes.code === 200) {
+                addedLines++;
+                console.log('[Factuur] Kortinglijn:', kortingLine.description, kortingLine.price);
+            } else {
+                errors.push({ line: kortingLine.description, code: kortingRes.code, error: kortingRes.data });
+            }
+        }
+
         // Stap 4: Factuur ophalen voor totalen + OGM
         let finalInvoice = await this.get(`sales-invoices/${invoiceId}`);
         let inv = finalInvoice.data || {};
@@ -4705,7 +5258,8 @@ const RobawsAPI = {
                     delete body.updatedAt;
                     delete body.createdBy;
                     delete body.updatedBy;
-                    // v311-hotfix: logicId (werkbon-nummer) MOET mee — zie factuurnummers 4 aug.
+                    // v323: logicId (werkbon-nummer) MOET mee — ontbreken = nummer
+                    // gewist (zelfde bug als de factuurnummers, 4 aug).
                     let sp = await this.put(`work-orders/${workOrderId}`, body);
                     if (sp.code === 400 || sp.code === 422) {
                         const zonder = { ...body };
@@ -4846,10 +5400,11 @@ const RobawsAPI = {
             delete body.updatedAt;
             delete body.createdBy;
             delete body.updatedBy;
-            // v311-hotfix (4 aug): logicId (factuurNUMMER) MOET mee — Robaws
-            // wist het nummer als het veld in de full-replace ontbreekt en
-            // deelt het daarna zelfs opnieuw uit. Huidige waarde terugsturen;
-            // weigert Robaws dat ooit (400/422): één herkansing zonder.
+            // v323: logicId (factuurNUMMER) MOET mee — sinds 4 aug wist Robaws
+            // het nummer als het veld in de full-replace ontbreekt (nummer werd
+            // daarna zelfs HERUITGEDEELD aan een andere factuur). We sturen de
+            // huidige waarde terug; weigert Robaws dat ooit (400/422), dan één
+            // herkansing zonder (het oude gedrag).
             let put = await this.put(`sales-invoices/${invoiceId}`, body);
             if (put.code === 400 || put.code === 422) {
                 const zonder = Object.assign({}, body);
@@ -5233,9 +5788,158 @@ const RobawsAPI = {
             wo.remark = existing ? (existing + '\n' + appendRemark) : appendRemark;
         }
         try { localStorage.setItem('qe_last_uitg_put_req', JSON.stringify(wo)); } catch(_) {}
-        const putRes = await this.put(`work-orders/${workOrderId}`, wo);
+        let putRes = await this.put(`work-orders/${workOrderId}`, wo);
+        if (putRes.code === 400 || putRes.code === 422) {
+            // v324: zelfde logicId-herkansing als elders (v323-conventie)
+            const zonder = { ...wo };
+            delete zonder.logicId;
+            putRes = await this.put(`work-orders/${workOrderId}`, zonder);
+        }
         try { localStorage.setItem('qe_last_uitg_put_res', JSON.stringify({code: putRes.code, data: putRes.data})); } catch(_) {}
+        // v324: STILLE-SUCCES-FIX — voorheen werd het PUT-resultaat ONGECONTROLEERD
+        // teruggegeven: een 429/4xx/5xx verdween geruisloos, de app toonde de
+        // uitklok-celebratie maar de werkbon bleef in Robaws open ("scan zegt
+        // voltooid maar is het niet"). Nu hard falen → de aanroepers tonen de
+        // eerlijke melding en de sessie blijft actief zodat een herscan herstelt.
+        if (putRes.code !== 200 && putRes.code !== 201 && putRes.code !== 204) {
+            throw new Error('Uitgeklokt-PUT faalde (' + putRes.code + ')');
+        }
         return putRes;
+    },
+
+    /**
+     * v327: HEROPEN een tijdsregistratie voor een 2e sessie op dezelfde dag —
+     * wist het Uitgeklokt-veld en voegt een "klok-in:"-regel toe aan de
+     * opmerking. Zelfde conventies als setTimeRegistrationUitgeklokt:
+     * vers GET vóór full-replace, logicId MEE (v323), 400/422-herkansing
+     * zonder, en hard falen op non-2xx (nooit stil succes).
+     */
+    async reopenTimeRegistration(workOrderId, appendRemark) {
+        const getRes = await this.get(`work-orders/${workOrderId}`, { bypassCache: true });
+        if (getRes.code !== 200 || !getRes.data) {
+            throw new Error('GET /work-orders/' + workOrderId + ' faalde (' + getRes.code + ')');
+        }
+        const wo = getRes.data;
+        wo.extraFields = wo.extraFields || {};
+        wo.extraFields['Uitgeklokt'] = { stringValue: '' };
+        if (appendRemark) {
+            const existing = String(wo.remark || '').trim();
+            wo.remark = existing ? (existing + '\n' + appendRemark) : appendRemark;
+        }
+        let putRes = await this.put(`work-orders/${workOrderId}`, wo);
+        if (putRes.code === 400 || putRes.code === 422) {
+            const zonder = { ...wo };
+            delete zonder.logicId;
+            putRes = await this.put(`work-orders/${workOrderId}`, zonder);
+        }
+        if (putRes.code !== 200 && putRes.code !== 201 && putRes.code !== 204) {
+            throw new Error('Heropen-PUT faalde (' + putRes.code + ')');
+        }
+        return putRes;
+    },
+
+    /**
+     * v328: mail versturen via Robaws' eigen e-mail-endpoint
+     * (POST /{resource}/{id}/emails — route B, live getest 7 aug 2026).
+     * - Afzender = het gekoppelde Robaws-mailaccount: "Quality Environment
+     *   <service@qe.be>" — ongeacht welke API-key.
+     * - De mail hangt als correspondentie aan de resource (werkbon/fiche/
+     *   project).
+     * - LET OP: bijlagen ondersteunt het endpoint NIET — een attachments-veld
+     *   wordt stil genegeerd (zowel base64 als document-id, beide live
+     *   getest). Bijlage nodig? Zet het bestand als document op de resource
+     *   en verwijs ernaar in de body.
+     * - Gooit bij non-2xx (foolproof-lijn: succes = het staat zo in Robaws).
+     * @param {string} resourcePath  bv. 'employees/1' of 'work-orders/3700'
+     * @param {Object} opts  { subject, html, to (string|array), cc? }
+     * @returns {string|null} het Robaws-mail-id
+     */
+    async sendMailViaRobaws(resourcePath, opts) {
+        const o = opts || {};
+        const to = Array.isArray(o.to) ? o.to : [o.to];
+        if (!to.length || !to[0]) throw new Error('Geen ontvanger opgegeven');
+        const body = {
+            subject: String(o.subject || '').slice(0, 250),
+            body: String(o.html || ''),
+            recipients: { to: to.map(String) },
+            send: true,
+        };
+        if (o.cc) body.recipients.cc = (Array.isArray(o.cc) ? o.cc : [o.cc]).map(String);
+        const pad = String(resourcePath).replace(/\/+$/, '') + '/emails';
+        // v332: mailen is een IDENTITEITS-actie (zoals goedkeuren) — met een
+        // eigen persoons-key vertrekt de mail op naam van de ingelogde
+        // gebruiker i.p.v. het kantoor-account (Rolf). Mist de key het
+        // mail-recht (401/403) → één terugval op de gedeelde key, zodat de
+        // aanvraag nooit strandt op een rechten-kwestie. Andere fouten
+        // (timeout/5xx) NOOIT herkansen met de andere key: dubbele-mail-risico.
+        let res;
+        if (this.hasOwnKey()) {
+            res = await this._personalFetch('POST', pad, body);
+            // v334: óók 404 = rechten-terugval. Een key zonder leesrecht op de
+            // resource krijgt geen 403 maar 404 (resource "bestaat niet" voor
+            // die key — de stille-rechten-les). 404 = er is niets verstuurd,
+            // dus terugvallen op de algemene key is veilig (geen dubbele
+            // mail); de aanvrager staat sowieso met naam in de mail zelf.
+            if (res.code === 401 || res.code === 403 || res.code === 404) {
+                console.warn('[RobawsAPI] mail met eigen key geweigerd (' + res.code + ') — key mist het mail-/leesrecht op deze resource; terugval op de algemene key');
+                res = await this.post(pad, body);
+            }
+        } else {
+            res = await this.post(pad, body);
+        }
+        if (res.code !== 200 && res.code !== 201) {
+            throw new Error('Mail versturen faalde (' + res.code + ')');
+        }
+        return (res.data && res.data.id) || null;
+    },
+
+    /**
+     * v329: de verantwoordelijke (Robaws-user) van een order opzoeken — voor
+     * de materiaal-bestelmail. Volgorde: order.assignedUser (heeft e-mail in
+     * de UserDTO) → terugval project.siteManager → terugval EMPLOYEES-map op
+     * het userId. Retourneert {userId, name, email} (email kan '' zijn) of
+     * null als er niets te vinden is.
+     */
+    async getOrderVerantwoordelijke(salesOrderId) {
+        if (!salesOrderId) return null;
+        const pak = (u) => {
+            if (!u) return null;
+            return {
+                userId: String(u.id || ''),
+                name: u.fullName || u.name || '',
+                email: String(u.email || '').trim().toLowerCase(),
+            };
+        };
+        const zoekMap = (userId) => {
+            for (const [em, e] of Object.entries(this.EMPLOYEES)) {
+                if (String(e.userId) === String(userId)) {
+                    return { userId: String(userId), name: e.name, email: em };
+                }
+            }
+            return null;
+        };
+        try {
+            const res = await this.get(`sales-orders/${salesOrderId}?include=assignedUser,project`, { bypassCache: true });
+            if (res.code !== 200 || !res.data) return null;
+            const so = res.data;
+            let v = pak(so.assignedUser);
+            if ((!v || !v.email) && so.assignedUserId) v = zoekMap(so.assignedUserId) || v;
+            if (v && v.email) return v;
+            // terugval: werfleider van het gekoppelde project
+            const pid = so.projectId || (so.project && so.project.id);
+            if (pid) {
+                const pr = await this.get(`projects/${pid}?include=siteManager`, { bypassCache: true });
+                if (pr.code === 200 && pr.data) {
+                    let s = pak(pr.data.siteManager);
+                    if ((!s || !s.email) && pr.data.siteManagerId) s = zoekMap(pr.data.siteManagerId) || s;
+                    if (s && s.email) return s;
+                }
+            }
+            return v;
+        } catch (e) {
+            console.warn('[RobawsAPI] getOrderVerantwoordelijke faalde:', e && e.message);
+            return null;
+        }
     },
 
     /** Update Tijd-keuze (bv. naar "Ziek"). v59: GET-then-PUT. */
@@ -5297,15 +6001,65 @@ const RobawsAPI = {
      * Robaws v2 ondersteunt PUT op /work-orders/{id}/time-entries/{teId}.
      */
     async closeOpenLLTimeEntry(workOrderId, teId, opts) {
-        const { startTime, endTime, date } = opts;
+        const { startTime, endTime, date, employeeId } = opts;
         // v110: bij PUT update ook hourTypeId op OVERUREN zetten (was werkuren).
         // v251: idem weekend-variant, zodat de PUT de POST niet terugzet.
         const llHourType = await this.getWeekendAdjustedHourTypeId(
             this.HOUR_TYPE_IDS.overuren, date || this._localDateStr());
-        const body = {
-            articleId: String(this.WERKUUR_ARTICLE_IDS.ladenLossen),
-            hourTypeId: String(llHourType),
+        // v327: PUT = full replace — voorheen ging er GEEN employeeId mee,
+        // waardoor Robaws de werknemer van het L&L-blok wiste ("naam ontbreekt
+        // bij het tijdsblok"). Nu: de bestaande entry vers ophalen en alle
+        // scalars behouden; de wijzigingen gaan er overheen.
+        // v338: eerst een DIRECTE GET op de entry (bewezen: bestaat en is
+        // kleiner/betrouwbaarder dan de lijst — die kon de entry missen zodra
+        // er meer dan 100 regels op de werkbon staan). Lijst = terugval.
+        const scalarsUit = (found) => {
+            const b = {};
+            const DROP = ['id', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy',
+                'deletedAt', 'archivedAt', 'lockedAt', '_metadata'];
+            for (const [k, v] of Object.entries(found)) {
+                if (DROP.includes(k)) continue;
+                // expansie-objecten (article/hourType/employee) droppen;
+                // tijd-objecten {hour,minute} en scalars behouden
+                if (v !== null && typeof v === 'object' && !('hour' in v)) continue;
+                b[k] = v;
+            }
+            return b;
         };
+        let base = null;
+        try {
+            const one = await this.get(`work-orders/${workOrderId}/time-entries/${teId}`, { bypassCache: true });
+            const d = one.data && (one.data.data || one.data);
+            if (one.code === 200 && d && d.id != null) base = scalarsUit(d);
+        } catch (_) { /* terugval hieronder */ }
+        if (!base) {
+            try {
+                const exRes = await this.get(`work-orders/${workOrderId}/time-entries?limit=100`, { bypassCache: true });
+                const items = (exRes.data && (exRes.data.items || exRes.data)) || [];
+                const found = items.find(t => String(t.id) === String(teId));
+                if (found) base = scalarsUit(found);
+            } catch (_) { /* terugval: minimale body hieronder */ }
+        }
+        if (!base) {
+            // Laatste vangnet: zonder verse entry zou een full-replace de
+            // kostprijs en de werknemer wissen (dát is de "L&L mist data"-
+            // klacht). Hard falen kan hier niet — de open entry blijft dan
+            // staan en de fallback-POST maakt een tweede regel. Dus vullen we
+            // de dragende velden zelf: werknemer uit de sessie, kostprijs vers
+            // uit het artikel.
+            console.warn('[RobawsAPI] L&L-entry ' + teId + ' niet vers ophaalbaar — kostprijs uit het artikel halen');
+            base = {};
+            try {
+                const art = await this.get('articles/' + this.WERKUUR_ARTICLE_IDS.ladenLossen, { bypassCache: true });
+                const a = (art.data && (art.data.data || art.data)) || {};
+                if (a.costPrice != null) base.costPrice = a.costPrice;
+                if (a.salePrice != null) base.salePrice = a.salePrice;
+            } catch (_) { /* dan zonder — beter een blok met tijden dan geen blok */ }
+        }
+        const body = base;
+        if (!body.employeeId && employeeId != null) body.employeeId = String(employeeId);
+        body.articleId = String(this.WERKUUR_ARTICLE_IDS.ladenLossen);
+        body.hourTypeId = String(llHourType);
         if (startTime) {
             const [sh, sm] = startTime.split(':').map(Number);
             body.startTime = { hour: sh || 0, minute: sm || 0 };
