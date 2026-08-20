@@ -119,6 +119,29 @@ const RobawsAPI = {
             }
             await new Promise(r => setTimeout(r, 400));  // rustig aan (burst)
         }
+        // v345: SCHRIJFRECHTEN-proef zonder iets aan te maken — een lege POST
+        // geeft 400/422 als de machtiging er is (validatie faalt pas ná de
+        // rechten-check) en 403 als ze mist. Les van 10 aug: drie
+        // rechten-gaten doken pas in het veld op (users-lezen,
+        // aankoopfacturen-lezen, verkoopfacturen-WIJZIGEN bij de technieker).
+        const schrijfProbes = [
+            ['verkoopfactuur maken (rechten-proef)', 'sales-invoices'],
+            ['taak maken (rechten-proef)', 'tasks'],
+        ];
+        for (const [naam, ep] of schrijfProbes) {
+            try {
+                const r = await this.post(ep, {});
+                const ok = (r.code === 400 || r.code === 422);
+                out.push('[gedeeld] ' + naam + ' → ' + r.code + (ok ? ' ✓ (machtiging aanwezig)' :
+                    (r.code === 403 ? ' ✗ MACHTIGING MIST — aanzetten in Robaws' : ' ? onverwacht')));
+            } catch (e) {
+                const msg = String((e && e.message) || '?');
+                const code = (msg.match(/\b(400|403|422)\b/) || [])[1];
+                out.push('[gedeeld] ' + naam + ' → ' + (code === '403' ? '403 ✗ MACHTIGING MIST — aanzetten in Robaws'
+                    : (code ? code + ' ✓ (machtiging aanwezig)' : 'FOUT: ' + msg.slice(0, 60))));
+            }
+            await new Promise(r => setTimeout(r, 400));
+        }
         // Persoonlijke key: alleen de identiteits-rechten testen
         // (goedkeuren + mailen — v332: mails vertrekken ook op eigen naam).
         if (this.hasPersonalKey()) {
@@ -1026,7 +1049,8 @@ const RobawsAPI = {
             const data = r.data || {};
             const items = data.items || (data.data && data.data.items) || [];
             for (const p of items) {
-                const naam = (p.planningName || p.name || p.title || '').trim();
+                const ev = p.extraFields && p.extraFields['Naam Project'];
+                const naam = ((p.planningName || p.name || p.title) || (ev && ev.stringValue) || '').trim();
                 if (naam) alles.push({ id: String(p.id), logicId: p.logicId || '', name: naam });
             }
             if (items.length < 100) break;
@@ -1235,6 +1259,332 @@ const RobawsAPI = {
             offset += SIZE;
         }
         return all;
+    },
+
+    // =============================================
+    // v346: VOERTUIGEN & KEURINGEN (Logistiek-tab)
+    // =============================================
+    KEURING_PLANNING_TYPE_ID: '51',   // planningstype "Keuring" (gemeten)
+
+    /** v349: keuringsstations provincie Antwerpen (autoveiligheid.be,
+     *  adressen opgehaald 11 aug 2026). Deurne = de standaard. */
+    KEURING_LOCATIES: [
+        { naam: 'Deurne',               straat: 'Santvoortbeeklaan 34-36',      postcode: '2100', stad: 'Deurne' },
+        { naam: 'Antwerpen-Noorderlaan', straat: 'Noorderlaan 36',              postcode: '2060', stad: 'Antwerpen' },
+        { naam: 'Brasschaat',           straat: 'Sint-Jobsesteenweg 134',       postcode: '2930', stad: 'Brasschaat' },
+        { naam: 'Geel',                 straat: 'Lammerdries 7',                postcode: '2440', stad: 'Geel' },
+        { naam: 'Heist-op-den-Berg',    straat: 'Wouwerstraat 5A',              postcode: '2220', stad: 'Heist-op-den-Berg' },
+        { naam: 'Hoboken',              straat: 'P. Van den Eedenstraat 100',   postcode: '2660', stad: 'Hoboken' },
+        { naam: 'Kontich',              straat: 'Neerveld 3',                   postcode: '2550', stad: 'Kontich' },
+        { naam: 'Malle',                straat: 'Ambachtsstraat 17',            postcode: '2390', stad: 'Malle' },
+        { naam: 'Mechelen',             straat: 'Brusselsesteenweg 460',        postcode: '2800', stad: 'Mechelen' },
+        { naam: 'Turnhout',             straat: 'Veedijk 40',                   postcode: '2300', stad: 'Turnhout' },
+        { naam: 'Willebroek',           straat: 'Hoeikensstraat 1B',            postcode: '2830', stad: 'Willebroek' },
+    ],
+
+    /** Keuring-datums van een voertuig bijwerken: laatste = gekozen datum,
+     *  geldig tot = +1 jaar. v351: wist meteen "Keuring ingepland op" —
+     *  uitgevoerd = afspraak-status weg. Merge-PATCH (bewezen 10 aug). */
+    async setMaterialKeuring(materialId, laatsteISO, maanden) {
+        // v353: cyclus in maanden (veld "Keuringscyclus maanden"); default 12
+        // = het oude +1 jaar-gedrag. Datum-overloop (29 feb) normaliseert Date.
+        const mnd = Number(maanden) > 0 ? Math.round(Number(maanden)) : 12;
+        const [y, m, d] = String(laatsteISO).slice(0, 10).split('-').map(Number);
+        const dt = new Date(y, (m - 1) + mnd, d);
+        const geldigTot = dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0') + '-' + String(dt.getDate()).padStart(2, '0');
+        const res = await this.patchMerge('materials/' + materialId, { extraFields: {
+            'Laatste keuring':      { type: 'DATE', group: 'Keuring', dateValue: String(laatsteISO).slice(0, 10) },
+            'Keuring geldig tot':   { type: 'DATE', group: 'Keuring', dateValue: geldigTot },
+            'Keuring ingepland op': { type: 'DATE', group: 'Keuring', dateValue: null },
+        } });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return geldigTot;
+    },
+
+    /** v351: afspraak-datum op het voertuig zetten (bij inplannen). */
+    async setMaterialKeuringGepland(materialId, datumISO) {
+        const res = await this.patchMerge('materials/' + materialId, { extraFields: {
+            'Keuring ingepland op': { type: 'DATE', group: 'Keuring', dateValue: String(datumISO).slice(0, 10) },
+        } });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** v351: onderhoud uitgevoerd — laatste onderhoud zetten + de
+     *  ingepland-datum wissen. */
+    async setMaterialOnderhoud(materialId, laatsteISO) {
+        const res = await this.patchMerge('materials/' + materialId, { extraFields: {
+            'Laatste onderhoud':      { type: 'DATE', group: 'Keuring', dateValue: String(laatsteISO).slice(0, 10) },
+            'Onderhoud ingepland op': { type: 'DATE', group: 'Keuring', dateValue: null },
+        } });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    // =============================================
+    // v353: GEREEDSCHAP (stocklocaties, verplaatsen, aanmaken)
+    // =============================================
+
+    /** Stocklocaties (19 stuks: magazijnen + camionetten + kasten).
+     *  Endpoint + POST/PATCH/DELETE live bewezen 12 aug. Volgorde = zoals
+     *  Robaws ze levert (magazijnen eerst) — die volgorde toont de app ook. */
+    async getStockLocations(opts) {
+        const r = await this.get('stock-locations?limit=100', opts);
+        if (r.code !== 200) throw new Error('Stocklocaties laden mislukt (' + r.code + ')');
+        const body = r.data || {};
+        return body.items || (Array.isArray(body) ? body : []);
+    },
+
+    /** Gereedschap verplaatsen: merge-PATCH van alleen stockLocationId
+     *  (live bewezen: naam/chauffeur/extraFields blijven intact).
+     *  null = geen locatie. */
+    async setMaterialStockLocation(materialId, stockLocationId) {
+        const res = await this.patchMerge('materials/' + materialId, {
+            stockLocationId: stockLocationId ? String(stockLocationId) : null,
+        });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** Buiten dienst / terug in dienst ("actief"/"inactief" — beide live bewezen). */
+    async setMaterialStatus(materialId, status) {
+        const res = await this.patchMerge('materials/' + materialId, { status });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** Nieuw materieel vanuit de app. Patroon = werkbon-les: kale POST,
+     *  daarna merge-PATCH voor extraFields. Veldnamen zoals Levi ze 12 aug
+     *  aanmaakte: "Keuringsplicht"/"Onderhoudsplicht" (CHECKBOX — 'BOOLEAN'
+     *  als type-string geeft 400, gemeten). Type = vrije stringValue op het
+     *  SELECT-veld (live bewezen); group-property wordt door Robaws
+     *  genegeerd, dus weggelaten. */
+    async createMaterial({ name, brand, serialNumber, stockLocationId, type, keuringsplichtig, onderhoudsplichtig }) {
+        const res = await this.post('materials', {
+            name: String(name || '').trim(),
+            brand: String(brand || '').trim() || null,
+            serialNumber: String(serialNumber || '').trim() || null,
+            stockLocationId: stockLocationId ? String(stockLocationId) : null,
+            status: 'actief',
+        });
+        if (res.code !== 200 && res.code !== 201) throw new Error('Aanmaken gaf status ' + res.code);
+        const id = res.data && res.data.id;
+        if (!id) throw new Error('Aanmaken gaf geen id terug');
+        const extra = {};
+        if (type) extra['Type'] = { type: 'SELECT', stringValue: String(type) };
+        if (keuringsplichtig !== undefined && keuringsplichtig !== null) {
+            extra['Keuringsplicht'] = { type: 'CHECKBOX', booleanValue: !!keuringsplichtig };
+        }
+        if (onderhoudsplichtig !== undefined && onderhoudsplichtig !== null) {
+            extra['Onderhoudsplicht'] = { type: 'CHECKBOX', booleanValue: !!onderhoudsplichtig };
+        }
+        if (Object.keys(extra).length) {
+            const p = await this.patchMerge('materials/' + id, { extraFields: extra });
+            if (p.code !== 200 && p.code !== 201 && p.code !== 204) console.warn('[Gereedschap] extravelden zetten faalde op #' + id + ' (' + p.code + ')');
+        }
+        return String(id);
+    },
+
+    // =============================================
+    // v361: KLEDIJ & PBM (Logistiek — bureel)
+    //
+    // Uitgiftes staan als JSON in het extraveld "Kledij" (LONG_TEXT) op de
+    // WERKNEMER — zelfde co-located patroon als "Reserveringen" op materieel.
+    // Waarom daar: de werknemerslijst levert extraFields mee (gemeten
+    // 12 aug), dus één call geeft het volledige register; en merge-PATCH op
+    // /employees is bewezen veilig (no-op-proef op fiche 1: 27 extraFields,
+    // 0 gewist). Bekende beperking (zoals materieel): last-write-wins per
+    // werknemer — daarom lezen we altijd vers vóór het schrijven.
+    //
+    // Vorm: { v:1, maten:{schoen,broek,boven}, regels:[
+    //          { id, datum, type:'uit'|'in', door, opm,
+    //            items:[{art, aantal, maat}] } ] }
+    // =============================================
+
+    KLEDIJ_FIELD: 'Kledij',
+
+    /** Vaste artikelcatalogus (lijst Levi 12 aug). `maat` verwijst naar het
+     *  maat-slot van de werknemer; artikelen zonder maat vragen er geen. */
+    KLEDIJ_ARTIKELEN: [
+        { id: 'schoenen',    naam: 'Veiligheidsschoenen', groep: 'kledij', maat: 'schoen' },
+        { id: 'lange_broek', naam: 'Lange broek',         groep: 'kledij', maat: 'broek' },
+        { id: 'korte_broek', naam: 'Korte broek',         groep: 'kledij', maat: 'broek' },
+        { id: 'tshirt',      naam: 'T-shirt',             groep: 'kledij', maat: 'boven' },
+        { id: 'trui_rits',   naam: 'Trui met rits',       groep: 'kledij', maat: 'boven' },
+        { id: 'hoodie',      naam: 'Hoodie',              groep: 'kledij', maat: 'boven' },
+        { id: 'wintertrui',  naam: 'Wintertrui',          groep: 'kledij', maat: 'boven' },
+        { id: 'jas',         naam: 'Jas',                 groep: 'kledij', maat: 'boven' },
+        { id: 'pet',         naam: 'Pet',                 groep: 'kledij', maat: null },
+        { id: 'muts',        naam: 'Muts',                groep: 'kledij', maat: null },
+        { id: 'bril',        naam: 'Veiligheidsbril',     groep: 'pbm',    maat: null },
+        { id: 'handschoen',  naam: 'Handschoenen',        groep: 'pbm',    maat: null },
+        { id: 'gehoor',      naam: 'Gehoorbescherming',   groep: 'pbm',    maat: null },
+        { id: 'helm',        naam: 'Veiligheidshelm',     groep: 'pbm',    maat: null },
+        { id: 'masker',      naam: 'Stofmasker / FFP',    groep: 'pbm',    maat: null },
+        { id: 'knie',        naam: 'Kniebeschermers',     groep: 'pbm',    maat: null },
+    ],
+
+    kledijArtikel(id) {
+        return this.KLEDIJ_ARTIKELEN.find(a => a.id === id) || null;
+    },
+
+    /** Bestaat de velddefinitie al? (endpoint gemeten 12 aug.) Voorkomt de
+     *  stille "204-maar-plakt-niet"-val als Levi het veld nog moet maken.
+     *  Bij twijfel (endpoint onbereikbaar) → true, nooit onnodig blokkeren. */
+    async kledijVeldBestaat() {
+        try {
+            const r = await this.get('resource-types/employee/extra-fields');
+            if (r.code !== 200 || !r.data) return true;
+            const lijst = Array.isArray(r.data) ? r.data : (r.data.items || []);
+            if (!lijst.length) return true;
+            return lijst.some(f => String(f.label || '').trim() === this.KLEDIJ_FIELD);
+        } catch (e) { return true; }
+    },
+
+    /** Kledij-JSON van een werknemer-object (robuust; lege vorm bij leeg/kapot). */
+    _kledijParse(emp) {
+        const leeg = { v: 1, maten: {}, regels: [] };
+        const f = emp && emp.extraFields && emp.extraFields[this.KLEDIJ_FIELD];
+        const raw = f ? (f.stringValue ?? f.value ?? null) : null;
+        if (!raw) return leeg;
+        try {
+            const o = JSON.parse(String(raw));
+            if (!o || typeof o !== 'object') return leeg;
+            return {
+                v: o.v || 1,
+                maten: (o.maten && typeof o.maten === 'object') ? o.maten : {},
+                regels: Array.isArray(o.regels) ? o.regels : [],
+            };
+        } catch (e) {
+            console.warn('[Kledij] JSON onleesbaar op werknemer', emp && emp.id, '— als leeg behandeld');
+            return leeg;
+        }
+    },
+
+    /** Alle werknemers met hun kledij-register (1 call; stopgezette blijven
+     *  meekomen — bureel moet zien wat er nog terug moet). */
+    async getKledijWerknemers(opts) {
+        const alle = [];
+        for (let off = 0; off < 500; off += 100) {
+            const r = await this.get('employees?limit=100&offset=' + off, opts);
+            if (r.code !== 200) throw new Error('Werknemers laden mislukt (' + r.code + ')');
+            const items = (r.data && r.data.items) || [];
+            alle.push(...items);
+            if (items.length < 100) break;
+        }
+        return alle.map(e => ({
+            employeeId: String(e.id),
+            name: [e.firstName, e.lastName].filter(Boolean).join(' ') || e.fullName || e.name || e.email || '(naamloos)',
+            status: String(e.status || ''),
+            gestopt: /stopgezet/i.test(String(e.status || '')),
+            kledij: this._kledijParse(e),
+        }));
+    },
+
+    /** Nieuwe regel toevoegen (uitgifte of inlevering) + maten bijwerken.
+     *  Leest ALTIJD vers vóór het schrijven (last-write-wins beperken). */
+    async addKledijRegel(employeeId, regel, maten) {
+        const r = await this.get('employees/' + employeeId, { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('Werknemer niet gevonden (' + r.code + ')');
+        const huidig = this._kledijParse(r.data);
+        huidig.regels.push(regel);
+        if (maten && typeof maten === 'object') {
+            huidig.maten = Object.assign({}, huidig.maten, maten);
+        }
+        return await this._kledijSchrijf(employeeId, huidig);
+    },
+
+    /** Eén regel verwijderen (correctie van een vergissing). */
+    async removeKledijRegel(employeeId, regelId) {
+        const r = await this.get('employees/' + employeeId, { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('Werknemer niet gevonden (' + r.code + ')');
+        const huidig = this._kledijParse(r.data);
+        huidig.regels = huidig.regels.filter(x => String(x.id) !== String(regelId));
+        return await this._kledijSchrijf(employeeId, huidig);
+    },
+
+    async _kledijSchrijf(employeeId, obj) {
+        const res = await this.patchMerge('employees/' + employeeId, { extraFields: {
+            [this.KLEDIJ_FIELD]: { type: 'LONG_TEXT', stringValue: JSON.stringify(obj) },
+        } });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** Document (ontvangstbewijs) op de werknemersfiche — route bewezen in
+     *  v311 (uren-export). */
+    async uploadEmployeeHtml(employeeId, html, fileName) {
+        const file = new File([new Blob([html], { type: 'text/html' })], fileName, { type: 'text/html' });
+        const res = await this.uploadFile('employees/' + employeeId + '/documents', file, fileName);
+        if (res.code !== 200 && res.code !== 201) throw new Error('Upload gaf status ' + res.code);
+        return (res.data && res.data.id) || null;
+    },
+
+    /** v358: NFC-tag van een materiaal zetten of wissen (extraveld
+     *  "NFC-tag", Tekst — Levi maakt het veld aan). Wissen = null. */
+    async setMaterialNfcTag(materialId, tagId) {
+        const res = await this.patchMerge('materials/' + materialId, { extraFields: {
+            'NFC Tag': { type: 'TEXT', stringValue: tagId ? String(tagId) : null },
+        } });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
+
+    /** v357: HTML-document (onderhoudsregistratie) op een materiaal zetten.
+     *  Zelfde route als de foto-upload; text/html i.p.v. afbeelding. */
+    async uploadMaterialHtml(materialId, html, fileName) {
+        const file = new File([new Blob([html], { type: 'text/html' })], fileName, { type: 'text/html' });
+        const res = await this.uploadFile('materials/' + materialId + '/documents', file, fileName);
+        if (res.code !== 200 && res.code !== 201) throw new Error('Upload gaf status ' + res.code);
+        return (res.data && res.data.id) || null;
+    },
+
+    /** v352: foto (dataURL) als document op een materiaal zetten.
+     *  POST /materials/{id}/documents live bewezen (upload+delete-proef 12 aug).
+     *  Geeft het document-id terug; gooit bij non-2xx. */
+    async uploadMaterialDocument(materialId, dataUrl, fileName) {
+        let base64 = String(dataUrl || '');
+        if (base64.includes(',')) base64 = base64.split(',')[1];
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
+        const contentType = /\.png$/i.test(fileName) ? 'image/png' : 'image/jpeg';
+        const file = new File([new Blob([bytes], { type: contentType })], fileName, { type: contentType });
+        const res = await this.uploadFile('materials/' + materialId + '/documents', file, fileName);
+        if (res.code !== 200 && res.code !== 201) throw new Error('Upload gaf status ' + res.code);
+        return (res.data && res.data.id) || null;
+    },
+
+    /** Keuring inplannen: dagplanning type "Keuring", gekozen tijden
+     *  (default 06:45-08:00 lokaal), adres Keuring Deurne.
+     *  POST live bewezen (proef 10 aug). */
+    async createKeuringPlanning({ datumISO, employeeId, employeeName, plaat, startTijd, eindTijd, locatie }) {
+        const dag = String(datumISO).slice(0, 10);
+        const start = new Date(dag + 'T' + (startTijd || '06:45') + ':00');
+        const eind = new Date(dag + 'T' + (eindTijd || '08:00') + ':00');
+        // v349: écht stationsadres (keuzemenu in de app); Deurne = default
+        const loc = locatie || this.KEURING_LOCATIES[0];
+        const res = await this.post('planning-items', {
+            planningTypeId: this.KEURING_PLANNING_TYPE_ID,
+            employeeIds: [String(employeeId)],
+            summary: employeeName + ' - Keuring ' + plaat,
+            startDate: start.toISOString(),
+            endDate: eind.toISOString(),
+            address: { addressLine1: loc.straat, postalCode: loc.postcode, city: loc.stad, country: 'BE' },
+        });
+        if (res.code !== 200 && res.code !== 201) throw new Error('Robaws gaf status ' + res.code);
+        return (res.data && res.data.id) || null;
+    },
+
+    /** Geplande keuringen (komende 120 d) — client-side op type gefilterd
+     *  (planningTypeId-filter werkt niet server-side; wacht-les v314). */
+    async getKeuringPlanningen() {
+        const van = new Date(); const tot = new Date(Date.now() + 120 * 24 * 3600e3);
+        const iso = (d) => d.toISOString().slice(0, 10);
+        const r = await this.get('planning-items?fromDate=' + iso(van) + '&toDate=' + iso(tot) + '&limit=100', { bypassCache: true });
+        if (r.code !== 200) return [];
+        const items = (r.data && (r.data.items || [])) || [];
+        return items.filter(p => String(p.planningTypeId) === this.KEURING_PLANNING_TYPE_ID);
     },
 
     async _getMaterieelFresh(materialId) {
@@ -2835,6 +3185,40 @@ const RobawsAPI = {
         const empRes = await this.get('employees/1');
         if (empRes.code !== 200 || !empRes.data) throw new Error('Kon werknemer niet ophalen');
         const config = this._parseNfcTags(empRes.data.extraFields || {});
+
+        // v359: camionet-klok-tags kunnen óók op het VOERTUIG-materiaal staan
+        // (extraveld "NFC-tag" — de verhuis van fiche 1 naar Materieel, vraag
+        // Levi 12 aug). Beide bronnen samen = veilige overgang: zelfde tag op
+        // beide → het materiaal bepaalt de naam; valt de materials-call weg →
+        // fiche-bron blijft gewoon werken (de klok mag NOOIT breken).
+        // ALLEEN Type "1. Bestelwagens"/"2. Personenwagens" telt als
+        // klok-camionet — een tag op bv. de aanhangwagen of gereedschap mag
+        // nooit per ongeluk in-/uitklokken (die volgen de materieel-route).
+        try {
+            const mats = await this.getMaterials();
+            const perTag = {};
+            for (const c of config.camionetten) {
+                const t = String(c.tagId || '').trim().toLowerCase();
+                if (t) perTag[t] = c;
+            }
+            for (const mat of mats) {
+                const f = mat.extraFields && mat.extraFields['NFC Tag'];   // v360: échte veldnaam
+                const tid = f ? String(f.stringValue ?? f.value ?? '').trim() : '';
+                if (!tid) continue;
+                const typeF = mat.extraFields && mat.extraFields['Type'];
+                const typeVal = typeF ? String(typeF.stringValue ?? typeF.value ?? '') : '';
+                if (!/^(1\.|2\.)/.test(typeVal.trim())) continue;   // geen klok-voertuig
+                const bekend = perTag[tid.toLowerCase()];
+                if (bekend) {
+                    bekend.name = mat.name || bekend.name;
+                    bekend.materialId = String(mat.id);
+                } else {
+                    config.camionetten.push({ name: mat.name || ('#' + mat.id), fieldName: null, materialId: String(mat.id), tagId: tid });
+                }
+            }
+        } catch (e) {
+            console.warn('[RobawsAPI] materieel-tags niet geladen — klok draait op de fiche-bron:', e && e.message);
+        }
 
         // Startuur + Pauze ophalen van de INGELOGDE werknemer (persoonlijk)
         // BUG-fix v56: ook voor werknemer 1, en lees alle mogelijke value-types
