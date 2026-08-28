@@ -1401,6 +1401,209 @@ const RobawsAPI = {
     //            items:[{art, aantal, maat}] } ] }
     // =============================================
 
+    // =============================================
+    // v363: WERKNEMERSBUDGET (Logistiek — bureel)
+    //
+    // Elke werknemer krijgt een JAARBUDGET voor alles wat hij nodig heeft
+    // (klein gereedschap, verbruik, kledij). Wat hij kwijtmaakt of stukmaakt
+    // gaat eraf — doel is zorg dragen voor het materiaal. Opslag = JSON in
+    // extraveld "Budget" (LONG_TEXT) op de WERKNEMER, zelfde patroon als
+    // "Kledij" (merge-PATCH op /employees bewezen veilig, 12 aug).
+    //
+    // Vorm: { v:1, jaarbudget:250, regels:[
+    //          { id, datum, art, oms, aantal, stukprijs, totaal,
+    //            reden:'kwijt'|'kapot'|'versleten'|'nieuw',
+    //            laste:'budget'|'firma', door, opm } ] }
+    // De PRIJS wordt in de regel bewaard: latere prijswijzigingen raken de
+    // historiek nooit.
+    // =============================================
+
+    BUDGET_FIELD: 'Budget',
+    BUDGET_STANDAARD: 500,   // standaard jaarbudget in euro als er niets is ingesteld (Levi, 21 aug)
+
+    /** Richtprijzen — altijd aanpasbaar bij het boeken; de geboekte prijs
+     *  wordt in de regel bewaard. `kledij` koppelt aan KLEDIJ_ARTIKELEN zodat
+     *  één boeking ook het kledijregister kan bijwerken. */
+    BUDGET_ARTIKELEN: [
+        { id: 'vouwmeter',     naam: 'Vouwmeter',              groep: 'meten',           prijs: 8 },
+        { id: 'rolmeter',      naam: 'Rolmeter 5 m',           groep: 'meten',           prijs: 14 },
+        { id: 'waterpas',      naam: 'Waterpas 40 cm',         groep: 'meten',           prijs: 25 },
+        { id: 'potlood',       naam: 'Potlood / markeerstift', groep: 'verbruik',        prijs: 3 },
+        { id: 'mes',           naam: 'Mes / cutter',           groep: 'verbruik',        prijs: 12 },
+        { id: 'mesjes',        naam: 'Reservemesjes',          groep: 'verbruik',        prijs: 4 },
+        { id: 'zaagblad',      naam: 'Zaagbladen',             groep: 'verbruik',        prijs: 9 },
+        { id: 'boortjes',      naam: 'Boortjes',               groep: 'verbruik',        prijs: 15 },
+        { id: 'tang',          naam: 'Combinatietang',         groep: 'handgereedschap', prijs: 22 },
+        { id: 'waterpomptang', naam: 'Waterpomptang',          groep: 'handgereedschap', prijs: 28 },
+        { id: 'sleutel',       naam: 'Verstelbare sleutel',    groep: 'handgereedschap', prijs: 30 },
+        { id: 'schroefset',    naam: 'Schroevendraaierset',    groep: 'handgereedschap', prijs: 35 },
+        { id: 'inbusset',      naam: 'Inbussleutelset',        groep: 'handgereedschap', prijs: 18 },
+        { id: 'hamer',         naam: 'Hamer',                  groep: 'handgereedschap', prijs: 20 },
+        { id: 'buizensnijder', naam: 'Buizensnijder',          groep: 'handgereedschap', prijs: 25 },
+        { id: 'ontbramer',     naam: 'Ontbramer',              groep: 'handgereedschap', prijs: 12 },
+        { id: 'zaklamp',       naam: 'Zaklamp',                groep: 'handgereedschap', prijs: 25 },
+        { id: 'koffer',        naam: 'Gereedschapskoffer',     groep: 'handgereedschap', prijs: 60 },
+        { id: 'riem',          naam: 'Gereedschapsriem',       groep: 'handgereedschap', prijs: 35 },
+        { id: 'werkbroek',     naam: 'Werkbroek',              groep: 'kledij', prijs: 45, kledij: 'lange_broek' },
+        { id: 'korte_broek',   naam: 'Korte broek',            groep: 'kledij', prijs: 35, kledij: 'korte_broek' },
+        { id: 'tshirt',        naam: 'T-shirt',                groep: 'kledij', prijs: 15, kledij: 'tshirt' },
+        { id: 'hoodie',        naam: 'Hoodie',                 groep: 'kledij', prijs: 35, kledij: 'hoodie' },
+        { id: 'jas',           naam: 'Jas',                    groep: 'kledij', prijs: 90, kledij: 'jas' },
+        { id: 'schoenen',      naam: 'Veiligheidsschoenen',    groep: 'kledij', prijs: 85, kledij: 'schoenen' },
+    ],
+
+    /** v364: de GEDEELDE artikelcatalogus. Staat als `catalogus` in de
+     *  Budget-JSON van fiche 1 (zelfde 'gedeelde configuratie'-plek als de
+     *  NFC-klok-tags); leeg of onleesbaar → de ingebouwde startlijst. */
+    CATALOGUS_FICHE: '1',
+    budgetCatalogus(werknemers) {
+        const een = (werknemers || []).find(w => String(w.employeeId) === this.CATALOGUS_FICHE);
+        const c = een && een.budget && Array.isArray(een.budget.catalogus) ? een.budget.catalogus : null;
+        return (c && c.length) ? c : this.BUDGET_ARTIKELEN;
+    },
+
+    /** Catalogus opslaan (op fiche 1; de rest van die Budget-JSON blijft). */
+    async saveBudgetCatalogus(lijst) {
+        const r = await this.get('employees/' + this.CATALOGUS_FICHE, { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('Fiche 1 niet gevonden (' + r.code + ')');
+        const huidig = this._budgetParse(r.data);
+        huidig.catalogus = (lijst || []).map(a => ({
+            id: String(a.id || '').replace(/[^a-z0-9_-]/gi, '').slice(0, 40),
+            naam: String(a.naam || '').trim().slice(0, 80),
+            groep: String(a.groep || 'overig').trim().slice(0, 40),
+            prijs: Math.round((Number(a.prijs) || 0) * 100) / 100,
+            bewijs: !!a.bewijs,
+        })).filter(a => a.id && a.naam);
+        return await this._budgetSchrijf(this.CATALOGUS_FICHE, huidig);
+    },
+    /** v366: heeft deze werknemer een budget? De vlag `budgetAan` in zijn
+     *  eigen Budget-JSON beslist; ontbreekt die, dan telt de rol mee —
+     *  bureel krijgt geen budget, monteurs/techniekers wel. Zo verschijnt
+     *  een nieuwe bediende nooit vanzelf in de lijst. */
+    budgetHeeftRecht(budgetObj, rol) {
+        const v = budgetObj && budgetObj.budgetAan;
+        if (v === true || v === false) return v;
+        return String(rol || '') !== 'bureel';
+    },
+
+    /** Budget aan- of uitzetten voor één werknemer. */
+    async setBudgetAan(employeeId, aan) {
+        const r = await this.get('employees/' + employeeId, { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('Werknemer niet gevonden (' + r.code + ')');
+        const huidig = this._budgetParse(r.data);
+        huidig.budgetAan = !!aan;
+        return await this._budgetSchrijf(employeeId, huidig);
+    },
+    // v367: het budgetjaar loopt van 1 AUGUSTUS t/m 31 JULI. Een jaar
+    // heet naar zijn STARTJAAR: '2026' = 1 aug 2026 t/m 31 jul 2027.
+    BUDGET_STARTMAAND: 8,
+
+    /** Budgetjaar (startjaar, als string) waarin een datum valt. */
+    budgetJaarVan(datumISO) {
+        const s = String(datumISO || '');
+        const j = parseInt(s.slice(0, 4), 10);
+        const m = parseInt(s.slice(5, 7), 10);
+        if (!isFinite(j) || !isFinite(m)) return '';
+        return String(m >= this.BUDGET_STARTMAAND ? j : j - 1);
+    },
+
+    /** Het budgetjaar waarin we vandaag zitten. */
+    budgetJaarNu() {
+        const d = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        return this.budgetJaarVan(d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()));
+    },
+
+    /** Leesbaar label, bv. '2026–2027'. */
+    budgetJaarLabel(startJaar) {
+        if (String(startJaar) === 'alles') return 'alle jaren';   // v372
+        const j = parseInt(startJaar, 10);
+        return isFinite(j) ? (j + '\u2013' + (j + 1)) : String(startJaar || '');
+    },
+    budgetArtikel(id) {
+        return this.BUDGET_ARTIKELEN.find(a => a.id === id) || null;
+    },
+
+    /** Budget-JSON van een werknemer-object (robuust; lege vorm bij leeg/kapot). */
+    _budgetParse(emp) {
+        const leeg = { v: 1, jaarbudget: null, regels: [] };
+        const f = emp && emp.extraFields && emp.extraFields[this.BUDGET_FIELD];
+        const raw = f ? (f.stringValue ?? f.value ?? null) : null;
+        if (!raw) return leeg;
+        try {
+            const o = JSON.parse(String(raw));
+            if (!o || typeof o !== 'object') return leeg;
+            const jb = Number(o.jaarbudget);
+            // v364: onbekende sleutels bewaren — op fiche 1 staat hier ook
+            // `catalogus` (de gedeelde artikellijst); die mag een schrijfactie
+            // op iemands budget nooit wissen.
+            return Object.assign({}, o, {
+                v: o.v || 1,
+                jaarbudget: isFinite(jb) && jb > 0 ? jb : null,
+                regels: Array.isArray(o.regels) ? o.regels : [],
+            });
+        } catch (e) {
+            console.warn('[Budget] JSON onleesbaar op werknemer', emp && emp.id, '— als leeg behandeld');
+            return leeg;
+        }
+    },
+
+    /** Bestaat de velddefinitie "Budget" al op Werknemers? */
+    async budgetVeldBestaat() {
+        try {
+            const r = await this.get('resource-types/employee/extra-fields');
+            if (r.code !== 200 || !r.data) return true;
+            const lijst = Array.isArray(r.data) ? r.data : (r.data.items || []);
+            if (!lijst.length) return true;
+            return lijst.some(f => String(f.label || '').trim() === this.BUDGET_FIELD);
+        } catch (e) { return true; }
+    },
+
+    async addBudgetRegel(employeeId, regel) {
+        const r = await this.get('employees/' + employeeId, { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('Werknemer niet gevonden (' + r.code + ')');
+        const huidig = this._budgetParse(r.data);
+        huidig.regels.push(regel);
+        return await this._budgetSchrijf(employeeId, huidig);
+    },
+
+    /** v373: meerdere regels in ÉÉN lees-muteer-schrijf (één boeking met
+     *  meerdere artikelen). Scheelt calls en voorkomt half geschreven
+     *  boekingen bij een fout halverwege. */
+    async addBudgetRegels(employeeId, regels) {
+        const lijst = Array.isArray(regels) ? regels : [regels];
+        if (!lijst.length) return true;
+        const r = await this.get('employees/' + employeeId, { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('Werknemer niet gevonden (' + r.code + ')');
+        const huidig = this._budgetParse(r.data);
+        for (const x of lijst) huidig.regels.push(x);
+        return await this._budgetSchrijf(employeeId, huidig);
+    },
+    async removeBudgetRegel(employeeId, regelId) {
+        const r = await this.get('employees/' + employeeId, { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('Werknemer niet gevonden (' + r.code + ')');
+        const huidig = this._budgetParse(r.data);
+        huidig.regels = huidig.regels.filter(x => String(x.id) !== String(regelId));
+        return await this._budgetSchrijf(employeeId, huidig);
+    },
+
+    /** Jaarbudget van één werknemer instellen (leeg = terug naar standaard). */
+    async setJaarbudget(employeeId, bedrag) {
+        const r = await this.get('employees/' + employeeId, { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('Werknemer niet gevonden (' + r.code + ')');
+        const huidig = this._budgetParse(r.data);
+        const n = Number(bedrag);
+        huidig.jaarbudget = isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null;
+        return await this._budgetSchrijf(employeeId, huidig);
+    },
+
+    async _budgetSchrijf(employeeId, obj) {
+        const res = await this.patchMerge('employees/' + employeeId, { extraFields: {
+            [this.BUDGET_FIELD]: { type: 'LONG_TEXT', stringValue: JSON.stringify(obj) },
+        } });
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        return true;
+    },
     KLEDIJ_FIELD: 'Kledij',
 
     /** Vaste artikelcatalogus (lijst Levi 12 aug). `maat` verwijst naar het
@@ -1477,7 +1680,9 @@ const RobawsAPI = {
             name: [e.firstName, e.lastName].filter(Boolean).join(' ') || e.fullName || e.name || e.email || '(naamloos)',
             status: String(e.status || ''),
             gestopt: /stopgezet/i.test(String(e.status || '')),
+            rol: this._roleFromEmployee(e),   // v366: standaard-budgetrecht
             kledij: this._kledijParse(e),
+            budget: this._budgetParse(e),   // v363: zelfde call bedient beide modules
         }));
     },
 
@@ -1530,6 +1735,53 @@ const RobawsAPI = {
         return true;
     },
 
+    // v368: DOCUMENTMAPPEN op een werknemersfiche. GEMETEN 24 aug:
+    //  - map aanmaken = JSON-POST { name, directory:true, parentId? }
+    //  - bestand in een map = multipart met het veld `parentId`
+    //  - de platte lijst /employees/{id}/documents bevat álles, met
+    //    parentId (leeg = bovenste niveau); een submap-lijst bestaat niet
+    //    (/documents/{id}/documents = 404), dus we leiden de boom hieruit af.
+
+    /** Zoek-of-maak een mappenpad, bv. ['Ontvangstbewijzen','2026'].
+     *  Geeft het id van de diepste map terug. */
+    async ensureEmployeeMap(employeeId, pad) {
+        const delen = (pad || []).map(x => String(x || '').trim()).filter(Boolean);
+        let ouder = null;
+        let docs = await this._employeeDocs(employeeId);
+        for (const naam of delen) {
+            const bestaat = docs.find(d => d && d.directory &&
+                String(d.name || '').toLowerCase() === naam.toLowerCase() &&
+                String(d.parentId || '') === String(ouder || ''));
+            if (bestaat) { ouder = String(bestaat.id); continue; }
+            const body = { name: naam, directory: true };
+            if (ouder) body.parentId = String(ouder);
+            const r = await this.post('employees/' + employeeId + '/documents', body);
+            const nieuw = r.data;
+            if ((r.code !== 200 && r.code !== 201) || !nieuw || !nieuw.id) {
+                throw new Error('Map "' + naam + '" aanmaken mislukte (' + r.code + ')');
+            }
+            ouder = String(nieuw.id);
+            docs = await this._employeeDocs(employeeId);
+        }
+        return ouder;
+    },
+
+    async _employeeDocs(employeeId) {
+        const r = await this.get('employees/' + employeeId + '/documents?limit=100', { bypassCache: true });
+        if (r.code !== 200) return [];
+        const d = r.data;
+        const lijst = (d && (d.items || d.data || (Array.isArray(d) ? d : []))) || [];
+        return Array.isArray(lijst) ? lijst : [];
+    },
+
+    /** PDF (Uint8Array) als document op de werknemersfiche, eventueel in een map. */
+    async uploadEmployeePdf(employeeId, bytes, fileName, parentId) {
+        const file = new File([new Blob([bytes], { type: 'application/pdf' })], fileName, { type: 'application/pdf' });
+        const res = await this.uploadFile('employees/' + employeeId + '/documents', file, fileName,
+            parentId ? { parentId: String(parentId) } : null);
+        if (res.code !== 200 && res.code !== 201) throw new Error('Upload gaf status ' + res.code);
+        return (res.data && res.data.id) || null;
+    },
     /** v357: HTML-document (onderhoudsregistratie) op een materiaal zetten.
      *  Zelfde route als de foto-upload; text/html i.p.v. afbeelding. */
     async uploadMaterialHtml(materialId, html, fileName) {
@@ -1690,13 +1942,15 @@ const RobawsAPI = {
         return out.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
     },
 
-    async uploadFile(endpoint, file, fileName) {
+    async uploadFile(endpoint, file, fileName, extra) {
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
         const _ap = this._authPair();  // v231: per-werknemer key indien aanwezig
         const auth = btoa(_ap.key + ':' + _ap.secret);
 
         const formData = new FormData();
         formData.append('file', file, fileName);
+        // v368: extra velden (bv. parentId om in een map te plaatsen)
+        if (extra) for (const k of Object.keys(extra)) if (extra[k] != null) formData.append(k, String(extra[k]));
 
         const res = await this._fetchWithTimeout(url, {   // v207: ruime upload-timeout
             method: 'POST',
@@ -6891,7 +7145,16 @@ const RobawsAPI = {
         for (let p = 0; p < 3; p++) {
             const offset = p * LIMIT;
             const res = await this.get(`work-orders?limit=${LIMIT}&offset=${offset}&sort=id:desc`);
-            if (res.code !== 200 || !res.data || !res.data.items || res.data.items.length === 0) break;
+            // v378: een MISLUKTE read (429/5xx/replica-storing) mag NOOIT als
+            // "geen werkbon vandaag" gelden — de sync wiste dan de lokale
+            // sessie en de eerstvolgende uitklok-scan werd stil een 2e INKLOK
+            // (dag bleef open, ochtenduren verloren in de 23:45-afsluiting;
+            // gemeten 19-25 aug bij bureel). Fout = gooien; alle aanroepers
+            // hebben een net catch-pad ("sessie behouden" / "probeer opnieuw").
+            if (res.code !== 200 || !res.data || !res.data.items) {
+                throw new Error('werkbonnen-lijst faalde (HTTP ' + res.code + ')');
+            }
+            if (res.data.items.length === 0) break;
             for (const wo of res.data.items) {
                 if (wo.id == null || seen.has(String(wo.id))) continue;
                 seen.add(String(wo.id));
