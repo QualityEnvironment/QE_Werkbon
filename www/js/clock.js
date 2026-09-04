@@ -655,23 +655,46 @@ window.QEClock = {
                             // lokale sessie gewoon verouderd: opruimen en door.
                             // Voorheen kreeg de werknemer dan "Nog ingeklokt van
                             // gisteren" terwijl bureel "succes uitgeklokt" zag.
+                            // v382: de controle-read krijgt 's ochtends geregeld een 429
+                            // (burst-teller van de gedeelde key). Onbekend is NIET open:
+                            // één herkansing na 1,5 s, en blijft het onbekend dan vragen
+                            // we NIET om af te sluiten (dat gaf de valse 'nog uitklokken'
+                            // + een 429 bij het afsluiten). De oude sessie blijft staan en
+                            // wordt bij de volgende scan opnieuw gecontroleerd.
                             let robawsDicht = null;
-                            try {
-                                const wr = await RobawsAPI.get('work-orders/' + oldOpen.session.workOrderId, { bypassCache: true });
-                                if (wr.code === 200 && wr.data) {
-                                    const uf = wr.data.extraFields && wr.data.extraFields.Uitgeklokt;
-                                    const uv = uf ? String(uf.stringValue ?? uf.value ?? '').trim() : '';
-                                    robawsDicht = uv || false;
-                                } else if (wr.code === 404) {
-                                    robawsDicht = 'verwijderd';
-                                }
-                            } catch (_) { /* onbekend → gewone flow */ }
-                            if (robawsDicht) {
+                            let controleGelukt = false;
+                            for (let poging = 0; poging < 2 && !controleGelukt; poging++) {
+                                if (poging > 0) await new Promise(r => setTimeout(r, 1500));
+                                try {
+                                    const wr = await RobawsAPI.get('work-orders/' + oldOpen.session.workOrderId, { bypassCache: true });
+                                    if (wr.code === 200 && wr.data) {
+                                        const uf = wr.data.extraFields && wr.data.extraFields.Uitgeklokt;
+                                        const uv = uf ? String(uf.stringValue ?? uf.value ?? '').trim() : '';
+                                        // v383: een VERGRENDELDE of GECONTROLEERDE dag is dicht, ook
+                                        // als het Uitgeklokt-veld leeg bleef (uren-controle zet dat
+                                        // veld niet; T264048 1 sep: gelockt, Uitgeklokt leeg → elke
+                                        // ochtend de afsluit-vraag + 423 bij het afsluiten).
+                                        const gelockt = !!wr.data.lockedAt || /gecontrol/i.test(String(wr.data.status || ''));
+                                        robawsDicht = uv || (gelockt ? 'vergrendeld' : false);
+                                        controleGelukt = true;
+                                    } else if (wr.code === 404) {
+                                        robawsDicht = 'verwijderd';
+                                        controleGelukt = true;
+                                    } else {
+                                        console.warn('[Clock] gisteren-check: werkbon-read gaf', wr.code, '(poging ' + (poging + 1) + ')');
+                                    }
+                                } catch (e) { console.warn('[Clock] gisteren-check faalde (poging ' + (poging + 1) + '):', e && e.message); }
+                            }
+                            if (!controleGelukt) {
+                                if (window.app && app.toast) app.toast('Kon ' + oldOpen.dStr + ' niet controleren bij Robaws (even druk) — de scan gaat door; het wordt bij de volgende scan opnieuw bekeken');
+                            } else if (robawsDicht) {
                                 try { localStorage.removeItem(oldOpen.key); } catch (_) {}
                                 if (window.app) {
                                     app.toast(robawsDicht === 'verwijderd'
                                         ? 'De open dag van ' + oldOpen.dStr + ' bestaat niet meer in Robaws — genegeerd'
-                                        : oldOpen.dStr + ' was al afgesloten om ' + robawsDicht + ' — de scan gaat gewoon door');
+                                        : robawsDicht === 'vergrendeld'
+                                            ? oldOpen.dStr + ' is al gecontroleerd en vergrendeld door bureel — genegeerd, de scan gaat gewoon door'
+                                            : oldOpen.dStr + ' was al afgesloten om ' + robawsDicht + ' — de scan gaat gewoon door');
                                 }
                             } else {
                                 const sluiten = await this._showConfirmModal(
@@ -687,10 +710,18 @@ window.QEClock = {
                                     { name: 'Automatische afsluiting (middernacht)' },
                                     { forcedEndTime: '23:45', skipKilometers: true });
                                 if (!yRes.ok) {
-                                    scanResult = { ok: false, message: 'Afsluiten van ' + oldOpen.dStr + ' mislukte:\n' + (yRes.message || '') };
-                                    return;
-                                }
+                                    if (/\b423\b/.test(String(yRes.message || ''))) {
+                                        // v383: intussen vergrendeld door bureel → niets meer te boeken;
+                                        // spooksessie opruimen, scan van vandaag gaat door.
+                                        try { localStorage.removeItem(oldOpen.key); } catch (_) {}
+                                        if (window.app) app.toast(oldOpen.dStr + ' is intussen gecontroleerd en vergrendeld door bureel — genegeerd, de scan gaat gewoon door');
+                                    } else {
+                                        scanResult = { ok: false, message: 'Afsluiten van ' + oldOpen.dStr + ' mislukte:\n' + this._netFout(yRes.message || '') };
+                                        return;
+                                    }
+                                } else {
                                 if (window.app) app.toast(oldOpen.dStr + ' afgesloten om 23:45');
+                                }
                             }
                         }
                     } catch (e) { console.warn('[Clock] gisteren-check faalde:', e && e.message); }
@@ -1041,6 +1072,57 @@ window.QEClock = {
     // UITCLOCKEN (v58: post time-entry + zet Uitgeklokt)
     // =============================================
 
+    /** v382: netwerk-/API-fouten in mensentaal voor de scan-overlays. Een
+     *  429 (te veel verzoeken — de gedeelde seconde-teller van de key, druk
+     *  rond de ochtendscans + automations) is geen 'fout' van de werknemer. */
+    _netFout(msg) {
+        const m = String(msg || '');
+        if (/\b423\b/.test(m)) return 'Deze dag is al gecontroleerd en vergrendeld door bureel — er kan niets meer aan geboekt worden.';
+        if (/\b429\b/.test(m)) return 'Robaws is even te druk (te veel verzoeken tegelijk). Wacht een halve minuut en scan opnieuw — er is niets verloren.';
+        if (/failed to fetch|net::err|networkerror|timeout|load failed/i.test(m)) return 'Geen verbinding met Robaws. Controleer je netwerk en scan opnieuw — er is niets verloren.';
+        return m;
+    },
+
+    /** v381: de tijdsblok-grenzen van een uitklok — ÉÉN berekening voor de
+     *  klok (_clockOut) én de werkbon-overname (app._fillKlokurenForMonteur),
+     *  zodat werkbon en tijdsregistratie altijd dezelfde uren dragen.
+     *  Regels (v74/v94): kwartier-afronding met 4 min tolerantie — inklok
+     *  omhoog, uitklok omlaag — en bij een BUREAU-scan nooit vóór het
+     *  startuur van de werknemer (max(afronding, startuur)). */
+    berekenEntryTijden(session, endTimeRaw) {
+        const toMinutes = (hhmm) => {
+            const m = String(hhmm || '').match(/^([0-9]{1,2}):([0-9]{1,2})/);
+            return m ? ((parseInt(m[1], 10) || 0) * 60 + (parseInt(m[2], 10) || 0)) : 0;
+        };
+        const fromMinutes = (mins) => {
+            const h = Math.floor(mins / 60) % 24;
+            return String(h).padStart(2, '0') + ':' + String(mins % 60).padStart(2, '0');
+        };
+        const TOLERANCE = 4;
+        const roundUp15 = (mins) => {
+            const rem = mins % 15;
+            if (rem > 0 && rem <= TOLERANCE) return mins - rem;
+            return Math.ceil(mins / 15) * 15;
+        };
+        const roundDown15 = (mins) => {
+            const rem = mins % 15;
+            const distUpper = (15 - rem) % 15;
+            if (distUpper > 0 && distUpper <= TOLERANCE) return mins + distUpper;
+            return Math.floor(mins / 15) * 15;
+        };
+        const actualStartMin = toMinutes(session && session.startTime);
+        const expectedStartMin = toMinutes(this.getExpectedStartTime());
+        const useStartuurCorrection = !!(session && session.tagType === 'bureau');
+        const entryStartMin = useStartuurCorrection
+            ? Math.max(roundUp15(actualStartMin), expectedStartMin)
+            : roundUp15(actualStartMin);
+        const entryEndMin = roundDown15(toMinutes(endTimeRaw));
+        return {
+            entryStartMin, entryEndMin,
+            entryStart: fromMinutes(entryStartMin), entryEnd: fromMinutes(entryEndMin),
+            useStartuurCorrection,
+        };
+    },
     async _clockOut(session, tag, opts) {
         const opts2 = opts || {};
         const now = await this._getNow();
@@ -1151,18 +1233,13 @@ window.QEClock = {
             if (distUpper > 0 && distUpper <= TOLERANCE) return mins + distUpper;
             return Math.floor(mins / 15) * 15;
         };
-        const useStartuurCorrection = (session.tagType === 'bureau');
-        let entryStartMin;
-        if (useStartuurCorrection) {
-            // Bureau-scan: als de scan VÓÓR de werknemer-startuur ligt, gebruiken
-            // we de startuur. Anders de gerondde scan-tijd (met v95 tolerantie).
-            // Math.max neemt vanzelf de latere van de twee.
-            entryStartMin = Math.max(roundUp15(actualStartMin), expectedStartMin);
-        } else {
-            // Camionet of L&L: gewoon afgeronde scan-tijd, géén startuur-correctie.
-            entryStartMin = roundUp15(actualStartMin);
-        }
-        const entryEndMin = roundDown15(toMinutes(endTimeRaw));  // v74: round DOWN naar kwartier
+        // v381: ÉÉN gedeelde berekening (berekenEntryTijden) — de werkbon-
+        // overname bij het uitklokken gebruikt exact dezelfde, zodat werkbon
+        // en tijdsregistratie nooit meer uiteenlopen (06:30-vs-06:45-melding).
+        const _et = this.berekenEntryTijden(session, endTimeRaw);
+        const useStartuurCorrection = _et.useStartuurCorrection;
+        const entryStartMin = _et.entryStartMin;
+        const entryEndMin = _et.entryEndMin;
         const entryStart = fromMinutes(entryStartMin);
         const entryEnd = fromMinutes(entryEndMin);
 
@@ -1438,7 +1515,7 @@ window.QEClock = {
             console.error('[Clock] time-entry POST exception:', e.message);
             return {
                 ok: false,
-                message: 'Uitklokken mislukt:\n' + e.message,
+                message: 'Uitklokken mislukt:\n' + this._netFout(e.message),
                 refresh: true,
             };
         }
@@ -2190,7 +2267,9 @@ window.QEClock = {
         const tijdLabel  = (ef.Tijd && ef.Tijd.stringValue) || 'Op tijd';
 
         // Active: ingeklokt-tijd staat, maar uitgeklokt nog leeg
-        let isActive = !!ingeklokt && !uitgeklokt;
+        // v383: een vergrendelde bon (bureel heeft de dag gecontroleerd) is nooit
+        // meer actief — elke schrijfactie erop geeft 423.
+        let isActive = !!ingeklokt && !uitgeklokt && !wo.lockedAt;
 
         const session = this.getSession() || this._newSession();
 
