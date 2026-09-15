@@ -1837,7 +1837,8 @@ const app = {
 
         // Update nav
         document.querySelectorAll('.nav-item').forEach(n => {
-            n.classList.toggle('active', n.dataset.screen === screenId);
+            n.classList.toggle('active', n.dataset.screen === screenId
+                || (n.dataset.screens || '').split(',').indexOf(screenId) >= 0);  // v391
         });
 
         // Update header
@@ -1859,6 +1860,11 @@ const app = {
             screenClock: 'Klok',
             screenAfwezigheid: 'Afwezigheid melden',  // v219
             screenAanvragen: 'Aanvragen',  // v278
+            screenOrganisatie: 'Organisatie',  // v391
+            screenProjecten: 'Projecten',  // v391
+            screenProjectDetail: 'Project',  // v391
+            screenDagplanningNieuw: 'Dagplanning maken',  // v391
+            screenToestel: 'Toestel & toestemmingen',  // v391
             screenTaakOntvangers: 'Taak-ontvangers',  // v381
             screenAppRechten: 'Toegang tot onderdelen',  // v384
             screenVerlofDetail: 'Verlofaanvraag',  // v278
@@ -1871,7 +1877,10 @@ const app = {
 
         const backBtn = document.getElementById('headerBack');
         // Geen back-button op hoofdschermen EN op betaalschermen (factuur is al aangemaakt, mag niet herhaald worden)
-        const noBackScreens = ['screenPlanning', 'screenUitgevoerd', 'screenAanvragen', 'screenClock', 'screenPayment', 'screenOverschrijving'];
+        // v391: Aanvragen is een compartiment van Organisatie — alleen wie geen hub
+        // heeft (monteur/technieker) krijgt het als hoofdscherm zonder terugknop.
+        const noBackScreens = ['screenPlanning', 'screenUitgevoerd', 'screenOrganisatie', 'screenClock', 'screenPayment', 'screenOverschrijving'];
+        if (!this._orgMagProjecten()) noBackScreens.push('screenAanvragen');
         backBtn.classList.toggle('visible', !noBackScreens.includes(screenId));
 
         // Scroll to top
@@ -1886,6 +1895,12 @@ const app = {
         if (screenId === 'screenUrenAnalyse') this.onNavigateToUrenAnalyse();
         if (screenId === 'screenAanvragen') this.openAanvragenTab();  // v278
         if (screenId === 'screenGoedkeuren') this.loadGoedkeuren();  // v278
+        // v391: Organisatie · Projecten · Toestel
+        if (screenId === 'screenOrganisatie') this.loadOrganisatie();
+        if (screenId === 'screenProjecten') this.loadProjecten();
+        if (screenId === 'screenProjectDetail') { this.renderProjectDetail(); this.loadProjectPlanning(); }
+        if (screenId === 'screenDagplanningNieuw' && !this._dp) setTimeout(() => this.goBack(), 0);
+        if (screenId === 'screenToestel') this.loadToestel();
 
         // v137: toon FAB enkel op planning-tab + niet voor monteurs
         this._updateNewWoFabVisibility();
@@ -1934,6 +1949,18 @@ const app = {
                     break;
                 case 'screenProfile':
                     // Profiel heeft geen dynamische data — niets te refreshen
+                    break;
+                case 'screenOrganisatie':   // v391
+                    this.loadOrganisatie();
+                    break;
+                case 'screenProjecten':
+                    await this.loadProjecten(true);
+                    break;
+                case 'screenProjectDetail':
+                    await this.loadProjectPlanning();
+                    break;
+                case 'screenToestel':
+                    this.loadToestel();
                     break;
                 default:
                     // Geen specifieke loader voor dit scherm: stilletjes niets doen.
@@ -4604,9 +4631,11 @@ const app = {
         document.getElementById('onderhoudGemeente').value = '';
         document.getElementById('onderhoudGemeenteResults').style.display = 'none';
 
-        // Auto-detectie: probeer zone af te leiden van adres (dagplanning → klant)
+        // Auto-detectie: zone uit de GEMEENTE van het werfadres (dagplanning → klant).
+        // v393: de gemeente staat erbij, zodat een fout voorstel meteen opvalt.
         const address = this.currentWO?.address || this.currentWO?.client?.address || '';
-        const autoZone = ONDERHOUD_DATA.detectZoneFromAddress(address);
+        const auto = ONDERHOUD_DATA.zoneVoorAdres(address);
+        const autoZone = auto ? auto.zone : null;
         const autoDiv = document.getElementById('onderhoudAutoZone');
         if (autoZone) {
             this._ohAutoZone = autoZone;
@@ -4614,7 +4643,7 @@ const app = {
             const zoneData = size.zones[autoZone];
             const priceStr = zoneData && zoneData.price ? ` — ${this.formatPrice(zoneData.price)}` : '';
             document.getElementById('onderhoudAutoZoneText').innerHTML =
-                `Zone ${autoZone} (€${verpl} verplaatsing)<span class="monteur-hide">${priceStr}</span>`;
+                `${this._zoneGemeenteLabel(auto)}Zone ${autoZone} (€${verpl} verplaatsing)<span class="monteur-hide">${priceStr}</span>`;
             autoDiv.style.display = '';
         } else {
             this._ohAutoZone = null;
@@ -4624,6 +4653,12 @@ const app = {
 
     onderhoudAcceptAutoZone() {
         if (this._ohAutoZone) this.onderhoudSelectZone(this._ohAutoZone);
+    },
+
+    // v393: "Lier (2500) · " vóór de zone in het adres-voorstel
+    _zoneGemeenteLabel(auto) {
+        if (!auto || !auto.gemeente) return '';
+        return this.escapeHtml(auto.gemeente) + (auto.postcode ? ' (' + this.escapeHtml(auto.postcode) + ')' : '') + ' · ';
     },
 
     onderhoudSearchGemeente(query) {
@@ -4639,7 +4674,7 @@ const app = {
             <div class="card card-clickable" style="padding:8px 12px;margin-bottom:3px"
                  onclick="app.onderhoudSelectZone(${r.zone})">
                 <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="font-size:14px;text-transform:capitalize">${this.escapeHtml(r.gemeente)}</span>
+                    <span style="font-size:14px">${this.escapeHtml(r.gemeente)}</span>
                     <span style="font-size:12px;color:var(--qe-purple);font-weight:500">Zone ${r.zone} — €${r.verplaatsing}</span>
                 </div>
             </div>
@@ -4760,18 +4795,21 @@ const app = {
     // ========================================
     initVerplaatsingPicker() {
         if (!window.ONDERHOUD_DATA) return;
-        // Auto-detectie: probeer zone af te leiden van adres (dagplanning → klant)
+        // Auto-detectie: zone uit de GEMEENTE van het werfadres (dagplanning → klant).
+        // v393: nooit meer uit de straatnaam (Leuvensevest, Lier gaf zone 9).
         const address = this.currentWO?.address || this.currentWO?.client?.address || '';
-        const autoZone = ONDERHOUD_DATA.detectZoneFromAddress(address);
+        const auto = ONDERHOUD_DATA.zoneVoorAdres(address);
+        const autoZone = auto ? auto.zone : null;
         const autoDiv = document.getElementById('verplAutoZone');
         if (autoZone) {
             const price = ONDERHOUD_DATA.ZONE_VERPLAATSING[autoZone] || 0;
             document.getElementById('verplAutoZoneText').innerHTML =
-                `Zone ${autoZone} — €${price}`;
+                `${this._zoneGemeenteLabel(auto)}Zone ${autoZone} — €${price}`;
             autoDiv.style.display = '';
             autoDiv.dataset.zone = autoZone;
         } else {
             autoDiv.style.display = 'none';
+            delete autoDiv.dataset.zone;
         }
         // Reset zoekresultaten
         document.getElementById('verplGemeente').value = '';
@@ -4796,7 +4834,7 @@ const app = {
             <div class="card card-clickable" style="padding:8px 12px;margin-bottom:3px"
                  onclick="app.verplSelectZone(${r.zone})">
                 <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="font-size:14px;text-transform:capitalize">${this.escapeHtml(r.gemeente)}</span>
+                    <span style="font-size:14px">${this.escapeHtml(r.gemeente)}</span>
                     <span style="font-size:12px;color:var(--qe-purple);font-weight:500">Zone ${r.zone} — €${r.verplaatsing}</span>
                 </div>
             </div>
@@ -4813,6 +4851,22 @@ const app = {
         if (this._verplBusy) return;  // dubbeltik-guard
         this._verplBusy = true;
         try {
+            // v393: staat er al verplaatsing met een ANDERE zone op deze werkbon?
+            // Dan eerst vragen of die vervangen moet worden (F20260485 kreeg zo
+            // zone 9 én zone 5). De oude lijn gaat pas weg als de nieuwe erop staat.
+            const woId = this.currentWO.id;
+            const zoneVanArtikel = {};
+            for (const [z, a] of Object.entries(ONDERHOUD_DATA.VERPLAATSING_ARTICLES || {})) zoneVanArtikel[String(a.id)] = Number(z);
+            const andereZone = ((this.woData[woId] && this.woData[woId].materials) || [])
+                .filter(m => zoneVanArtikel[String(m.id)] != null && zoneVanArtikel[String(m.id)] !== Number(zone));
+            if (andereZone.length) {
+                const oud = andereZone.map(m => 'zone ' + zoneVanArtikel[String(m.id)]).join(' en ');
+                const confirmFn = (window.QEClock && QEClock._showConfirmModal) ? QEClock._showConfirmModal.bind(QEClock) : (t, m) => Promise.resolve(window.confirm(m));
+                const vervangen = await confirmFn('Andere verplaatsingszone',
+                    'Op deze werkbon staat al verplaatsing ' + oud + '. Vervangen door zone ' + Number(zone) + '?',
+                    'Vervangen', 'Annuleren');
+                if (!vervangen || !this.currentWO || this.currentWO.id !== woId) return;
+            }
             const articleData = (ONDERHOUD_DATA.VERPLAATSING_ARTICLES && ONDERHOUD_DATA.VERPLAATSING_ARTICLES[zone]) || null;
             const fallbackPrice = ONDERHOUD_DATA.ZONE_VERPLAATSING[zone];
             if (!articleData || !articleData.id || fallbackPrice == null) {
@@ -4844,7 +4898,15 @@ const app = {
                 };
                 this.toast('Let op: prijslijst-prijs voor verplaatsing gebruikt — kon Robaws niet bereiken', true);
             }
+            if (!this.currentWO || this.currentWO.id !== woId) return;   // intussen andere werkbon geopend
             this.addMaterial(article);
+            if (andereZone.length) {
+                const weg = andereZone.map(m => String(m.id));
+                const data = this.woData[woId];
+                data.materials = data.materials.filter(m => weg.indexOf(String(m.id)) < 0);
+                this.renderMaterials();
+                this.toast('Verplaatsing vervangen door zone ' + Number(zone));
+            }
             // Reset picker
             this.initVerplaatsingPicker();
         } finally {
@@ -9141,7 +9203,7 @@ const app = {
                 RobawsAPI.getMaterials({ bypassCache: true }),
                 RobawsAPI.getStockLocations().catch(() => []),
             ]);
-            this._gsItems = mats.filter(m => !this._isVoertuig(m));
+            this._gsItems = mats.filter(m => !this._isVoertuig(m) && !RobawsAPI.isGasfles(m));   // v388: gasflessen apart
             this._gsLocs = locs;
             this._gsAlles = {};
             this._gsItems.forEach(m => { this._gsAlles[m.id] = m; });
@@ -9779,6 +9841,653 @@ const app = {
                 onderhoudsplichtig: !!((document.getElementById('gsNieuwOndPlicht') || {}).checked),
             });
         }, 'Toegevoegd: ' + naam.trim());
+    },
+
+    // =============================================
+    // v388: GASFLESSEN IN HUUR (Logistiek — bureel)
+    // Elke fles = een Materieel-item. De natieve velden doen het werk:
+    // assignedProjectId (op project) of stockLocationId (camionet/magazijn)
+    // = WAAR, assignedEmployeeId = WIE, status 'ingeleverd' = terug naar de
+    // leverancier, serialNumber = flesnummer. 'Huur sinds' (extraveld)
+    // draagt de huurduur; ontbreekt het nog, dan telt de aanmaakdatum.
+    // QR op de fles (https://mijnqe.be/m/<id>) → scan → fiche → overzetten
+    // in twee tikken. Zie ook logistiek.html (hub) — zelfde regels.
+    // =============================================
+    openGasflessen() {
+        if (!this._adminIsBureel()) { this.toast('Alleen voor bureel', true); return; }
+        this._gfState = this._gfState || { zoek: '', weergave: 'project', soort: '' };
+        this.navigate('screenGasflessen', true);
+        this.loadGasflessen();
+    },
+
+    gfZet(k, v) {
+        this._gfState = this._gfState || { zoek: '', weergave: 'project', soort: '' };
+        this._gfState[k] = k === 'zoek' ? String(v || '').trim().toLowerCase() : v;
+        this._gfRender();
+    },
+
+    async loadGasflessen(stil) {
+        const el = document.getElementById('gasflesList');
+        if (!el) return;
+        if (!stil) el.innerHTML = '<div class="spinner"></div>';
+        try {
+            const [mats, locs, projs, emps, veldHuur] = await Promise.all([
+                RobawsAPI.getMaterials({ bypassCache: true }),
+                RobawsAPI.getStockLocations().catch(() => []),
+                RobawsAPI.getProjectsVoorPicker().catch(() => []),
+                RobawsAPI.getActiveEmployees().catch(() => []),
+                RobawsAPI.materialVeldBestaat('Huur sinds').catch(() => true),
+            ]);
+            this._gfItems = mats.filter(m => RobawsAPI.isGasfles(m));
+            this._gfAlle = {};
+            this._gfItems.forEach(m => { this._gfAlle[m.id] = m; });
+            this._gfLocs = locs; this._gfProjs = projs; this._gfEmps = emps; this._gfVeldHuur = veldHuur;
+            const soorten = [...new Set(this._gfItems.map(m => RobawsAPI.gasSoort(m)))].sort();
+            const sel = document.getElementById('gfSoort');
+            if (sel) {
+                const cur = (this._gfState && this._gfState.soort) || '';
+                sel.innerHTML = '<option value="">Alle gassen</option>' + soorten.map(g => '<option value="' + this.escapeHtml(g) + '"' + (g === cur ? ' selected' : '') + '>' + this.escapeHtml(g) + '</option>').join('');
+            }
+            const hint = document.getElementById('gfVeldHint');
+            if (hint) hint.innerHTML = veldHuur ? '' : '<div class="card" style="margin-bottom:10px;padding:10px 14px;background:var(--awash2,#F7EFE2);border-color:var(--aborder2,#E0C79B);font-size:12.5px;color:var(--amber2,#A5651A)">Het extraveld <strong>"Huur sinds"</strong> (Datum, op Materieel) bestaat nog niet in Robaws \u2014 de huurduur telt voorlopig vanaf de aanmaakdatum.</div>';
+            this._gfRender();
+            // v388b: huurcontrole tegen de Messer-factuur — apart geladen, blokkeert de lijst niet
+            if (!this._gfHuur) RobawsAPI.gasHuurcontrole().then(h => { this._gfHuur = h; this._gfRender(); }).catch(() => {});
+            const sub = document.getElementById('logGasSub');
+            if (sub) {
+                const inHuur = this._gfItems.filter(m => !RobawsAPI.gasIsIngeleverd(m));
+                const lang = inHuur.filter(m => (RobawsAPI.gasDagen(m) || 0) > RobawsAPI.GAS_LANG_DAGEN).length;
+                sub.textContent = inHuur.length ? (inHuur.length + ' in huur' + (lang ? ' \u00B7 ' + lang + ' langer dan ' + RobawsAPI.GAS_LANG_DAGEN + ' d' : '')) : 'Nog geen flessen geregistreerd';
+            }
+        } catch (e) {
+            el.innerHTML = '<div class="card" style="font-size:13px;color:var(--red2,#B4372F)">Laden mislukt: ' + this.escapeHtml((e && e.message) || '?') + '</div>';
+        }
+    },
+
+    _gfProjNaam(id) { const p = (this._gfProjs || []).find(x => String(x.id) === String(id)); return p ? p.name : null; },
+    _gfEmpNaam(id) { const e = (this._gfEmps || []).find(x => String(x.employeeId) === String(id)); return e ? e.name : null; },
+    _gfLocNaam(id) { const l = (this._gfLocs || []).find(x => String(x.id) === String(id)); return l ? l.name : null; },
+    /** Waar staat de fles: project > stocklocatie > onbekend. */
+    _gfWaar(m) {
+        if (m.assignedProjectId) return { soort: 'project', tekst: this._gfProjNaam(m.assignedProjectId) || ('Project #' + m.assignedProjectId) };
+        if (m.stockLocationId) return { soort: 'locatie', tekst: this._gfLocNaam(m.stockLocationId) || ('Locatie #' + m.stockLocationId) };
+        return { soort: 'geen', tekst: 'Plaats onbekend' };
+    },
+    _gfDagenKleur(d) {
+        if (d == null) return 'var(--g3,#A3A29A)';
+        if (d > RobawsAPI.GAS_LANG_DAGEN) return 'var(--red2,#B4372F)';
+        if (d > 90) return 'var(--amber,#D97E24)';
+        return 'var(--green2,#3E7A54)';
+    },
+    _gfDat(iso) { return iso ? new Date(String(iso).slice(0, 10) + 'T12:00:00').toLocaleDateString('nl-BE', { day: 'numeric', month: 'short', year: 'numeric' }) : '\u2014'; },
+
+    /** sub = wat onder de naam staat: 'wie' | 'waar' | 'beide' */
+    _gfRij(m, sub) {
+        const ing = RobawsAPI.gasIsIngeleverd(m);
+        const dagen = RobawsAPI.gasDagen(m);
+        const waar = this._gfWaar(m);
+        const wie = this._gfEmpNaam(m.assignedEmployeeId);
+        const onder = sub === 'wie' ? (wie || 'Geen verantwoordelijke') : (sub === 'waar' ? waar.tekst : (waar.tekst + (wie ? ' \u00B7 ' + wie : '')));
+        const rechts = ing
+            ? '<span style="color:var(--g2,#5F5E56)">ingeleverd ' + this.escapeHtml(this._gfDat(RobawsAPI.gasIngeleverdOp(m))) + '</span>'
+            : '<span style="color:' + this._gfDagenKleur(dagen) + '">' + (dagen == null ? '?' : dagen + ' d') + '</span>';
+        return '<div style="display:flex;align-items:center;gap:11px;padding:11px 2px;border-top:1px solid var(--l2,#EBE8E0);cursor:pointer" onclick="event.stopPropagation();app.openGasflesItem(\'' + m.id + '\')">' +
+            '  <span style="flex-shrink:0;width:10px;height:10px;border-radius:50%;background:' + (ing ? 'var(--g3,#A3A29A)' : this._gfDagenKleur(dagen)) + '"></span>' +
+            '  <div style="flex:1;min-width:0">' +
+            '    <div style="font-size:14px;font-weight:600;color:var(--ink,#26334B);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + this.escapeHtml(m.name || '') + '</div>' +
+            '    <div style="font-size:11.5px;color:var(--g1,#85847C);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + this.escapeHtml(onder) + '</div>' +
+            '  </div>' +
+            '  <div style="flex-shrink:0;font-size:12px;font-weight:700;font-variant-numeric:tabular-nums">' + rechts + '</div>' +
+            '</div>';
+    },
+
+    _gfGroepen() {
+        const s = this._gfState || { zoek: '', weergave: 'project', soort: '' };
+        let items = (this._gfItems || []).slice();
+        if (s.soort) items = items.filter(m => RobawsAPI.gasSoort(m) === s.soort);
+        if (s.zoek) items = items.filter(m => ((m.name || '') + ' ' + (m.serialNumber || '') + ' ' + (m.brand || '') + ' ' + this._gfWaar(m).tekst + ' ' + (this._gfEmpNaam(m.assignedEmployeeId) || '')).toLowerCase().includes(s.zoek));
+        const inHuur = items.filter(m => !RobawsAPI.gasIsIngeleverd(m));
+        const ingeleverd = items.filter(m => RobawsAPI.gasIsIngeleverd(m)).sort((a, b) => String(RobawsAPI.gasIngeleverdOp(b) || '').localeCompare(String(RobawsAPI.gasIngeleverdOp(a) || '')));
+        const oudEerst = (arr) => arr.sort((a, b) => (RobawsAPI.gasDagen(b) || 0) - (RobawsAPI.gasDagen(a) || 0) || String(a.name || '').localeCompare(String(b.name || '')));
+        const groepen = [];
+        const per = (sleutel, sub) => {
+            const map = new Map();
+            for (const m of inHuur) { const k = sleutel(m); if (!map.has(k)) map.set(k, []); map.get(k).push(m); }
+            for (const [kop, arr] of map) groepen.push({ kop, items: oudEerst(arr), sub });
+        };
+        if (s.weergave === 'wie') { per(m => this._gfEmpNaam(m.assignedEmployeeId) || 'Geen verantwoordelijke', 'waar'); groepen.sort((a, b) => a.kop.localeCompare(b.kop)); }
+        else if (s.weergave === 'soort') { per(m => RobawsAPI.gasSoort(m), 'beide'); groepen.sort((a, b) => a.kop.localeCompare(b.kop)); }
+        else if (s.weergave === 'oud') { if (inHuur.length) groepen.push({ kop: 'Langst in huur eerst', items: oudEerst(inHuur.slice()), sub: 'beide' }); }
+        else {
+            per(m => this._gfWaar(m).tekst, 'wie');
+            // projecten eerst, dan camionet/magazijn, 'Plaats onbekend' onderaan
+            const rang = (kop) => kop === 'Plaats onbekend' ? 2 : (inHuur.some(m => this._gfWaar(m).soort === 'project' && this._gfWaar(m).tekst === kop) ? 0 : 1);
+            groepen.sort((a, b) => rang(a.kop) - rang(b.kop) || a.kop.localeCompare(b.kop));
+        }
+        return { groepen, ingeleverd, inHuur };
+    },
+
+    _gfRender() {
+        const el = document.getElementById('gasflesList');
+        if (!el || !this._gfItems) return;
+        const g = this._gfGroepen();
+        const kop = document.getElementById('gfKop');
+        if (kop) {
+            const alle = (this._gfItems || []).filter(m => !RobawsAPI.gasIsIngeleverd(m));
+            const perSoort = {};
+            alle.forEach(m => { const s2 = RobawsAPI.gasSoort(m); perSoort[s2] = (perSoort[s2] || 0) + 1; });
+            const lang = alle.filter(m => (RobawsAPI.gasDagen(m) || 0) > RobawsAPI.GAS_LANG_DAGEN).length;
+            const h = this._gfHuur && this._gfHuur.facturen && this._gfHuur.facturen[0];
+            const tekort = h ? Math.round(h.flessen) - alle.length : 0;
+            const huurHtml = h ? '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--wash,#F0EDE6);color:var(--ink,#26334B)">' +
+                '<strong>Volgens de Messer-factuur</strong> van ' + this.escapeHtml(this._gfDat(h.datum)) + ': \u00B1<strong>' + h.flessen + ' flessen</strong> in huur' +
+                ' (' + h.cilinderdagen + ' cilinderdagen over ' + h.dagen + ' d \u00B7 ' + this._budEur(h.kost) + ' huur \u2248 ' + this._budEur(h.perJaar) + '/jaar)' +
+                (tekort > 0 ? ' \u2192 <span style="color:var(--red2,#B4372F);font-weight:600">' + tekort + ' meer dan hier geregistreerd</span>' : (h.flessen ? ' \u2192 register klopt' : '')) +
+                '<div style="font-size:11px;color:var(--g1,#85847C);margin-top:2px">' + h.types.map(t => this.escapeHtml(t.naam.replace(/cilinder/i, '').replace(/\s+/g, ' ').trim()) + ' ' + t.flessen).join(' \u00B7 ') + ' \u2014 schatting: periode = afstand tot de vorige factuur</div></div>' : '';
+            kop.innerHTML = (alle.length
+                ? '<strong>' + alle.length + ' in huur</strong>: ' + Object.keys(perSoort).sort().map(s2 => perSoort[s2] + ' ' + this.escapeHtml(s2.toLowerCase())).join(' \u00B7 ') + (lang ? ' \u2014 <span style="color:var(--red2,#B4372F);font-weight:600">' + lang + ' langer dan ' + RobawsAPI.GAS_LANG_DAGEN + ' dagen</span>' : '')
+                : 'Nog geen flessen in huur geregistreerd.') + huurHtml;
+        }
+        let html = g.groepen.map(gr => '<div class="card" style="margin-bottom:10px;padding:12px 16px 4px">' +
+            '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px"><div style="font-size:14px;font-weight:700;color:var(--ink,#26334B)">' + this.escapeHtml(gr.kop) + '</div><div style="font-size:12px;color:var(--g1,#85847C)">' + gr.items.length + ' fles' + (gr.items.length === 1 ? '' : 'sen') + '</div></div>' +
+            gr.items.map(m => this._gfRij(m, gr.sub)).join('') + '</div>').join('');
+        if (!g.groepen.length) html += '<div class="card" style="font-size:13px;color:var(--g2,#5F5E56);margin-bottom:10px">' + ((this._gfItems || []).length ? 'Niets gevonden in deze weergave.' : 'Nog geen gasflessen. Tik op "+ Nieuwe fles" om de eerste te registreren.') + '</div>';
+        if (g.ingeleverd.length) {
+            const open = !!this._gfToonIng;
+            html += '<div class="card" style="margin-bottom:10px;padding:12px 16px ' + (open ? '4px' : '12px') + ';cursor:pointer" onclick="app._gfToonIng=!app._gfToonIng;app._gfRender()">' +
+                '<div style="display:flex;justify-content:space-between;align-items:baseline"><div style="font-size:14px;font-weight:700;color:var(--g2,#5F5E56)">Ingeleverd</div><div style="font-size:12px;color:var(--g1,#85847C)">' + g.ingeleverd.length + ' ' + (open ? '\u25B4' : '\u25BE') + '</div></div>' +
+                (open ? g.ingeleverd.slice(0, 40).map(m => this._gfRij(m, 'beide')).join('') : '') + '</div>';
+        }
+        el.innerHTML = html;
+    },
+
+    openGasflesItem(id) {
+        const m = (this._gfAlle || {})[id];
+        if (!m) { this.toast('Fles niet gevonden (#' + id + ')', true); return; }
+        const oud = document.getElementById('gasflesSheet');
+        if (oud) oud.remove();
+        const ing = RobawsAPI.gasIsIngeleverd(m);
+        const dagen = RobawsAPI.gasDagen(m);
+        const waar = this._gfWaar(m);
+        const wie = this._gfEmpNaam(m.assignedEmployeeId);
+        const vandaag = new Date().toISOString().slice(0, 10);
+        const mijn = this.currentUser && this.currentUser.robawsEmployeeId;
+        const esc = (t) => this.escapeHtml(t);
+        const rij = (l, w, kleur) => '<div style="display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--l2,#EBE8E0);font-size:14px"><span style="color:var(--g2,#5F5E56)">' + l + '</span><span style="font-weight:600;text-align:right;' + (kleur ? 'color:' + kleur : '') + '">' + w + '</span></div>';
+        const kop = (t) => '<div style="margin-top:16px;font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--g1,#85847C)">' + t + '</div>';
+        const locOpties = '<option value="">\u2014 kies camionet / magazijn \u2014</option>' + (this._gfLocs || []).map(l => '<option value="' + l.id + '"' + (String(l.id) === String(m.stockLocationId) ? ' selected' : '') + '>' + esc(l.name) + '</option>').join('');
+        const empOpties = '<option value="">\u2014 niemand \u2014</option>' + (this._gfEmps || []).map(e => '<option value="' + e.employeeId + '"' + (String(e.employeeId) === String(m.assignedEmployeeId) ? ' selected' : '') + '>' + esc(e.name) + '</option>').join('');
+        const ov = document.createElement('div');
+        ov.id = 'gasflesSheet';
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99990;background:rgba(20,28,45,0.45);overflow-y:auto;-webkit-overflow-scrolling:touch';
+        ov.innerHTML =
+            '<div style="min-height:100%;display:flex;flex-direction:column;justify-content:flex-end">' +
+            '<div style="background:var(--bg,#F4F2ED);border-radius:18px 18px 0 0;padding:18px 16px calc(18px + env(safe-area-inset-bottom))">' +
+            '  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
+            '    <div><div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:' + (ing ? 'var(--g2,#5F5E56)' : this._gfDagenKleur(dagen)) + '">' + (ing ? 'Ingeleverd' : (dagen == null ? 'In huur' : dagen + ' dagen in huur')) + '</div>' +
+            '    <div style="font-size:19px;font-weight:700;letter-spacing:-0.4px;color:var(--ink,#26334B)">' + esc(m.name || '') + '</div></div>' +
+            '    <button onclick="document.getElementById(\'gasflesSheet\').remove()" style="border:none;background:none;font-size:24px;line-height:1;color:var(--qe-grey);padding:6px 8px;cursor:pointer">&times;</button>' +
+            '  </div>' +
+            rij('Gassoort', esc(RobawsAPI.gasSoort(m))) +
+            rij('Flesnummer', esc(m.serialNumber || '\u2014')) +
+            rij('Leverancier', esc(m.brand || '\u2014')) +
+            rij('Huur sinds', esc(this._gfDat(RobawsAPI.gasHuurSinds(m))) + (this._gfVeldHuur === false ? ' <span style="font-weight:400;color:var(--g1,#85847C)">(aanmaakdatum)</span>' : '')) +
+            (ing ? rij('Ingeleverd op', esc(this._gfDat(RobawsAPI.gasIngeleverdOp(m)))) : rij('Waar', esc(waar.tekst), waar.soort === 'geen' ? 'var(--amber,#D97E24)' : null)) +
+            rij('Verantwoordelijke', esc(wie || '\u2014'), wie ? null : 'var(--amber,#D97E24)') +
+            (ing
+                ? '<button class="btn btn-outline btn-full" style="margin-top:16px" onclick="app.gfHeractiveer(\'' + m.id + '\')">\u21A9 Toch nog in huur</button>'
+                : (kop('Waar staat de fles?') +
+                   '  <button class="btn btn-primary btn-full" style="margin-top:8px" onclick="app.gfKiesProject(\'' + m.id + '\')">\uD83C\uDFD7\uFE0F Op een project\u2026</button>' +
+                   '  <div style="display:flex;gap:8px;margin-top:8px">' +
+                   '    <select id="gfLocSel" class="form-input" style="flex:1.5">' + locOpties + '</select>' +
+                   '    <button class="btn btn-outline" style="flex:1" onclick="app.gfNaarLocatie(\'' + m.id + '\')">Zet</button>' +
+                   '  </div>' +
+                   kop('Verantwoordelijke') +
+                   '  <div style="display:flex;gap:8px;margin-top:8px">' +
+                   '    <select id="gfEmpSel" class="form-input" style="flex:1.5">' + empOpties + '</select>' +
+                   '    <button class="btn btn-outline" style="flex:1" onclick="app.gfVerantw(\'' + m.id + '\')">Zet</button>' +
+                   '  </div>' +
+                   (mijn && String(mijn) !== String(m.assignedEmployeeId) ? '  <button class="btn btn-outline btn-full" style="margin-top:8px" onclick="app.gfVerantw(\'' + m.id + '\',\'' + mijn + '\')">Ik neem deze fles mee</button>' : '') +
+                   kop('Fles inleveren bij de leverancier') +
+                   '  <div style="display:flex;gap:8px;margin-top:8px">' +
+                   '    <input type="date" id="gfInlDatum" class="form-input" style="flex:1" value="' + vandaag + '" max="' + vandaag + '">' +
+                   '    <button class="btn btn-outline" style="flex:1" onclick="app.gfInleveren(\'' + m.id + '\')">Ingeleverd</button>' +
+                   '  </div>' +
+                   kop('Huur sinds aanpassen') +
+                   '  <div style="display:flex;gap:8px;margin-top:8px">' +
+                   '    <input type="date" id="gfHuurDatum" class="form-input" style="flex:1" value="' + esc(RobawsAPI.gasHuurSinds(m) || vandaag) + '" max="' + vandaag + '">' +
+                   '    <button class="btn btn-outline" style="flex:1" onclick="app.gfHuurstart(\'' + m.id + '\')">Bewaar</button>' +
+                   '  </div>' +
+                   (this._gfVeldHuur === false ? '  <div style="font-size:12px;color:var(--amber2,#A5651A);margin-top:6px">Werkt pas zodra het veld "Huur sinds" in Robaws bestaat.</div>' : ''))) +
+            kop('QR-code') +
+            '  <div style="font-size:12.5px;color:var(--g2,#5F5E56);margin-top:6px;line-height:1.5">Op de fles hoort een etiket met deze code: <span style="font-family:monospace">' + esc(RobawsAPI.GAS_QR_BASE + m.id) + '</span><br>Etiketten print je in de Software-hub (Logistiek \u2192 Gasflessen \u2192 Etiketten).</div>' +
+            '</div></div>';
+        ov.addEventListener('click', (e) => { if (e.target === ov) ov.remove(); });
+        document.body.appendChild(ov);
+    },
+
+    async _gfActie(fn, okTekst) {
+        if (this._gfBusy) return;
+        this._gfBusy = true;
+        try {
+            await fn();
+            if (okTekst) this.toast(okTekst);
+            ['gasflesSheet', 'gfProjectSheet'].forEach(id => { const s2 = document.getElementById(id); if (s2) s2.remove(); });
+            await this.loadGasflessen(true);
+        } catch (e) {
+            this.toast('Mislukt: ' + ((e && e.message) || '?'), true);
+        } finally { this._gfBusy = false; }
+    },
+    gfNaarLocatie(id) {
+        const locId = (document.getElementById('gfLocSel') || {}).value || '';
+        if (!locId) { this.toast('Kies eerst een camionet of magazijn', true); return; }
+        return this._gfActie(() => RobawsAPI.setMaterialWaar(id, { locId }), 'Fles staat nu in ' + (this._gfLocNaam(locId) || 'die locatie'));
+    },
+    gfVerantw(id, empId) {
+        const e = empId || (document.getElementById('gfEmpSel') || {}).value || '';
+        return this._gfActie(() => RobawsAPI.setMaterialEmployee(id, e || null), e ? ((this._gfEmpNaam(e) || 'Verantwoordelijke') + ' is nu verantwoordelijk') : 'Verantwoordelijke weggehaald');
+    },
+    gfInleveren(id) {
+        const d = (document.getElementById('gfInlDatum') || {}).value || new Date().toISOString().slice(0, 10);
+        const m = (this._gfAlle || {})[id];
+        if (!confirm('Fles ' + ((m && m.name) || '#' + id) + ' als ingeleverd registreren?')) return;
+        return this._gfActie(() => RobawsAPI.gasflesInleveren(id, d), 'Fles ingeleverd');
+    },
+    gfHeractiveer(id) { return this._gfActie(() => RobawsAPI.gasflesHeractiveer(id), 'Fles staat weer als in huur'); },
+    gfHuurstart(id) {
+        const d = (document.getElementById('gfHuurDatum') || {}).value;
+        if (!d) { this.toast('Kies een datum', true); return; }
+        return this._gfActie(() => RobawsAPI.setMaterialHuurSinds(id, d), 'Huur sinds ' + this._gfDat(d));
+    },
+
+    // ---- projectkiezer: zoeken over naam / nummer / gemeente ----
+    gfKiesProject(matId) {
+        const oud = document.getElementById('gfProjectSheet');
+        if (oud) oud.remove();
+        const ov = document.createElement('div');
+        ov.id = 'gfProjectSheet';
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99992;background:var(--bg,#F4F2ED);overflow-y:auto;-webkit-overflow-scrolling:touch';
+        ov.innerHTML = '<div style="max-width:560px;margin:0 auto;padding:18px 16px calc(30px + env(safe-area-inset-bottom))">' +
+            '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px"><div style="font-size:20px;font-weight:700;color:var(--ink,#26334B)">Op welk project?</div>' +
+            '<button onclick="document.getElementById(\'gfProjectSheet\').remove()" style="border:none;background:none;font-size:26px;line-height:1;color:var(--qe-grey);padding:6px 8px;cursor:pointer">&times;</button></div>' +
+            '<input type="text" id="gfProjZoek" class="form-input" placeholder="Zoek project (naam, nummer, gemeente)\u2026" style="width:100%;margin-bottom:10px" oninput="app._gfProjLijst(\'' + matId + '\', this.value)">' +
+            '<div id="gfProjLijst"></div></div>';
+        document.body.appendChild(ov);
+        this._gfProjLijst(matId, '');
+        setTimeout(() => { const i = document.getElementById('gfProjZoek'); if (i) i.focus(); }, 50);
+    },
+    _gfProjLijst(matId, q) {
+        const el = document.getElementById('gfProjLijst');
+        if (!el) return;
+        const z = String(q || '').trim().toLowerCase();
+        const dood = /afgesloten|gesloten|geannuleerd|verloren|archief/i;
+        let lijst = (this._gfProjs || []).filter(p => !z || (p.name + ' ' + p.logicId + ' ' + p.stad).toLowerCase().includes(z));
+        if (!z) lijst = lijst.filter(p => !dood.test(p.status));
+        lijst = lijst.slice(0, 60);
+        const m = (this._gfAlle || {})[matId];
+        el.innerHTML = '<div class="card" style="padding:4px 14px">' +
+            (m && m.assignedProjectId ? '<div style="padding:11px 2px;border-bottom:1px solid var(--l2,#EBE8E0);font-size:13.5px;color:var(--g2,#5F5E56);cursor:pointer" onclick="app.gfZetProject(\'' + matId + '\',\'\')">\u2014 Van het project afhalen (plaats onbekend)</div>' : '') +
+            (lijst.length ? lijst.map(p => '<div style="padding:11px 2px;border-bottom:1px solid var(--l2,#EBE8E0);cursor:pointer" onclick="app.gfZetProject(\'' + matId + '\',\'' + p.id + '\')">' +
+                '<div style="font-size:14px;font-weight:600;color:var(--ink,#26334B)">' + this.escapeHtml(p.name) + '</div>' +
+                '<div style="font-size:11.5px;color:var(--g1,#85847C)">' + this.escapeHtml([p.logicId, p.stad, p.status].filter(Boolean).join(' \u00B7 ')) + '</div></div>').join('')
+              : '<div style="padding:12px 2px;font-size:13px;color:var(--g2,#5F5E56)">Geen project gevonden' + (z ? '' : ' \u2014 typ om ook afgesloten projecten te zien') + '.</div>') +
+            '</div>';
+    },
+    gfZetProject(matId, projId) {
+        return this._gfActie(() => RobawsAPI.setMaterialWaar(matId, { projectId: projId || null }), projId ? ('Fles staat nu op ' + (this._gfProjNaam(projId) || 'het project')) : 'Fles van het project gehaald');
+    },
+
+    // ---- nieuwe fles ----
+    openGasflesNieuw(voorNr) {
+        const oud = document.getElementById('gasflesSheet');
+        if (oud) oud.remove();
+        const esc = (t) => this.escapeHtml(t);
+        const vandaag = new Date().toISOString().slice(0, 10);
+        const mijn = this.currentUser && this.currentUser.robawsEmployeeId;
+        const merken = [...new Set((this._gfItems || []).map(m => m.brand).filter(Boolean))];
+        const dood = /afgesloten|gesloten|geannuleerd|verloren|archief/i;
+        this._gfNwWaar = ''; this._gfNwWaarLabel = '';   // v388b: zoekbare kiezer i.p.v. keuzelijst
+        const empOpties = '<option value="">\u2014 niemand \u2014</option>' + (this._gfEmps || []).map(e => '<option value="' + e.employeeId + '"' + (String(e.employeeId) === String(mijn) ? ' selected' : '') + '>' + esc(e.name) + '</option>').join('');
+        const ov = document.createElement('div');
+        ov.id = 'gasflesSheet';
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99990;background:rgba(20,28,45,0.45);overflow-y:auto;-webkit-overflow-scrolling:touch';
+        ov.innerHTML =
+            '<div style="min-height:100%;display:flex;flex-direction:column;justify-content:flex-end">' +
+            '<div style="background:var(--bg,#F4F2ED);border-radius:18px 18px 0 0;padding:18px 16px calc(18px + env(safe-area-inset-bottom))">' +
+            '  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">' +
+            '    <div style="font-size:19px;font-weight:700;letter-spacing:-0.4px;color:var(--ink,#26334B)">Nieuwe gasfles</div>' +
+            '    <button onclick="document.getElementById(\'gasflesSheet\').remove()" style="border:none;background:none;font-size:24px;line-height:1;color:var(--qe-grey);padding:6px 8px;cursor:pointer">&times;</button>' +
+            '  </div>' +
+            '  <div style="display:flex;gap:8px;margin-bottom:8px">' +
+            '    <select id="gfNwSoort" class="form-input" style="flex:1.2">' + RobawsAPI.GAS_SOORTEN.map(g => '<option>' + esc(g) + '</option>').join('') + '</select>' +
+            '    <input type="text" id="gfNwInhoud" class="form-input" placeholder="Inhoud (bv. 50 L)" style="flex:1">' +
+            '  </div>' +
+            '  <div style="display:flex;gap:8px;margin-bottom:8px">' +
+            '    <input type="text" id="gfNwNr" class="form-input" placeholder="Flesnummer (staat op het etiket)" style="flex:1" inputmode="numeric" value="' + esc(voorNr || '') + '">' +
+            '    <button class="btn btn-outline" style="flex:none" onclick="app.openGasScan(\'nummer\')">\uD83D\uDCF7 Scan</button>' +
+            '  </div>' +
+            '  <input type="text" id="gfNwLev" class="form-input" list="gfMerken" placeholder="Leverancier" value="' + esc(RobawsAPI.GAS_LEVERANCIER_STANDAARD) + '" style="width:100%;margin-bottom:8px">' +
+            '  <datalist id="gfMerken">' + merken.map(b => '<option value="' + esc(b) + '">').join('') + '</datalist>' +
+            '  <label style="display:block;font-size:12px;font-weight:600;color:var(--g2,#5F5E56);margin:6px 0 5px">In huur sinds</label>' +
+            '  <input type="date" id="gfNwHuur" class="form-input" style="width:100%;margin-bottom:8px" value="' + vandaag + '" max="' + vandaag + '">' +
+            '  <label style="display:block;font-size:12px;font-weight:600;color:var(--g2,#5F5E56);margin:6px 0 5px">Verantwoordelijke</label>' +
+            '  <select id="gfNwEmp" class="form-input" style="width:100%;margin-bottom:8px">' + empOpties + '</select>' +
+            '  <label style="display:block;font-size:12px;font-weight:600;color:var(--g2,#5F5E56);margin:6px 0 5px">Waar staat de fles?</label>' +
+            '  <input type="text" id="gfNwWaarZoek" class="form-input" placeholder="Zoek camionet, magazijn of project\u2026" style="width:100%" oninput="app._gfNwWaarLijst(this.value)">' +
+            '  <div id="gfNwWaarGekozen" style="font-size:13px;margin:6px 2px;min-height:18px"></div>' +
+            '  <div id="gfNwWaarLijst" class="card" style="padding:0 12px;margin-bottom:12px;max-height:220px;overflow-y:auto"></div>' +
+            '  <button class="btn btn-primary btn-full" onclick="app.gasflesMaak()">Fles registreren</button>' +
+            '</div></div>';
+        ov.addEventListener('click', (e) => { if (e.target === ov) ov.remove(); });
+        document.body.appendChild(ov);
+        this._gfNwWaarLijst('');
+    },
+    /** Zoeklijst voor 'waar staat de fles': camionetten/magazijn + lopende projecten. */
+    _gfNwWaarLijst(q) {
+        const el = document.getElementById('gfNwWaarLijst');
+        if (!el) return;
+        const z = String(q || '').trim().toLowerCase();
+        const dood = /afgesloten|gesloten|geannuleerd|verloren|archief/i;
+        const locs = (this._gfLocs || []).filter(l => !z || String(l.name || '').toLowerCase().includes(z)).map(l => ({ val: 'l:' + l.id, kop: l.name, sub: 'camionet / magazijn' }));
+        let projs = (this._gfProjs || []).filter(p => !z || (p.name + ' ' + p.logicId + ' ' + p.stad).toLowerCase().includes(z));
+        if (!z) projs = projs.filter(p => !dood.test(p.status));
+        const rijen = locs.concat(projs.map(p => ({ val: 'p:' + p.id, kop: p.name, sub: [p.logicId, p.stad, p.status].filter(Boolean).join(' \u00B7 ') }))).slice(0, 40);
+        el.innerHTML = rijen.length
+            ? rijen.map(r => '<div style="padding:9px 2px;border-bottom:1px solid var(--l2,#EBE8E0);cursor:pointer" onclick="app._gfNwWaarKies(\'' + r.val + '\',this)">' +
+                '<div style="font-size:13.5px;font-weight:600;color:var(--ink,#26334B)">' + this.escapeHtml(r.kop) + '</div>' +
+                '<div style="font-size:11.5px;color:var(--g1,#85847C)">' + this.escapeHtml(r.sub) + '</div></div>').join('')
+            : '<div style="padding:10px 2px;font-size:13px;color:var(--g2,#5F5E56)">Niets gevonden' + (z ? '' : ' \u2014 typ om ook afgesloten projecten te zien') + '.</div>';
+    },
+    _gfNwWaarKies(val, rij) {
+        this._gfNwWaar = val;
+        this._gfNwWaarLabel = rij && rij.firstChild ? String(rij.firstChild.textContent || '') : val;
+        const g = document.getElementById('gfNwWaarGekozen');
+        if (g) g.innerHTML = '<span style="color:var(--green2,#3E7A54);font-weight:600">\u2713 ' + this.escapeHtml(this._gfNwWaarLabel) + '</span> <button onclick="app._gfNwWaarKies(\'\',null)" style="border:none;background:none;color:var(--g1,#85847C);cursor:pointer;font-size:14px">\u2715</button>';
+        if (!val && g) g.innerHTML = '';
+        const z = document.getElementById('gfNwWaarZoek'); if (z && val) z.value = '';
+        if (val) this._gfNwWaarLijst('');
+    },
+    async gasflesMaak() {
+        const v = (id) => ((document.getElementById(id) || {}).value || '').trim();
+        const nr = v('gfNwNr');
+        if (!nr) { this.toast('Vul het flesnummer in', true); return; }
+        const sleutel = (x) => String(x || '').replace(/\s+/g, '').toLowerCase();
+        const dubbel = (this._gfItems || []).find(m => sleutel(m.serialNumber) === sleutel(nr));
+        if (dubbel) { this.toast('Flesnummer bestaat al: ' + dubbel.name, true); return; }
+        const waar = this._gfNwWaar || '';
+        // Type-waarde overnemen van een bestaande fles (Levi's eigen optienaam), anders de standaard
+        const typeNaam = (this._gfItems || []).map(m => { const t = m.extraFields && m.extraFields['Type']; return t ? (t.stringValue ?? t.value) : null; }).find(Boolean) || RobawsAPI.GAS_TYPE_DEFAULT;
+        await this._gfActie(() => RobawsAPI.createGasfles({
+            soort: v('gfNwSoort') || 'Gasfles', inhoud: v('gfNwInhoud'), flesnr: nr, leverancier: v('gfNwLev'),
+            huurSinds: v('gfNwHuur') || null, empId: v('gfNwEmp') || null,
+            projectId: waar.indexOf('p:') === 0 ? waar.slice(2) : null,
+            locId: waar.indexOf('l:') === 0 ? waar.slice(2) : null,
+            typeNaam,
+        }), 'Fles geregistreerd: ' + nr);
+    },
+
+    // ---- Etiket scannen (v390): 1) native scanner uit de APK (QEBridge.scanBarcode,
+    //      Google ML Kit — eigen camera-UI, leest QR én streepjescodes), 2) anders de
+    //      webcamera met BarcodeDetector → ZXing → jsQR, 3) anders een foto (ZXing/jsQR),
+    //      4) altijd: het nummer typen. De WebView geeft de camera pas vrij als de APK
+    //      onPermissionRequest heeft (1.244+); oudere APK's landen dus op 3/4. ----
+    GAS_SCAN_FORMATEN: ['qr_code', 'code_128', 'code_39', 'ean_13', 'ean_8', 'itf', 'upc_a', 'upc_e'],
+    _gfScanNatiefKan() {
+        try { return !!(window.QEBridge && typeof QEBridge.scanBarcode === 'function'); } catch (_) { return false; }
+    },
+    openGasScan(doel) {
+        this._gfScanDoel = doel === 'nummer' ? 'nummer' : 'fiche';
+        if (this._gfScanNatiefKan() && !this._gfScanNatiefKapot) {
+            this._gfScanNatiefBezig = true;
+            try { QEBridge.scanBarcode(); return; } catch (e) { this._gfScanNatiefBezig = false; }
+        }
+        this._gfScanWebOpen();
+    },
+    /** Terugroep uit Java (QEBridge.scanBarcode → app._gfScanNatief). tekst = gelezen
+     *  code; fout = 'geannuleerd' (gebruiker sloot de scanner) of een reden. */
+    _gfScanNatief(tekst, fout) {
+        this._gfScanNatiefBezig = false;
+        if (tekst) { this._gfScanVerwerk(String(tekst)); return; }
+        if (fout && fout !== 'geannuleerd') {
+            this._gfScanNatiefKapot = true;   // deze sessie niet meer proberen (module niet beschikbaar)
+            this.toast('Scanner niet beschikbaar (' + fout + ') — we gebruiken de camera in de app', true);
+            this._gfScanWebOpen();
+        }
+    },
+    _gfScanWebOpen() {
+        const oud = document.getElementById('gfScanSheet');
+        if (oud) oud.remove();
+        const ov = document.createElement('div');
+        ov.id = 'gfScanSheet';
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99995;background:#0F1626;color:#fff;display:flex;flex-direction:column';
+        ov.innerHTML =
+            '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px"><div style="font-size:16px;font-weight:700">Scan het etiket op de fles</div>' +
+            '<button onclick="app._gfScanStop(true)" style="border:none;background:none;font-size:26px;line-height:1;color:#fff;padding:4px 8px;cursor:pointer">&times;</button></div>' +
+            '<div id="gfScanVak" style="flex:1;position:relative;overflow:hidden;background:#000">' +
+            '<video id="gfScanVideo" playsinline autoplay muted style="width:100%;height:100%;object-fit:cover;visibility:hidden"></video>' +
+            '<div id="gfScanPaneel" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:24px;text-align:center;color:#C9CFDA;background:#0F1626"><div style="font-size:44px">📷</div><div id="gfScanPaneelTekst" style="font-size:14px;line-height:1.45">Camera starten…</div></div>' +
+            '<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none"><div id="gfScanKader" style="display:none;width:84vw;max-width:520px;height:36vw;max-height:220px;border:3px solid rgba(249,157,62,.9);border-radius:16px"></div></div></div>' +
+            '<div id="gfScanStatus" style="padding:10px 16px;font-size:13px;color:#C9CFDA;text-align:center;min-height:38px">Camera starten…</div>' +
+            '<div style="display:flex;gap:8px;padding:0 16px calc(16px + env(safe-area-inset-bottom))">' +
+            '<button class="btn btn-outline" style="flex:1;color:#fff;border-color:rgba(255,255,255,.5)" onclick="document.getElementById(\'gfScanFoto\').click()">📸 Foto nemen</button>' +
+            '<button class="btn btn-outline" style="flex:1;color:#fff;border-color:rgba(255,255,255,.5)" onclick="app._gfScanHandmatig()">Flesnummer typen</button></div>' +
+            '<input type="file" id="gfScanFoto" accept="image/*" capture="environment" style="display:none" onchange="app._gfScanFoto(this)">';
+        document.body.appendChild(ov);
+        this._gfScanStart();
+    },
+    async _gfScanStart() {
+        const video = document.getElementById('gfScanVideo');
+        const status = document.getElementById('gfScanStatus');
+        const paneel = document.getElementById('gfScanPaneel');
+        const paneelTekst = document.getElementById('gfScanPaneelTekst');
+        const zeg = (t) => { if (status) status.textContent = t; };
+        try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('geen camera-API');
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+            this._gfStream = stream;
+            if (!video || !document.getElementById('gfScanSheet')) { this._gfScanStop(); return; }
+            video.srcObject = stream;
+            // pas als er echt beeld is: video tonen, startpaneel weg, richtkader erbij (kader hoort niet over de uitleg te staan)
+            const toon = () => { video.style.visibility = 'visible'; if (paneel) paneel.style.display = 'none'; const kd = document.getElementById('gfScanKader'); if (kd) kd.style.display = ''; };
+            video.addEventListener('playing', toon, { once: true });
+            await video.play().catch(() => {});
+            if (video.readyState >= 2) toon();
+            // Decoder: ingebouwde BarcodeDetector → ZXing (QR + streepjescodes) → jsQR (alleen QR)
+            let detector = null, zx = false;
+            if (window.BarcodeDetector) {
+                try { detector = new BarcodeDetector({ formats: this.GAS_SCAN_FORMATEN }); }
+                catch (_) { try { detector = new BarcodeDetector({ formats: ['qr_code', 'code_128'] }); } catch (_2) { detector = null; } }
+            }
+            if (!detector) { try { await this._gfLaadZxing(); zx = true; } catch (_) { zx = false; } }
+            if (!detector && !zx) { try { await this._qrLaadJsqr(); } catch (_) {} }
+            if (!detector && !zx && !window.jsQR) { zeg('Herkenning niet beschikbaar — neem een foto of typ het nummer.'); return; }
+            zeg(detector || zx ? 'Richt op de streepjescode of QR-code van het etiket…' : 'Richt op de QR-code… (streepjescode: neem een foto of typ het nummer)');
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            let bezig = false, n = 0, detFouten = 0;
+            const stap = async () => {
+                if (!document.getElementById('gfScanSheet') || !this._gfStream) return;
+                if (!bezig && video.readyState >= 2 && (video.videoWidth || 0) > 0) {
+                    bezig = true;
+                    try {
+                        const k = this._gfScanKader(video);
+                        canvas.width = k.dw; canvas.height = k.dh;
+                        ctx.drawImage(video, k.sx, k.sy, k.sw, k.sh, 0, 0, k.dw, k.dh);
+                        let tekst = null;
+                        if (detector) {
+                            const res = await detector.detect(canvas);
+                            if (res && res[0]) tekst = res[0].rawValue;
+                        } else if (zx) {
+                            tekst = this._gfZxingDecode(canvas);
+                        } else if (window.jsQR) {
+                            const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                            const r = jsQR(img.data, canvas.width, canvas.height, { inversionAttempts: 'dontInvert' });
+                            if (r && r.data) tekst = r.data;
+                        }
+                        if (tekst) { this._gfScanStop(); this._gfScanVerwerk(tekst); return; }
+                        n++;
+                        if (n === 40) zeg('Nog niets gelezen. Hou de code recht, dichtbij en scherp in het kader — of neem een foto.');
+                    } catch (_) {
+                        // BarcodeDetector aanwezig maar kapot (komt voor op WebViews) → na 5 fouten over op ZXing
+                        if (detector && ++detFouten >= 5) { detector = null; try { await this._gfLaadZxing(); zx = true; } catch (_2) {} }
+                    }
+                    bezig = false;
+                }
+                this._gfScanTimer = setTimeout(stap, detector ? 150 : 220);
+            };
+            stap();
+        } catch (e) {
+            // De WebView gaf de camera niet vrij (APK zonder onPermissionRequest, of geweigerd).
+            if (video) video.style.visibility = 'hidden';
+            if (paneel) paneel.style.display = 'flex';
+            if (paneelTekst) paneelTekst.innerHTML = '<b style="color:#fff">Live camera niet beschikbaar in deze app-versie.</b><br>Neem een foto van het etiket — de streepjescode wordt uit de foto gelezen — of typ het nummer dat onder de streepjes staat.';
+            zeg('Camera niet beschikbaar — neem een foto van het etiket.');
+            setTimeout(() => { const f = document.getElementById('gfScanFoto'); if (f) f.click(); }, 300);
+        }
+    },
+    /** Het oranje kader → uitsnede in videopixels (object-fit: cover), zodat de decoder
+     *  alleen het relevante stuk beeld ziet (sneller én betrouwbaarder). */
+    _gfScanKader(video) {
+        const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+        let sx = 0, sy = 0, sw = vw, sh = vh;
+        try {
+            const c = document.getElementById('gfScanVak').getBoundingClientRect();
+            const k = document.getElementById('gfScanKader').getBoundingClientRect();
+            if (c.width > 0 && c.height > 0 && k.width > 0 && k.height > 0) {
+                const schaal = Math.max(c.width / vw, c.height / vh);   // cover
+                sw = Math.min(vw, Math.round((k.width + 24) / schaal));
+                sh = Math.min(vh, Math.round((k.height + 24) / schaal));
+                sx = Math.max(0, Math.round((vw - sw) / 2));
+                sy = Math.max(0, Math.round((vh - sh) / 2));
+            }
+        } catch (_) {}
+        const dw = Math.min(1024, sw), dh = Math.max(1, Math.round(sh * dw / sw));
+        return { sx, sy, sw, sh, dw, dh };
+    },
+    _gfScanStop(sluit) {
+        if (this._gfScanTimer) { clearTimeout(this._gfScanTimer); this._gfScanTimer = null; }
+        if (this._gfStream) { try { this._gfStream.getTracks().forEach(t => t.stop()); } catch (_) {} this._gfStream = null; }
+        this._gfScanNatiefBezig = false;
+        if (sluit) { const s2 = document.getElementById('gfScanSheet'); if (s2) s2.remove(); }
+    },
+    /** Bibliotheken pas laden als het nodig is (jsQR 257 KB, ZXing 336 KB — niet bij elke start). */
+    _gfLaadScript(pad, globaal, sleutel) {
+        if (window[globaal]) return Promise.resolve();
+        if (this[sleutel]) return this[sleutel];
+        this[sleutel] = new Promise((ok, nee) => {
+            const sc = document.createElement('script');
+            sc.src = pad;
+            sc.onload = () => { if (window[globaal]) ok(); else { this[sleutel] = null; nee(new Error(pad + ' geladen maar ' + globaal + ' ontbreekt')); } };
+            sc.onerror = () => { this[sleutel] = null; nee(new Error(pad + ' laden mislukt')); };
+            document.head.appendChild(sc);
+        });
+        return this[sleutel];
+    },
+    _qrLaadJsqr() { return this._gfLaadScript('js/jsqr.js', 'jsQR', '_jsqrBelofte'); },
+    _gfLaadZxing() { return this._gfLaadScript('js/zxing.js', 'ZXing', '_zxingBelofte'); },
+    /** ZXing-decode van een canvas: QR + Code 128/39, EAN, ITF, UPC, Data Matrix;
+     *  TRY_HARDER probeert ook 90° gedraaid. Niets gevonden = null (geen fout). */
+    _gfZxingDecode(canvas) {
+        const Z = window.ZXing;
+        if (!Z) return null;
+        if (!this._gfZxReader) {
+            const hints = new Map();
+            hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.CODE_128, Z.BarcodeFormat.QR_CODE, Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8, Z.BarcodeFormat.CODE_39, Z.BarcodeFormat.ITF, Z.BarcodeFormat.UPC_A, Z.BarcodeFormat.UPC_E, Z.BarcodeFormat.DATA_MATRIX]);
+            hints.set(Z.DecodeHintType.TRY_HARDER, true);
+            this._gfZxReader = new Z.MultiFormatReader();
+            this._gfZxReader.setHints(hints);
+        }
+        try {
+            const bron = new Z.HTMLCanvasElementLuminanceSource(canvas);
+            const res = this._gfZxReader.decodeWithState(new Z.BinaryBitmap(new Z.HybridBinarizer(bron)));
+            const t = res && res.getText ? res.getText() : null;
+            return t ? String(t).trim() : null;
+        } catch (_) { return null; }
+        finally { try { this._gfZxReader.reset(); } catch (_) {} }
+    },
+    async _gfScanFoto(input) {
+        const file = input && input.files && input.files[0];
+        if (!file) return;
+        const status = document.getElementById('gfScanStatus');
+        const zeg = (t) => { if (status) status.textContent = t; };
+        zeg('Foto lezen…');
+        try {
+            const url = URL.createObjectURL(file);
+            const img = await new Promise((ok, nee) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => nee(new Error('foto onleesbaar')); i.src = url; });
+            // foto → canvas op maat; draai = 90° gedraaid (streepjescode verticaal gefotografeerd)
+            const teken = (maxPx, draai) => {
+                const sch = Math.min(1, maxPx / Math.max(img.width || 1, img.height || 1));
+                const w = Math.max(1, Math.round((img.width || 1) * sch)), h = Math.max(1, Math.round((img.height || 1) * sch));
+                const c = document.createElement('canvas');
+                const g = (c.width = draai ? h : w, c.height = draai ? w : h, c.getContext('2d'));
+                if (draai) { g.translate(h, 0); g.rotate(Math.PI / 2); }
+                g.drawImage(img, 0, 0, w, h);
+                return c;
+            };
+            let tekst = null;
+            // 1) ZXing: vol formaat eerst (streepjes), ook gedraaid, dan kleiner (QR)
+            try { await this._gfLaadZxing(); } catch (_) {}
+            if (window.ZXing) {
+                for (const [px, draai] of [[1600, false], [1600, true], [1000, false], [1000, true], [640, false]]) {
+                    tekst = this._gfZxingDecode(teken(px, draai));
+                    if (tekst) break;
+                }
+            }
+            // 2) jsQR als vangnet voor QR
+            if (!tekst) {
+                try { await this._qrLaadJsqr(); } catch (_) {}
+                if (window.jsQR) {
+                    const c = teken(1200);
+                    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+                    const r = jsQR(d.data, c.width, c.height);
+                    if (r && r.data) tekst = r.data;
+                }
+            }
+            URL.revokeObjectURL(url);
+            if (tekst) { this._gfScanStop(); this._gfScanVerwerk(tekst); }
+            else zeg('Geen code gevonden in de foto. Tip: dichtbij, scherp, streepjescode horizontaal en goed verlicht — probeer nog een foto of typ het nummer.');
+        } catch (e) { zeg('Foto lezen mislukt: ' + ((e && e.message) || '?')); }
+        finally { input.value = ''; }
+    },
+    _gfScanHandmatig() {
+        const nr = prompt('Flesnummer (zoals op de fles):');
+        if (nr == null) return;
+        this._gfScanStop();
+        this._gfScanVerwerk(String(nr));
+    },
+    /** Gescande tekst → fiche of formulier. Onze QR-URL → materieel-id; een
+     *  Messer-streepjescode of getypt nummer → flesnummer (serienummer).
+     *  Doel 'nummer' (vanuit het formulier) vult alleen het veld in. Onbekend
+     *  nummer = nieuwe levering → meteen het registratieformulier met het
+     *  nummer ingevuld ("een paar clicks"). */
+    _gfScanVerwerk(tekst) {
+        const p = RobawsAPI.qrParseMaterial(tekst);
+        const sheet = document.getElementById('gfScanSheet');
+        if (sheet) sheet.remove();
+        if (!p) { this.toast('Lege code', true); return; }
+        const sleutel = (x) => String(x || '').replace(/\s+/g, '').toLowerCase();
+        const opSerie = (serie) => serie ? ((this._gfItems || []).find(x => sleutel(x.serialNumber) === sleutel(serie)) || null) : null;
+        if (this._gfScanDoel === 'nummer') {
+            this._gfScanDoel = 'fiche';
+            const nr = p.serie || p.id || '';
+            const veld = document.getElementById('gfNwNr');
+            if (veld) { veld.value = nr; }
+            const bestaand = opSerie(nr);
+            this.toast(bestaand ? 'Let op: dit nummer staat al geregistreerd (' + bestaand.name + ')' : 'Flesnummer gelezen: ' + nr, !!bestaand);
+            return;
+        }
+        let m = opSerie(p.serie);
+        if (!m && p.id && !p.serie) m = (this._gfAlle || {})[p.id] || null;   // onze QR-URL
+        if (!m && p.id && p.serie) m = (this._gfAlle || {})[p.id] || null;   // kort getal: id als terugval
+        if (m) { this.openGasflesItem(m.id); return; }
+        if (p.id && !p.serie && this._gsAlles && this._gsAlles[p.id]) { this.toast('Dit is geen gasfles maar gereedschap: ' + (this._gsAlles[p.id].name || '#' + p.id), true); return; }
+        const nr = p.serie || p.id;
+        if (/^[A-Za-z0-9-]{4,}$/.test(String(nr || ''))) {
+            this.toast('Onbekende fles ' + nr + ' \u2014 registreer ze hier');
+            this.openGasflesNieuw(nr);
+            return;
+        }
+        this.toast('Code niet herkend: ' + String(tekst).slice(0, 40), true);
     },
 
     // ---------- keurdag: meerdere items in één keer ----------
@@ -11409,6 +12118,8 @@ const app = {
             ]);
             const n = (verlof.length || 0) + (fact.length || 0) + (mat.length || 0);
             if (n > 0) { badge.textContent = String(n); badge.style.display = ''; } else badge.style.display = 'none';
+            const orgBadge = document.getElementById('orgAanvragenBadge');  // v391
+            if (orgBadge) { if (n > 0) { orgBadge.textContent = String(n); orgBadge.style.display = ''; } else orgBadge.style.display = 'none'; }
             try { if (window.QEBridge && QEBridge.setApprovalCount) QEBridge.setApprovalCount(n); } catch (_e) {}
         } catch (e) { badge.style.display = 'none'; }
     },
@@ -15094,6 +15805,21 @@ const app = {
                         </div>`;
                     }
 
+                    // v394: de opmerking die je zelf bij het uitklokken meegaf
+                    // (regel "opmerking werknemer (HH:MM): …" in de klok-werkbon).
+                    const eigenOpm = [];
+                    for (const w of wos) {
+                        for (const o of RobawsAPI.leesUitklokOpmerkingen(w.remark)) eigenOpm.push(o);
+                    }
+                    if (eigenOpm.length) {
+                        html += `<div style="display:flex;gap:9px;align-items:flex-start;margin:2px 0 8px;padding:9px 11px;background:var(--awash);border-radius:10px">
+                            <span style="font-size:14px;line-height:1.2;flex-shrink:0">&#128172;</span>
+                            <div style="flex:1;min-width:0;font-size:12.5px;color:var(--g2);line-height:1.45">
+                                <span style="font-weight:700;color:var(--ink)">Jouw opmerking</span>${eigenOpm.map(o => `<br>${o.uur ? `<span style="color:var(--g3)">${this.escapeHtml(o.uur)}</span> ` : ''}${this.escapeHtml(o.tekst)}`).join('')}
+                            </div>
+                        </div>`;
+                    }
+
                     // v83: per werkbon — render individuele tijdsblokken (1 kaart per time-entry)
                     //   Werkuren (hourTypeId=1, article 185)  → ✅ groen, klant-werk
                     //   L&L (article 19786)                   → 📦 oranje box
@@ -15261,7 +15987,7 @@ const app = {
                             <div style="font-size:13px;color:var(--qe-grey)">${tijd} · ${totalHours.toFixed(2)} uur</div>
                         </div>
                     </div>
-                    ${(() => { const pub = this._publicRemark(wo.remark); return pub ? `<div style="font-size:12px;color:var(--qe-grey);padding:8px;background:#f5f5f5;border-radius:8px">${this.escapeHtml(pub)}</div>` : ''; })()}
+                    ${(() => { const pub = this._publicRemark(wo.remark); return pub ? `<div style="font-size:12px;color:var(--qe-grey);padding:8px;background:#f5f5f5;border-radius:8px;white-space:pre-line">${this.escapeHtml(pub)}</div>` : ''; })()}
                     <div style="font-size:11px;color:var(--qe-grey);margin-top:8px">Werkbon #${wo.id}</div>
                 </div>
 
@@ -16321,13 +17047,30 @@ const app = {
         };
     },
 
+    /** v394: klad van de uitklok-opmerking (overleeft een mislukte afsluiting;
+     *  QEClock wist het zodra de uitklok gelukt is). */
+    _uitklokOpmSleutel(workOrderId, employeeId) {
+        return 'qe_uitklok_opm_' + workOrderId + '_' + employeeId;
+    },
+    _uitklokOpmWis(workOrderId, employeeId) {
+        try { localStorage.removeItem(this._uitklokOpmSleutel(workOrderId, employeeId)); } catch (_) {}
+    },
+
     /**
      * v83: Vraag de monteur om kilometers heen/terug in te geven na uitklokken,
      * en post die als commute-entry op de werkbon. Modal — kan niet weggeklikt
      * worden zonder iets in te vullen (0 is een geldige waarde).
      * v119: bij open auto-fill via Google Maps Distance Matrix.
+     * v394: + OPMERKING VOOR HET BUREEL (vraag Levi). Resolvet nu
+     * { bevestigd: true, opmerking } i.p.v. true; annuleren blijft false.
+     * opts.hint (uit QEClock._uitklokHint) = geheugensteun bij een duidelijke
+     * afwijking (vroeger begonnen): leeg vak → één keer extra vragen, nog eens
+     * tikken = uitklokken zonder opmerking. Het klad blijft bewaard tot de
+     * uitklok gelukt is (localStorage qe_uitklok_opm_<wo>_<emp>, 12 u).
      */
-    async promptKilometers(workOrderId, employeeId) {
+    async promptKilometers(workOrderId, employeeId, opts) {
+        const kmOpts = opts || {};
+        const hint = (kmOpts.hint && kmOpts.hint.tekst) ? kmOpts.hint : null;
         return new Promise((resolve) => {
             // Bouw modal — v95: mobility-keuze + woonwerk-fiets checkbox
             let m = document.getElementById('kmPromptModal');
@@ -16437,6 +17180,18 @@ const app = {
                         </div>
                     </div>
 
+                    <!-- v394: opmerking voor het bureel — komt bij de tijdsregistratie -->
+                    <div id="kmOpmBlok" style="margin-bottom:14px">
+                        <div id="kmOpmHint" style="display:none;margin-bottom:8px;padding:10px 12px;border-radius:10px;background:var(--awash2);border:1px solid var(--aborder2,var(--aborder));color:var(--amber2);font-size:12.5px;line-height:1.45">
+                            <div id="kmOpmHintTekst" style="font-weight:700"></div>
+                            <div id="kmOpmHintVraag" style="margin-top:3px"></div>
+                        </div>
+                        <label for="kmOpmInput" style="font-size:12px;color:var(--g1);display:block;margin-bottom:4px">Opmerking voor het bureel <span style="font-weight:400">(niet verplicht)</span></label>
+                        <textarea id="kmOpmInput" rows="3" maxlength="500" placeholder="Bv. vroeger begonnen om de file voor te zijn, afgesproken met de projectleider"
+                            style="width:100%;box-sizing:border-box;padding:11px 12px;min-height:74px;resize:vertical;border:1px solid var(--b1);border-radius:10px;background:var(--card);color:var(--ink);font:400 14px var(--font,inherit);line-height:1.4"></textarea>
+                        <div style="font-size:11.5px;color:var(--g2);margin-top:4px;line-height:1.4">Komt bij je tijdsregistratie. Het bureel ziet het meteen bij het nakijken van je uren.</div>
+                    </div>
+
                     <button id="kmPromptSubmit" style="width:100%;padding:16px;background:var(--btn);color:var(--btnfg);border:none;border-radius:2px;font:600 14px var(--font);cursor:pointer">
                         Uitklokken bevestigen
                     </button>
@@ -16453,6 +17208,36 @@ const app = {
             const directWTEl = document.getElementById('kmDirectWerfThuisInput');
             const errEl = document.getElementById('kmPromptError');
             const btn = document.getElementById('kmPromptSubmit');
+            // v394: opmerking voor het bureel + geheugensteun
+            const opmEl = document.getElementById('kmOpmInput');
+            const opmBlokEl = document.getElementById('kmOpmBlok');
+            const opmHintEl = document.getElementById('kmOpmHint');
+            const opmHintVraagEl = document.getElementById('kmOpmHintVraag');
+            const opmSleutel = this._uitklokOpmSleutel(workOrderId, employeeId);
+            let opmGevraagd = false;
+            const knopTekst = () => (opmGevraagd && opmEl && !opmEl.value.trim())
+                ? 'Uitklokken zonder opmerking' : 'Uitklokken bevestigen';
+            try {
+                const klad = JSON.parse(localStorage.getItem(opmSleutel) || 'null');
+                if (klad && klad.t && opmEl && (Date.now() - (Number(klad.ts) || 0)) < 12 * 3600 * 1000) {
+                    opmEl.value = String(klad.t).slice(0, 500);
+                }
+            } catch (_) {}
+            if (hint && opmHintEl) {
+                document.getElementById('kmOpmHintTekst').textContent = hint.tekst;
+                opmHintVraagEl.textContent = hint.vraag || 'Afgesproken? Zet het hieronder.';
+                opmHintEl.style.display = 'block';
+            }
+            if (opmEl) {
+                opmEl.addEventListener('input', () => {
+                    try {
+                        const t = opmEl.value;
+                        if (t.trim()) localStorage.setItem(opmSleutel, JSON.stringify({ t: t, ts: Date.now() }));
+                        else localStorage.removeItem(opmSleutel);
+                    } catch (_) {}
+                    if (!btn.disabled) btn.textContent = knopTekst();
+                });
+            }
             // v131: split-rit elementen
             const splitToggleEl = document.getElementById('kmSplitToggle');
             const splitSectionEl = document.getElementById('kmSplitSection');
@@ -16576,6 +17361,20 @@ const app = {
                 // twee keer Enter op traag 4G gaf dubbele commute-entries
                 // (dubbele km-vergoeding).
                 if (this._kmSubmitBusy) return;
+                // v394: vroeger begonnen en niets ingevuld? Eén keer vragen —
+                // vóór er iets geschreven wordt. Nog eens tikken = zonder opmerking.
+                const opmerking = opmEl ? opmEl.value.trim() : '';
+                if (hint && !opmerking && !opmGevraagd) {
+                    opmGevraagd = true;
+                    if (opmHintVraagEl) {
+                        opmHintVraagEl.textContent = 'Schrijf kort waarom (bv. afgesproken met de projectleider). '
+                            + 'Geen opmerking nodig? Tik dan op "Uitklokken zonder opmerking".';
+                    }
+                    btn.textContent = knopTekst();
+                    try { opmBlokEl.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
+                    try { opmEl.focus({ preventScroll: true }); } catch (_) {}
+                    return;
+                }
                 this._kmSubmitBusy = true;
                 const heen = Math.max(0, Math.round(parseFloat(heenEl.value) || 0));
                 const terug = Math.max(0, Math.round(parseFloat(terugEl.value) || 0));
@@ -16596,6 +17395,7 @@ const app = {
                 btn.disabled = true;
                 btn.textContent = 'Bevestigen…';
                 errEl.style.display = 'none';
+                if (opmEl) opmEl.readOnly = true;
 
                 try {
                     if (kmAlGepost) {
@@ -16686,13 +17486,15 @@ const app = {
                     this.toast(kmAlGepost
                         ? 'Uitklokken bevestigd — kilometers stonden al opgeslagen'
                         : 'Kilometers opgeslagen: ' + totaalKm + ' km' + tagTxt);
-                    resolve(true);
+                    // v394: de opmerking gaat mee in de afsluiting (clock.js)
+                    resolve({ bevestigd: true, opmerking: opmerking });
                 } catch (e) {
                     console.warn('[App] km POST faalde:', e && e.message);
                     errEl.textContent = 'Opslaan mislukt: ' + (e && e.message || '?');
                     errEl.style.display = 'block';
                     btn.disabled = false;
-                    btn.textContent = 'Uitklokken bevestigen';
+                    if (opmEl) opmEl.readOnly = false;
+                    btn.textContent = knopTekst();
                 } finally {
                     this._kmSubmitBusy = false;  // v251
                 }
@@ -17413,6 +18215,10 @@ const app = {
     _publicRemark(remark) {
         if (!remark) return '';
         const cleanLine = (line) => {
+            // v394: de eigen opmerking bij het uitklokken volledig tonen (niet
+            // afknippen op een " - " in de tekst)
+            const opm = RobawsAPI.leesUitklokOpmerking(line);
+            if (opm) return 'Jouw opmerking' + (opm.uur ? ' (' + opm.uur + ')' : '') + ': ' + opm.tekst;
             let s = String(line || '').replace(/^\s*klok-(in|uit):\s*/i, '');
             const m = s.match(/^(.*?)\s+[—-]\s+/);
             if (m) return m[1].trim();
@@ -18270,6 +19076,972 @@ const app = {
         const M = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
         const p = String(d).split('-');
         return parseInt(p[2], 10) + ' ' + (M[parseInt(p[1], 10) - 1] || '');
+    },
+
+    // ============================================================
+    // v391: ORGANISATIE — nieuw onderdeel in de onderbalk (was "Aanvragen").
+    // Compartimenten zoals bij Logistiek: Aanvragen (iedereen) + Projecten
+    // (bureel: zoeken tussen alle projecten en onderweg dagplanningen maken).
+    // Wie maar één compartiment heeft (monteur/technieker) gaat meteen naar
+    // Aanvragen. Daarnaast het scherm Toestel & toestemmingen (APK 1.245).
+    // ============================================================
+    _orgMagProjecten() {
+        const u = RobawsAPI.getLoggedInUser();
+        return !!(u && u.role === 'bureel') && RobawsAPI.magAppTool('projecten');
+    },
+
+    openOrganisatie() {
+        if (!this._orgMagProjecten()) { this.navigate('screenAanvragen'); return; }
+        this.navigate('screenOrganisatie');
+    },
+
+    loadOrganisatie() {
+        try { this._refreshAanvraagGoedkeurCount(); } catch (_e) {}
+        const sub = document.getElementById('orgProjectenSub');
+        if (!sub) return;
+        Promise.all([RobawsAPI.getProjectenOverzicht(), RobawsAPI.getActiveEmployees().catch(() => [])]).then(([lijst, emps]) => {
+            this._prjLijst = lijst;
+            this._prjZetLeiders(emps);
+            const lopend = lijst.filter(p => !p.afgesloten);
+            const mijn = lopend.filter(p => this._prjIsMijn(p)).length;
+            sub.textContent = mijn + (mijn === 1 ? ' lopend project van jou' : ' lopende projecten van jou') + ' · ' + lopend.length + ' in totaal';
+        }).catch(() => {});
+    },
+
+    _prjNorm(s) {
+        return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+    },
+
+    _prjTijd(d) {
+        return d ? String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') : '';
+    },
+
+    _prjDag(datum, lang) {
+        const d = new Date(datum + 'T12:00:00');
+        const D = lang ? ['Zondag', 'Maandag', 'Dinsdag', 'Woensdag', 'Donderdag', 'Vrijdag', 'Zaterdag'] : ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'];
+        const M = lang ? ['januari', 'februari', 'maart', 'april', 'mei', 'juni', 'juli', 'augustus', 'september', 'oktober', 'november', 'december']
+            : ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
+        return D[d.getDay()] + ' ' + d.getDate() + ' ' + M[d.getMonth()];
+    },
+
+    _prjStatusKlasse(p) {
+        if (p.afgesloten) return 'prj-st-dicht';
+        if (/voorbereiding/i.test(p.status)) return 'prj-st-voorb';
+        if (/actief|uitvoering|lopend/i.test(p.status)) return 'prj-st-actief';
+        return 'prj-st-ander';
+    },
+
+    /** Venster voor bezetting: vorige week t/m 4 weken vooruit (1 gedeelde, gecachte ophaling). */
+    _prjVensterBereik() {
+        return { van: RobawsAPI._localDateStr(new Date(), -7), tot: RobawsAPI._localDateStr(new Date(), 28) };
+    },
+
+    _prjFilter: 'lopend',
+    _prjZoek: '',
+
+    openProjecten() {
+        if (!this._orgMagProjecten()) { this.toast('Alleen voor bureel', true); return; }
+        this.navigate('screenProjecten', true);
+    },
+
+    async loadProjecten(force) {
+        const el = document.getElementById('prjLijst');
+        if (!el) return;
+        const zoek = document.getElementById('prjZoek');
+        if (zoek && zoek.value !== this._prjZoek) zoek.value = this._prjZoek;
+        if (!this._prjLijst || force) el.innerHTML = '<div class="spinner"></div>';
+        else this.renderProjecten();
+        try {
+            const [lijst, emps] = await Promise.all([
+                RobawsAPI.getProjectenOverzicht({ force: !!force }),
+                RobawsAPI.getActiveEmployees().catch(() => []),
+            ]);
+            this._prjLijst = lijst;
+            this._prjZetLeiders(emps);
+            this.renderProjecten();
+        } catch (e) {
+            el.innerHTML = '<div class="card" style="padding:16px;text-align:center"><div style="font-size:13.5px;color:var(--g2);margin-bottom:10px">'
+                + this.escapeHtml((e && e.message) || 'Projecten laden mislukt') + '</div>'
+                + '<button class="btn btn-outline btn-sm" onclick="app.loadProjecten(true)">Opnieuw proberen</button></div>';
+            return;
+        }
+        const b = this._prjVensterBereik();
+        RobawsAPI.getPlanningVenster(b.van, b.tot, { force: !!force })
+            .then(items => { this._prjVenster = items; if (this.currentScreen === 'screenProjecten') this.renderProjecten(); })
+            .catch(() => {});
+    },
+
+    prjZoeken(waarde) {
+        this._prjZoek = String(waarde || '');
+        this.renderProjecten();
+    },
+
+    prjZetFilter(f) {
+        this._prjFilter = f === 'alles' ? 'alles' : 'lopend';
+        this.renderProjecten();
+    },
+
+    // v392 (vraag Levi): standaard alleen je EIGEN projecten, filter weg met één tik,
+    // en filteren op projectleider. Projectleider = extraveld "Verantwoordelijke
+    // project:" (wint, zelfde regel als het werfdossier) of anders de native
+    // projectleider siteManagerId (= Robaws-gebruiker → werknemersfiche).
+    // GEMETEN 14 sep: 36/39 projecten hebben er één (Bart, Bjorn, Rolf, Levi);
+    // executorId is de UITVOERDER (monteur) en telt bewust niet mee.
+    // Sleutel = de werknemersfiche als die te vinden is ("Bart Spoormans" en
+    // bart@qe.be worden zo dezelfde persoon), anders de voornaam.
+    _prjLeider: 'mijn',
+
+    _prjZetLeiders(emps) {
+        let lijst = (emps || []).filter(e => e && e.employeeId != null);
+        // geen werknemerslijst (bv. leesrecht weg) → de vaste EMPLOYEES-map heeft ook userId's
+        if (!lijst.length && RobawsAPI.EMPLOYEES) {
+            lijst = Object.entries(RobawsAPI.EMPLOYEES).map(([email, v]) => Object.assign({ email }, v)).filter(e => e.employeeId != null);
+        }
+        const perUser = {}, perNaam = {}, perVoornaam = {};
+        const normNaam = (n) => this._prjNorm(n).replace(/\s+/g, ' ').trim();
+        for (const e of lijst) {
+            if (e.userId != null) perUser[String(e.userId)] = e;
+            const vol = normNaam(e.name);
+            if (!vol) continue;
+            perNaam[vol] = e;
+            const vn = vol.split(' ')[0];
+            (perVoornaam[vn] = perVoornaam[vn] || []).push(e);
+        }
+        const viaNaam = (naam) => {
+            const vol = normNaam(naam);
+            if (!vol) return null;
+            if (perNaam[vol]) return perNaam[vol];
+            const kand = perVoornaam[vol.split(' ')[0]] || [];
+            return kand.length === 1 ? kand[0] : null;
+        };
+        const leiders = {};
+        for (const p of (this._prjLijst || [])) {
+            let l = null;
+            if (p.verantwoordelijke) {
+                const e = viaNaam(p.verantwoordelijke);
+                l = e ? { sleutel: 'e' + e.employeeId, naam: e.name || p.verantwoordelijke }
+                    : { sleutel: 'n' + normNaam(p.verantwoordelijke).split(' ')[0], naam: p.verantwoordelijke };
+            } else if (p.siteManagerId) {
+                const e = perUser[p.siteManagerId];
+                l = e ? { sleutel: 'e' + e.employeeId, naam: e.name || ('Gebruiker #' + p.siteManagerId) }
+                    : { sleutel: 'u' + p.siteManagerId, naam: 'Gebruiker #' + p.siteManagerId };
+            }
+            leiders[p.id] = l;
+        }
+        this._prjLeiders = leiders;
+        const u = this.currentUser || RobawsAPI.getLoggedInUser() || {};
+        const mijnFiche = u.robawsEmployeeId != null ? String(u.robawsEmployeeId) : '';
+        const ik = lijst.find(e => String(e.employeeId) === mijnFiche) || viaNaam(u.name || '');
+        const sleutels = new Set();
+        if (ik) sleutels.add('e' + ik.employeeId);
+        if (mijnFiche) sleutels.add('e' + mijnFiche);
+        if (u.name) sleutels.add('n' + normNaam(u.name).split(' ')[0]);
+        this._prjMijnSleutels = sleutels;
+    },
+
+    _prjIsMijn(p) {
+        const l = this._prjLeiders ? this._prjLeiders[p.id] : null;
+        return !!(l && this._prjMijnSleutels && this._prjMijnSleutels.has(l.sleutel));
+    },
+
+    _prjLeiderOk(p) {
+        const f = this._prjLeider;
+        if (f === 'alle' || !this._prjLeiders) return true;
+        if (f === 'mijn') return this._prjIsMijn(p);
+        const l = this._prjLeiders[p.id];
+        if (f === '_geen') return !l;
+        return !!(l && l.sleutel === f);
+    },
+
+    _prjLeiderNaam() {
+        const f = this._prjLeider;
+        if (f === 'mijn') return 'jouw projecten';
+        if (f === '_geen') return 'projecten zonder projectleider';
+        const p = (this._prjLijst || []).find(x => this._prjLeiders && this._prjLeiders[x.id] && this._prjLeiders[x.id].sleutel === f);
+        return p ? this._prjLeiders[p.id].naam : 'deze projectleider';
+    },
+
+    prjZetLeider(v) {
+        this._prjLeider = v || 'alle';
+        this.renderProjecten();
+    },
+
+    /** Keuzelijst Projectleider + "✕ Filter weg" (tellers volgen Lopend/Alles). */
+    _prjLeiderBalk(statusOk) {
+        const el = document.getElementById('prjLeiderBalk');
+        if (!el) return;
+        if (!this._prjLeiders || !this._prjLijst) { el.innerHTML = ''; return; }
+        const basis = this._prjLijst.filter(statusOk);
+        const namen = {}, tel = {};
+        let mijn = 0, geen = 0;
+        for (const p of basis) {
+            const l = this._prjLeiders[p.id];
+            if (!l) { geen++; continue; }
+            tel[l.sleutel] = (tel[l.sleutel] || 0) + 1;
+            if (!namen[l.sleutel] || String(l.naam).length > String(namen[l.sleutel]).length) namen[l.sleutel] = l.naam;
+            if (this._prjIsMijn(p)) mijn++;
+        }
+        const f = this._prjLeider;
+        const sleutels = Object.keys(tel).sort((a, b) => String(namen[a]).localeCompare(String(namen[b])));
+        if (f !== 'mijn' && f !== 'alle' && f !== '_geen' && !tel[f]) {
+            tel[f] = 0;
+            namen[f] = this._prjLeiderNaam();
+            sleutels.push(f);
+        }
+        const opt = (v, t) => '<option value="' + this.escapeHtml(v) + '"' + (v === f ? ' selected' : '') + '>' + this.escapeHtml(t) + '</option>';
+        el.innerHTML = '<div class="prj-leiderbalk">'
+            + '<select class="form-input prj-leiderkeuze" aria-label="Projectleider" onchange="app.prjZetLeider(this.value)">'
+            + opt('mijn', 'Mijn projecten (' + mijn + ')')
+            + opt('alle', 'Alle projectleiders (' + basis.length + ')')
+            + '<optgroup label="Projectleider">'
+            + sleutels.map(s => opt(s, namen[s] + ' (' + tel[s] + ')')).join('')
+            + (geen || f === '_geen' ? opt('_geen', 'Niet ingevuld (' + geen + ')') : '')
+            + '</optgroup></select>'
+            + (f !== 'alle' ? '<button type="button" class="mb-minibtn prj-filterweg" onclick="app.prjZetLeider(\'alle\')">✕ Filter weg</button>' : '')
+            + '</div>';
+    },
+
+    /** projectId → { eerste: datum, dagen: aantal } voor vandaag t/m 13 dagen vooruit. */
+    _prjKomend() {
+        const uit = {};
+        if (!this._prjVenster) return uit;
+        const van = RobawsAPI._localDateStr(new Date()), tot = RobawsAPI._localDateStr(new Date(), 13);
+        for (const i of this._prjVenster) {
+            if (!i.projectId || !i.datum || i.datum < van || i.datum > tot) continue;
+            const u = uit[i.projectId] || (uit[i.projectId] = { eerste: i.datum, dagen: new Set() });
+            if (i.datum < u.eerste) u.eerste = i.datum;
+            u.dagen.add(i.datum);
+        }
+        return uit;
+    },
+
+    renderProjecten() {
+        const el = document.getElementById('prjLijst');
+        if (!el || !this._prjLijst) return;
+        document.querySelectorAll('#prjFilters .mb-subtab').forEach(b => b.classList.toggle('active', b.dataset.f === this._prjFilter));
+        const woorden = this._prjNorm(this._prjZoek).trim().split(/\s+/).filter(Boolean);
+        const komend = this._prjKomend();
+        // v392: status (zoeken kijkt ook in afgesloten) → zoekterm → projectleider
+        const statusOk = (p) => woorden.length > 0 || this._prjFilter === 'alles' || !p.afgesloten;
+        const zoekOk = (p) => {
+            if (!woorden.length) return true;
+            const l = this._prjLeiders ? this._prjLeiders[p.id] : null;
+            const hooi = this._prjNorm([p.logicId, p.naam, p.naamProject, p.klant, p.eindklant, p.adresTekst,
+                p.adres.addressLine2, p.verantwoordelijke, l ? l.naam : '', p.status, p.type].join(' '));
+            return woorden.every(w => hooi.indexOf(w) >= 0);
+        };
+        this._prjLeiderBalk((p) => this._prjFilter === 'alles' || !p.afgesloten);
+        const zonderLeider = this._prjLijst.filter(p => statusOk(p) && zoekOk(p));
+        let lijst = zonderLeider.filter(p => this._prjLeiderOk(p));
+        const rang = (p) => p.afgesloten ? 2 : (/voorbereiding/i.test(p.status) ? 1 : 0);
+        lijst.sort((a, b) => rang(a) - rang(b) || String(b.logicId).localeCompare(String(a.logicId), undefined, { numeric: true }));
+        const telling = document.getElementById('prjTelling');
+        if (telling) {
+            const afg = this._prjLijst.filter(p => p.afgesloten && this._prjLeiderOk(p)).length;
+            telling.textContent = woorden.length
+                ? (lijst.length + (lijst.length === 1 ? ' project gevonden' : ' projecten gevonden') + ' (in alle projecten)')
+                : (lijst.length + (lijst.length === 1 ? ' project' : ' projecten') + (this._prjFilter === 'lopend' && afg ? ' · ' + afg + ' afgesloten verborgen' : ''));
+        }
+        if (!lijst.length) {
+            const elders = zonderLeider.length;
+            let html = '<div class="card" style="padding:18px;text-align:center;color:var(--g1);font-size:13.5px;line-height:1.5">';
+            if (this._prjLeider !== 'alle' && elders > 0) {
+                html += (woorden.length
+                        ? 'Geen treffers voor "' + this.escapeHtml(this._prjZoek) + '" bij ' + this.escapeHtml(this._prjLeiderNaam()) + '.'
+                        : (this._prjLeider === 'mijn'
+                            ? 'Je bent bij geen enkel ' + (this._prjFilter === 'lopend' ? 'lopend ' : '') + 'project projectleider.'
+                            : 'Geen ' + (this._prjFilter === 'lopend' ? 'lopende ' : '') + 'projecten bij ' + this.escapeHtml(this._prjLeiderNaam()) + '.'))
+                    + '<br><button type="button" class="btn btn-outline btn-sm" style="margin-top:10px" onclick="app.prjZetLeider(\'alle\')">'
+                    + (woorden.length ? 'Zoek in alle projecten (' + elders + ')' : 'Toon alle projecten (' + elders + ')') + '</button>';
+            } else {
+                html += woorden.length ? 'Geen project gevonden voor "' + this.escapeHtml(this._prjZoek) + '".' : 'Geen projecten.';
+            }
+            el.innerHTML = html + '</div>';
+            return;
+        }
+        el.innerHTML = lijst.map(p => {
+            const k = komend[p.id];
+            const plan = k
+                ? '<div class="prj-plan prj-plan-ja"><span class="prj-dot"></span>Ingepland vanaf ' + this.escapeHtml(this._prjDag(k.eerste))
+                    + (k.dagen.size > 1 ? ' · ' + k.dagen.size + ' dagen de komende 2 weken' : '') + '</div>'
+                : (!p.afgesloten && this._prjVenster ? '<div class="prj-plan">Niets ingepland de komende 2 weken</div>' : '');
+            const sub = [p.klant, p.adres.city].filter(Boolean).map(x => this.escapeHtml(x)).join(' · ');
+            return '<div class="card card-clickable prj-rij" onclick="app.openProjectDetail(\'' + this.escapeHtml(p.id) + '\')">'
+                + '<div class="prj-rij-kop"><span class="prj-nr">' + this.escapeHtml(p.logicId || '#' + p.id) + '</span>'
+                + '<span class="prj-status ' + this._prjStatusKlasse(p) + '">' + this.escapeHtml(p.status || 'zonder status') + '</span></div>'
+                + '<div class="prj-naam">' + this.escapeHtml(p.naam) + '</div>'
+                + (sub ? '<div class="prj-sub">' + sub + '</div>' : '')
+                + plan + '</div>';
+        }).join('');
+    },
+
+    // ---------------------------------------------------------------- detail
+    openProjectDetail(id) {
+        const p = (this._prjLijst || []).find(x => x.id === String(id));
+        if (!p) { this.toast('Project niet gevonden', true); return; }
+        this._prjHuidig = p;
+        this._prjPlanItems = null;
+        this.navigate('screenProjectDetail', true);
+    },
+
+    renderProjectDetail() {
+        const p = this._prjHuidig;
+        const el = document.getElementById('prjDetail');
+        if (!el) return;
+        if (!p) { el.innerHTML = ''; return; }
+        const rij = (label, waarde) => waarde
+            ? '<div class="prj-info-rij"><span class="prj-info-l">' + label + '</span><span class="prj-info-w">' + waarde + '</span></div>' : '';
+        const adres = p.adresTekst
+            ? this.escapeHtml(p.adresTekst) + (p.adres.addressLine2 ? '<br><span style="color:var(--g1)">' + this.escapeHtml(p.adres.addressLine2) + '</span>' : '')
+                + '<br><button class="mb-minibtn" style="margin-top:6px" onclick="app.prjRoute()">Route</button>'
+            : '';
+        el.innerHTML = '<div class="mb-head"><div class="mb-head-sub">' + this.escapeHtml([p.logicId, p.status].filter(Boolean).join(' · ')) + '</div>'
+            + '<div class="mb-head-title prj-titel">' + this.escapeHtml(p.naam) + '</div></div>'
+            + '<div class="card prj-info">'
+            + rij('Klant', this.escapeHtml(p.klant))
+            + rij('Eindklant', p.eindklant && p.eindklant !== p.klant ? this.escapeHtml(p.eindklant) : '')
+            + rij('Werf', adres)
+            + rij('Verantwoordelijke', this.escapeHtml(p.verantwoordelijke))
+            + rij('Type', this.escapeHtml(p.type))
+            + '</div>'
+            + '<button class="btn btn-primary btn-full" style="margin:4px 0 18px" onclick="app.openDagplanningNieuw()">+ Dagplanning maken</button>'
+            + '<div id="prjPlanLijst"><div class="spinner"></div></div>';
+    },
+
+    prjRoute() {
+        const p = this._prjHuidig;
+        if (!p || !p.adresTekst) return;
+        const url = 'https://www.google.com/maps/dir/?api=1&destination=' + encodeURIComponent(p.adresTekst);
+        if (window.QENative && QENative.beschikbaar()) { QENative.navigeer(p.adresTekst); return; }
+        window.open(url, '_blank');
+    },
+
+    async loadProjectPlanning() {
+        const p = this._prjHuidig;
+        const box = document.getElementById('prjPlanLijst');
+        if (!p || !box) return;
+        if (!this._prjPlanItems) box.innerHTML = '<div class="spinner"></div>';
+        try {
+            const [items, types, emps] = await Promise.all([
+                RobawsAPI.getProjectPlanning(p.id),
+                RobawsAPI.getPlanningTypes().catch(() => []),
+                RobawsAPI.getActiveEmployees().catch(() => []),
+            ]);
+            if (this._prjHuidig !== p) return;
+            this._prjPlanItems = items;
+            this._dpTypes = types;
+            this._prjEmpNamen = {};
+            (emps || []).forEach(e => { this._prjEmpNamen[String(e.employeeId)] = String(e.name || '').split(' ')[0] || e.name; });
+            this.renderProjectPlanning();
+        } catch (e) {
+            box.innerHTML = '<div class="card" style="padding:14px;text-align:center"><div style="font-size:13px;color:var(--g2);margin-bottom:8px">'
+                + this.escapeHtml((e && e.message) || 'Planning laden mislukt') + '</div>'
+                + '<button class="btn btn-outline btn-sm" onclick="app.loadProjectPlanning()">Opnieuw proberen</button></div>';
+        }
+    },
+
+    _prjTypeKleur(typeId) {
+        const t = (this._dpTypes || []).find(x => x.id === String(typeId));
+        return (t && t.kleur) || 'var(--b2)';
+    },
+
+    _prjPlanRij(i) {
+        const p = this._prjHuidig;
+        const namen = i.employeeIds.map(id => (this._prjEmpNamen && this._prjEmpNamen[id]) || ('#' + id)).join(', ');
+        const titelAnders = i.summary && p && this._prjNorm(i.summary) !== this._prjNorm(p.naam)
+            && this._prjNorm(i.summary) !== this._prjNorm((p.logicId ? p.logicId + ' ' : '') + p.naam);
+        return '<div class="prj-plan-rij" onclick="app.prjPlanActie(\'' + this.escapeHtml(i.id) + '\')">'
+            + '<span class="prj-kleur" style="background:' + this.escapeHtml(this._prjTypeKleur(i.typeId)) + '"></span>'
+            + '<div class="prj-plan-info"><div class="prj-plan-t">' + this._prjTijd(i.start) + '–' + this._prjTijd(i.eind)
+            + ' · ' + this.escapeHtml(namen || 'niemand') + '</div>'
+            + (titelAnders ? '<div class="prj-plan-s">' + this.escapeHtml(i.summary) + '</div>' : '')
+            + '</div>'
+            + (i.regie ? '<span class="prj-tag">regie</span>' : '')
+            + (i.reeks ? '<span class="prj-tag">reeks</span>' : '')
+            + '<span class="mb-prow-arrow">›</span></div>';
+    },
+
+    renderProjectPlanning() {
+        const box = document.getElementById('prjPlanLijst');
+        const items = this._prjPlanItems;
+        if (!box || !items) return;
+        const vandaag = RobawsAPI._localDateStr(new Date());
+        const morgen = RobawsAPI._localDateStr(new Date(), 1);
+        const komend = items.filter(i => i.datum >= vandaag).sort((a, b) => (a.start || 0) - (b.start || 0));
+        const eerder = items.filter(i => i.datum && i.datum < vandaag).sort((a, b) => (b.start || 0) - (a.start || 0)).slice(0, 15);
+        const groep = (lijst) => {
+            let html = '', dag = null;
+            for (const i of lijst) {
+                if (i.datum !== dag) {
+                    dag = i.datum;
+                    const label = dag === vandaag ? 'Vandaag · ' + this._prjDag(dag) : dag === morgen ? 'Morgen · ' + this._prjDag(dag) : this._prjDag(dag, true);
+                    html += '<div class="prj-dagkop">' + this.escapeHtml(label) + '</div>';
+                }
+                html += this._prjPlanRij(i);
+            }
+            return html;
+        };
+        let html = '<div class="section-header"><h2>Ingepland</h2><span class="badge">' + komend.length + '</span></div>';
+        html += komend.length ? '<div class="card prj-plan-kaart">' + groep(komend) + '</div>'
+            : '<div class="card" style="padding:16px;text-align:center;color:var(--g1);font-size:13.5px;margin-bottom:14px">Nog niets ingepland op dit project.</div>';
+        if (eerder.length) {
+            const open = !!this._prjEerderOpen;
+            html += '<button class="mb-minibtn" style="margin:4px 0 10px" onclick="app._prjEerderOpen=!app._prjEerderOpen;app.renderProjectPlanning()">'
+                + (open ? 'Eerdere dagen verbergen' : 'Eerdere dagen tonen (' + eerder.length + ')') + '</button>';
+            if (open) html += '<div class="card prj-plan-kaart prj-eerder">' + groep(eerder) + '</div>';
+        }
+        box.innerHTML = html;
+    },
+
+    prjPlanActie(id) {
+        const i = (this._prjPlanItems || []).find(x => x.id === String(id));
+        if (!i) return;
+        const namen = i.employeeIds.map(e => (this._prjEmpNamen && this._prjEmpNamen[e]) || ('#' + e)).join(', ');
+        const t = (this._dpTypes || []).find(x => x.id === i.typeId);
+        const verleden = i.datum < RobawsAPI._localDateStr(new Date());
+        const html = '<div style="padding:4px 4px 8px">'
+            + '<div style="font-size:12px;color:var(--g1);margin-bottom:2px">' + this.escapeHtml(this._prjDag(i.datum, true)) + ' · '
+            + this._prjTijd(i.start) + '–' + this._prjTijd(i.eind) + '</div>'
+            + '<div style="font-size:17px;font-weight:600;color:var(--ink);margin-bottom:10px">' + this.escapeHtml(i.summary || '(zonder titel)') + '</div>'
+            + '<div style="font-size:13.5px;color:var(--g2);line-height:1.6;margin-bottom:14px">'
+            + 'Wie: ' + this.escapeHtml(namen || 'niemand') + '<br>'
+            + 'Kleur: <span class="prj-kleur" style="display:inline-block;vertical-align:-2px;background:' + this.escapeHtml(this._prjTypeKleur(i.typeId)) + '"></span> '
+            + this.escapeHtml((t && t.naam) || 'geen') + (i.regie ? '<br>Regie: ja' : '') + '</div>'
+            + '<button class="btn btn-primary btn-full" style="margin-bottom:10px" onclick="app.closeModal();app.prjPlanKopieer(\'' + this.escapeHtml(i.id) + '\')">Kopiëren naar andere dag(en)</button>'
+            + (i.reeks
+                ? '<div style="font-size:12.5px;color:var(--g1);line-height:1.5;margin-bottom:10px">Deze planning hoort bij een herhalende reeks in Robaws — aanpassen of verwijderen doe je in Robaws zelf.</div>'
+                : '<button class="btn btn-outline btn-full" style="margin-bottom:10px;color:var(--red2);border-color:var(--red2)" onclick="app.prjPlanVerwijder(\'' + this.escapeHtml(i.id) + '\')">'
+                    + (verleden ? 'Verwijderen (dag is voorbij)' : 'Verwijderen') + '</button>')
+            + '<button class="btn btn-outline btn-full" onclick="app.closeModal()">Sluiten</button></div>';
+        this.showModal(html);
+    },
+
+    prjPlanKopieer(id) {
+        const i = (this._prjPlanItems || []).find(x => x.id === String(id));
+        if (i) this.openDagplanningNieuw({ kopie: i });
+    },
+
+    async prjPlanVerwijder(id) {
+        const i = (this._prjPlanItems || []).find(x => x.id === String(id));
+        if (!i || this._prjVerwijderBezig) return;
+        const tekst = 'Deze dagplanning verwijderen?\n\n' + this._prjDag(i.datum, true) + ' · ' + this._prjTijd(i.start) + '–' + this._prjTijd(i.eind)
+            + '\n' + (i.summary || '');
+        if (!confirm(tekst)) return;
+        this._prjVerwijderBezig = true;
+        this.closeModal();
+        try {
+            await RobawsAPI.deletePlanningItem(i.id);
+            this.toast('Dagplanning verwijderd');
+            this._prjPlanItems = (this._prjPlanItems || []).filter(x => x.id !== i.id);
+            this.renderProjectPlanning();
+            this.loadProjectPlanning();
+        } catch (e) {
+            this.toast('Verwijderen mislukt: ' + ((e && e.message) || '?'), true);
+        } finally {
+            this._prjVerwijderBezig = false;
+        }
+    },
+
+    // -------------------------------------------------- toestel & toestemmingen
+    openToestel() {
+        this.navigate('screenToestel', true);
+    },
+
+    loadToestel() {
+        const el = document.getElementById('toestelInhoud');
+        if (!el) return;
+        if (!this._toestelZichtLuister) {
+            this._toestelZichtLuister = true;
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden && this.currentScreen === 'screenToestel') setTimeout(() => this.loadToestel(), 400);
+            });
+        }
+        const N = window.QENative;
+        if (!N || !N.beschikbaar()) {
+            let apk = '';
+            try { apk = (window.QEBridge && QEBridge.getApkVersionName) ? QEBridge.getApkVersionName() : ''; } catch (_e) {}
+            el.innerHTML = '<div class="card" style="padding:16px;font-size:13.5px;color:var(--g2);line-height:1.55">'
+                + (window.QEBridge
+                    ? 'Deze app (APK ' + this.escapeHtml(apk || 'ouder') + ') kent de nieuwe toestelfuncties nog niet. '
+                        + 'Installeer <b>APK 1.245</b> — daarna staan hier alle toestemmingen en kan je ze in één keer geven.'
+                    : 'Toestelfuncties zijn alleen beschikbaar in de Android-app.')
+                + '</div>';
+            return;
+        }
+        const info = N.info() || {};
+        const perms = info.permissies || {};
+        const hw = info.hardware || {};
+        const RIJEN = [
+            ['locatie', 'Locatie', 'Klokken met GPS'],
+            ['camera', 'Camera', "Foto's en etiketten scannen"],
+            ['meldingen', 'Meldingen', 'Goedkeuringen en herinneringen'],
+            ['microfoon', 'Microfoon', 'Spraak- en video-opnames'],
+            ['agenda', 'Agenda', 'Planning in je telefoonagenda'],
+            ['bluetooth', 'Apparaten in de buurt', 'Bluetooth-printers en meettoestellen'],
+            ['batterij', 'Altijd actief', 'Meldingen ook als de app op de achtergrond staat'],
+            ['installeren', 'Updates installeren', 'Een nieuwe APK rechtstreeks vanuit de app'],
+        ];
+        const pill = (st) => st === 'toegestaan' ? '<span class="prj-status prj-st-actief">Toegestaan</span>'
+            : st === 'niet-nodig' ? '<span class="prj-status prj-st-dicht">Niet nodig</span>'
+            : '<span class="prj-status prj-st-voorb">Niet toegestaan</span>';
+        const nietOk = RIJEN.filter(r => ['locatie', 'camera', 'meldingen', 'microfoon', 'agenda', 'bluetooth'].indexOf(r[0]) >= 0
+            && perms[r[0]] !== 'toegestaan' && perms[r[0]] !== 'niet-nodig');
+        el.innerHTML = (nietOk.length
+                ? '<button class="btn btn-primary btn-full" style="margin-bottom:14px" onclick="app.toestelAllesToestaan()">Alles in één keer toestaan</button>' : '')
+            + '<div class="card prj-plan-kaart">' + RIJEN.map(r => {
+                const st = perms[r[0]] || 'onbekend';
+                return '<div class="prj-plan-rij" style="cursor:default">'
+                    + '<div class="prj-plan-info"><div class="prj-plan-t">' + r[1] + '</div><div class="prj-plan-s">' + r[2] + '</div></div>'
+                    + pill(st)
+                    + (st !== 'toegestaan' && st !== 'niet-nodig'
+                        ? '<button class="mb-minibtn" style="margin-left:8px" onclick="app.toestelVraag(\'' + r[0] + '\')">Toestaan</button>' : '')
+                    + '</div>';
+            }).join('') + '</div>'
+            + '<div class="section-header"><h2>Toestel</h2></div>'
+            + '<div class="card" style="padding:14px 16px;font-size:13px;color:var(--g2);line-height:1.7">'
+            + 'App: ' + this.escapeHtml(info.versionName || '?') + ' · toestelfuncties v' + this.escapeHtml(String(info.apiVersie || '?')) + '<br>'
+            + 'Toestel: ' + this.escapeHtml([info.merk, info.model].filter(Boolean).join(' ')) + ' · Android ' + this.escapeHtml(String(info.android || '?')) + '<br>'
+            + 'Locatie (GPS): ' + (hw.locatieAan ? 'aan' : '<b style="color:var(--amber2)">uit</b>')
+            + ' · NFC: ' + (hw.nfc ? (hw.nfcAan ? 'aan' : '<b style="color:var(--amber2)">uit</b>') : 'geen')
+            + ' · Bluetooth: ' + (hw.bluetooth ? 'ja' : 'nee') + '</div>'
+            + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">'
+            + (!hw.locatieAan ? '<button class="mb-minibtn" onclick="QENative.openInstelling(\'locatie\')">Locatie aanzetten</button>' : '')
+            + (hw.nfc && !hw.nfcAan ? '<button class="mb-minibtn" onclick="QENative.openInstelling(\'nfc\')">NFC aanzetten</button>' : '')
+            + '<button class="mb-minibtn" onclick="QENative.openInstelling(\'app\')">App-instellingen</button></div>';
+    },
+
+    async toestelVraag(naam) {
+        const N = window.QENative;
+        if (!N) return;
+        const r = await N.vraagPermissie([naam]);
+        const st = r && r.resultaat && r.resultaat[naam];
+        if (st === 'geblokkeerd' && confirm('Android vraagt dit niet meer opnieuw. De app-instellingen openen om het daar aan te zetten?')) {
+            N.openInstelling(naam === 'meldingen' ? 'meldingen' : 'app');
+        }
+        this.loadToestel();
+    },
+
+    async toestelAllesToestaan() {
+        const N = window.QENative;
+        if (!N) return;
+        await N.vraagPermissie(['locatie', 'camera', 'meldingen', 'microfoon', 'agenda', 'bluetooth']);
+        this.loadToestel();
+    },
+
+    // ------------------------------------------------------ dagplanning maken
+    // Eén dagplanning per gekozen DAG met alle gekozen personen samen (zoals
+    // bureel ze in Robaws maakt: bv. Hervé + Vince op één item). Standaard
+    // 06:45-15:30, kleur = planningstype van de (eerste) persoon, titel =
+    // projectnummer + naam, adres = werfadres. Bezetting en verlof van de
+    // gekozen personen staan erbij; dubbels op hetzelfde project worden
+    // overgeslagen; elke planning wordt teruggelezen als bewijs.
+    _dpVolgendeWerkdag() {
+        for (let n = 1; n < 8; n++) {
+            const d = new Date(Date.now() + n * 86400e3);
+            if (d.getDay() !== 0 && d.getDay() !== 6) return RobawsAPI._localDateStr(d);
+        }
+        return RobawsAPI._localDateStr(new Date(), 1);
+    },
+
+    _dpHtmlNaarTekst(html) {
+        if (!html) return '';
+        const t = String(html).replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n').replace(/<[^>]+>/g, '');
+        const ta = document.createElement('textarea');
+        ta.innerHTML = t;
+        return ta.value.replace(/\u00a0/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    },
+
+    _dpTekstNaarHtml(tekst) {
+        const regels = String(tekst || '').split(/\r?\n/).map(r => r.trim());
+        if (!regels.some(Boolean)) return '';
+        return regels.map(r => '<p>' + (r ? this.escapeHtml(r) : '&nbsp;') + '</p>').join('');
+    },
+
+    async openDagplanningNieuw(opts) {
+        const p = this._prjHuidig;
+        if (!p) return;
+        const kopie = opts && opts.kopie;
+        this._dp = {
+            project: p,
+            datums: new Set(),
+            emp: new Set(kopie ? kopie.employeeIds : []),
+            start: kopie && kopie.start ? this._prjTijd(kopie.start) : '06:45',
+            eind: kopie && kopie.eind ? this._prjTijd(kopie.eind) : '15:30',
+            typeId: kopie ? kopie.typeId : null,
+            typeHandmatig: !!(kopie && kopie.typeId),
+            summary: kopie && kopie.summary ? kopie.summary : ((p.logicId ? p.logicId + ' ' : '') + p.naam),
+            beschrijving: kopie ? this._dpHtmlNaarTekst(kopie.description) : '',
+            regie: kopie ? !!kopie.regie : false,
+            extraDatum: false,
+            bezig: false,
+            kopie: !!kopie,
+        };
+        if (!kopie) this._dp.datums.add(this._dpVolgendeWerkdag());
+        this.navigate('screenDagplanningNieuw', true);
+        this.renderDagplanning();
+        try {
+            const [types, emps] = await Promise.all([
+                RobawsAPI.getPlanningTypes().catch(() => []),
+                RobawsAPI.getActiveEmployees().catch(() => []),
+            ]);
+            if (!this._dp || this._dp.project !== p) return;
+            this._dpTypes = types;
+            this._dpEmps = (emps || []).filter(e => e && e.employeeId != null);
+            const actief = new Set(this._dpEmps.map(e => String(e.employeeId)));
+            const weg = Array.from(this._dp.emp).filter(id => !actief.has(String(id)));
+            weg.forEach(id => this._dp.emp.delete(id));
+            if (weg.length) this.toast(weg.length + ' persoon/personen uit de kopie zijn niet meer actief en werden weggelaten');
+            if (!this._dp.typeHandmatig) this._dp.typeId = this._dpAutoType();
+            this.renderDagplanning();
+        } catch (_e) { /* scherm toont zelf wat ontbreekt */ }
+        const b = this._prjVensterBereik();
+        RobawsAPI.getPlanningVenster(b.van, b.tot)
+            .then(items => { this._dpVenster = items; if (this.currentScreen === 'screenDagplanningNieuw') this.renderDagplanning(); })
+            .catch(() => { this._dpVenster = null; });
+    },
+
+    _dpVoornaam(e) { return String((e && e.name) || '').trim().split(/\s+/)[0] || ''; },
+
+    _dpEmpLabel(e) {
+        if (/^agenda\b/i.test(String((e && e.name) || ''))) return String(e.name).trim();  // "Agenda Monteurs" voluit
+        const vn = this._dpVoornaam(e);
+        const zelfde = (this._dpEmps || []).filter(x => this._prjNorm(this._dpVoornaam(x)) === this._prjNorm(vn));
+        if (zelfde.length > 1) {
+            const delen = String(e.name || '').trim().split(/\s+/);
+            if (delen.length > 1) return vn + ' ' + delen[delen.length - 1].charAt(0) + '.';
+        }
+        return vn || String(e.name || '#' + e.employeeId);
+    },
+
+    /** Kleur kiezen zoals bureel: type met exact deze namen ("Sascha & Jens"), anders het type van de eerste persoon. */
+    _dpAutoType() {
+        const d = this._dp;
+        const types = this._dpTypes || [];
+        const emps = Array.from(d.emp).map(id => (this._dpEmps || []).find(e => String(e.employeeId) === String(id))).filter(Boolean);
+        if (!emps.length || !types.length) return null;
+        const set = emps.map(e => this._prjNorm(this._dpVoornaam(e))).sort().join('|');
+        if (emps.length > 1) {
+            for (const t of types) {
+                const delen = this._prjNorm(t.naam).split(/\s*(?:&|\+|,|\ben\b)\s*/).map(x => x.trim()).filter(Boolean);
+                if (delen.length === emps.length && delen.sort().join('|') === set) return t.id;
+            }
+        }
+        for (const e of emps) {
+            const t = types.find(x => this._prjNorm(x.naam) === this._prjNorm(this._dpVoornaam(e)));
+            if (t) return t.id;
+        }
+        return null;
+    },
+
+    /** Bezetting van één persoon op de gekozen dagen/uren (uit het gedeelde venster). */
+    _dpBezetting(empId) {
+        const d = this._dp;
+        if (!d || !this._dpVenster || !d.datums.size) return null;
+        let bezet = 0, verlof = 0;
+        const wat = [];
+        for (const datum of d.datums) {
+            const s = new Date(datum + 'T' + d.start + ':00'), e = new Date(datum + 'T' + d.eind + ':00');
+            if (isNaN(s.getTime()) || isNaN(e.getTime())) continue;
+            const hits = this._dpVenster.filter(i => i.start && i.eind && i.employeeIds.indexOf(String(empId)) >= 0 && i.start < e && i.eind > s);
+            if (!hits.length) continue;
+            if (hits.some(h => h.verlof)) { verlof++; wat.push(this._prjDag(datum) + ': verlof'); }
+            else {
+                bezet++;
+                const h = hits[0];
+                const eigen = h.projectId && h.projectId === String(d.project.id);
+                wat.push(this._prjDag(datum) + ': ' + (eigen ? 'al op dit project' : (h.summary || 'ingepland')) + ' (' + this._prjTijd(h.start) + '–' + this._prjTijd(h.eind) + ')');
+            }
+        }
+        return { bezet, verlof, n: d.datums.size, wat };
+    },
+
+    renderDagplanning() {
+        const el = document.getElementById('dpInhoud');
+        const d = this._dp;
+        if (!el || !d) return;
+        const p = d.project;
+        const vandaag = RobawsAPI._localDateStr(new Date());
+
+        // --- wie
+        let wie;
+        if (!this._dpEmps) {
+            wie = '<div class="spinner"></div>';
+        } else {
+            const groepen = [['monteur', 'Monteurs'], ['technieker', 'Techniekers'], ['bureel', 'Bureel'], ['agenda', "Agenda's"]];
+            const groepVan = (e) => /^agenda\b/i.test(String(e.name || '')) ? 'agenda' : (e.role || 'technieker');
+            wie = groepen.map(([sleutel, titel]) => {
+                const leden = this._dpEmps.filter(e => groepVan(e) === sleutel)
+                    .sort((a, b) => this._dpEmpLabel(a).localeCompare(this._dpEmpLabel(b)));
+                if (!leden.length) return '';
+                return '<div class="dp-groep">' + titel + '</div><div class="dp-chips">' + leden.map(e => {
+                    const id = String(e.employeeId);
+                    const aan = d.emp.has(id);
+                    const bz = this._dpBezetting(id);
+                    let st = '', cls = '';
+                    if (bz && bz.verlof) { st = bz.n > 1 ? 'verlof ' + bz.verlof + '/' + bz.n : 'verlof'; cls = ' dp-verlof'; }
+                    else if (bz && bz.bezet) { st = bz.n > 1 ? 'bezet ' + bz.bezet + '/' + bz.n : 'bezet'; cls = ' dp-bezet'; }
+                    return '<button type="button" class="dp-chip' + (aan ? ' aan' : '') + cls + '"'
+                        + (bz && bz.wat.length ? ' title="' + this.escapeHtml(bz.wat.join('\n')) + '"' : '')
+                        + ' onclick="app.dpWissel(\'' + this.escapeHtml(id) + '\')">'
+                        + this.escapeHtml(this._dpEmpLabel(e)) + (st ? '<span class="dp-chip-st">' + st + '</span>' : '') + '</button>';
+                }).join('') + '</div>';
+            }).join('');
+        }
+        const gekozen = Array.from(d.emp).map(id => (this._dpEmps || []).find(e => String(e.employeeId) === id)).filter(Boolean);
+        const meldingen = [];
+        gekozen.forEach(e => {
+            const bz = this._dpBezetting(String(e.employeeId));
+            if (bz && bz.wat.length) meldingen.push(this._dpEmpLabel(e) + ' — ' + bz.wat.join('; '));
+        });
+
+        // --- wanneer: 4 weken vanaf de maandag van deze week
+        const nu = new Date();
+        const ma = new Date(nu.getFullYear(), nu.getMonth(), nu.getDate() - ((nu.getDay() + 6) % 7), 12);
+        let cellen = '';
+        for (let i = 0; i < 28; i++) {
+            const dt = new Date(ma.getFullYear(), ma.getMonth(), ma.getDate() + i, 12);
+            const ds = RobawsAPI._localDateStr(dt);
+            const voorbij = ds < vandaag;
+            const aan = d.datums.has(ds);
+            const weekend = dt.getDay() === 0 || dt.getDay() === 6;
+            let stip = false;
+            if (this._dpVenster && d.emp.size && !voorbij) {
+                stip = this._dpVenster.some(it => it.datum === ds && it.employeeIds.some(x => d.emp.has(x)));
+            }
+            cellen += '<button type="button" class="dp-dag' + (aan ? ' aan' : '') + (voorbij ? ' voorbij' : '') + (weekend ? ' weekend' : '')
+                + (ds === vandaag ? ' vandaag' : '') + '"' + (voorbij ? ' disabled' : '')
+                + ' onclick="app.dpDag(\'' + ds + '\')">' + (dt.getDate() === 1 || i === 0 ? '<span class="dp-dag-m">' + ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'][dt.getMonth()] + '</span>' : '')
+                + dt.getDate() + (stip ? '<span class="dp-dag-stip"></span>' : '') + '</button>';
+        }
+        const eindRaster = RobawsAPI._localDateStr(new Date(ma.getFullYear(), ma.getMonth(), ma.getDate() + 27, 12));
+        const buiten = Array.from(d.datums).filter(x => x > eindRaster).sort();
+        const datumsLijst = Array.from(d.datums).sort();
+
+        // --- kleur
+        const types = this._dpTypes || [];
+        const type = types.find(t => t.id === d.typeId);
+        const typeOpties = '<option value="">Geen kleur</option>' + types.map(t =>
+            '<option value="' + this.escapeHtml(t.id) + '"' + (t.id === d.typeId ? ' selected' : '') + '>' + this.escapeHtml(t.naam) + '</option>').join('');
+
+        const fout = this._dpValideer();
+        const n = datumsLijst.length;
+        const knopTekst = d.bezig ? 'Bezig met inplannen…'
+            : (n ? (n === 1 ? '1 dagplanning inplannen' : n + ' dagplanningen inplannen') : 'Kies minstens één dag');
+
+        el.innerHTML = '<div class="mb-head"><div class="mb-head-sub">' + this.escapeHtml((d.kopie ? 'Kopie · ' : '') + [p.logicId, p.klant].filter(Boolean).join(' · ')) + '</div>'
+            + '<div class="mb-head-title prj-titel">' + this.escapeHtml(p.naam) + '</div></div>'
+            + (p.adresTekst ? '<div class="dp-adres">' + this.escapeHtml(p.adresTekst) + '</div>' : '<div class="dp-adres dp-waarsch">Dit project heeft geen werfadres — de planning krijgt geen locatie.</div>')
+
+            + '<div class="section-header"><h2>Wie</h2>' + (d.emp.size ? '<span class="badge">' + d.emp.size + '</span>' : '') + '</div>'
+            + '<div class="card dp-kaart">' + wie
+            + (meldingen.length ? '<div class="dp-melding">' + meldingen.map(m => this.escapeHtml(m)).join('<br>') + '</div>' : '')
+            + (this._dpVenster === null && this._dpEmps ? '<div class="dp-hint">Bezetting kon niet geladen worden — plannen kan wel.</div>' : '')
+            + '</div>'
+
+            + '<div class="section-header"><h2>Wanneer</h2>' + (n ? '<span class="badge">' + n + '</span>' : '') + '</div>'
+            + '<div class="card dp-kaart">'
+            + '<div class="dp-snel">'
+            + '<button type="button" class="mb-minibtn" onclick="app.dpSnel(\'morgen\')">Volgende werkdag</button>'
+            + '<button type="button" class="mb-minibtn" onclick="app.dpSnel(\'week\')">Rest van de week</button>'
+            + '<button type="button" class="mb-minibtn" onclick="app.dpSnel(\'volgende\')">Volgende week</button>'
+            + (n ? '<button type="button" class="mb-minibtn" onclick="app.dpSnel(\'wis\')">Wissen</button>' : '')
+            + '</div>'
+            + '<div class="dp-raster-kop"><span>ma</span><span>di</span><span>wo</span><span>do</span><span>vr</span><span>za</span><span>zo</span></div>'
+            + '<div class="dp-raster">' + cellen + '</div>'
+            + '<div class="dp-extra"><label for="dpExtraDatum">Andere datum:</label> <input type="date" id="dpExtraDatum" class="form-input" min="' + vandaag + '" onchange="app.dpExtraDatum(this.value)"></div>'
+            + (buiten.length ? '<div class="dp-buiten">' + buiten.map(x => '<button type="button" class="dp-chip aan" onclick="app.dpDag(\'' + x + '\')">'
+                + this.escapeHtml(this._prjDag(x)) + ' ×</button>').join('') + '</div>' : '')
+            + (n ? '<div class="dp-hint">' + this.escapeHtml(datumsLijst.map(x => this._prjDag(x)).join(', ')) + '</div>' : '')
+            + '</div>'
+
+            + '<div class="section-header"><h2>Uren</h2></div>'
+            + '<div class="card dp-kaart">'
+            + '<div class="dp-snel">'
+            + '<button type="button" class="mb-minibtn' + (d.start === '06:45' && d.eind === '15:30' ? ' dp-sel' : '') + '" onclick="app.dpUren(\'06:45\',\'15:30\')">Volle dag</button>'
+            + '<button type="button" class="mb-minibtn' + (d.start === '06:45' && d.eind === '12:00' ? ' dp-sel' : '') + '" onclick="app.dpUren(\'06:45\',\'12:00\')">Voormiddag</button>'
+            + '<button type="button" class="mb-minibtn' + (d.start === '12:00' && d.eind === '15:30' ? ' dp-sel' : '') + '" onclick="app.dpUren(\'12:00\',\'15:30\')">Namiddag</button>'
+            + '</div>'
+            + '<div class="dp-tijden"><div class="form-group" style="margin:0"><label>Van</label><input type="time" class="form-input" value="' + d.start + '" onchange="app.dpUren(this.value,null)"></div>'
+            + '<div class="form-group" style="margin:0"><label>Tot</label><input type="time" class="form-input" value="' + d.eind + '" onchange="app.dpUren(null,this.value)"></div></div>'
+            + '</div>'
+
+            + '<div class="section-header"><h2>Details</h2></div>'
+            + '<div class="card dp-kaart">'
+            + '<div class="form-group"><label>Titel in de planning</label><input type="text" class="form-input" maxlength="250" value="' + this.escapeHtml(d.summary) + '" oninput="app.dpVeld(\'summary\',this.value)" placeholder="Wat moet er gebeuren?"></div>'
+            + '<div class="form-group"><label>Kleur</label><div class="dp-kleurrij"><span class="dp-kleur" style="background:' + this.escapeHtml((type && type.kleur) || 'transparent') + '"></span>'
+            + '<select class="form-input" onchange="app.dpType(this.value)">' + typeOpties + '</select></div>'
+            + '<div class="dp-hint">' + (d.typeHandmatig ? 'Zelf gekozen.' : 'Automatisch volgens de gekozen personen.') + '</div></div>'
+            + '<div class="form-group"><label>Instructies (optioneel)</label><textarea class="form-input" rows="3" oninput="app.dpVeld(\'beschrijving\',this.value)" placeholder="Bv. wat mee te nemen, contactpersoon op de werf…">'
+            + this.escapeHtml(d.beschrijving) + '</textarea></div>'
+            + '<label class="dp-regie"><input type="checkbox"' + (d.regie ? ' checked' : '') + ' onchange="app.dpVeld(\'regie\',this.checked)"> Uren in regie</label>'
+            + '</div>'
+
+            + (fout && !d.bezig ? '<div class="dp-fout">' + this.escapeHtml(fout) + '</div>' : '')
+            + '<button type="button" class="btn btn-primary btn-full dp-bewaar"' + (fout || d.bezig ? ' disabled' : '') + ' onclick="app.dpBewaar()">' + knopTekst + '</button>';
+    },
+
+    _dpValideer() {
+        const d = this._dp;
+        if (!d) return 'Geen project gekozen';
+        if (!d.emp.size) return 'Kies wie er gaat.';
+        if (!d.datums.size) return 'Kies minstens één dag.';
+        if (!/^\d\d:\d\d$/.test(d.start) || !/^\d\d:\d\d$/.test(d.eind) || d.eind <= d.start) return 'Het einduur moet na het beginuur liggen.';
+        if (!String(d.summary || '').trim()) return 'Geef de planning een titel.';
+        return '';
+    },
+
+    dpWissel(id) {
+        const d = this._dp;
+        if (!d || d.bezig) return;
+        const k = String(id);
+        if (d.emp.has(k)) d.emp.delete(k); else d.emp.add(k);
+        if (!d.typeHandmatig) d.typeId = this._dpAutoType();
+        this.renderDagplanning();
+    },
+
+    dpDag(ds) {
+        const d = this._dp;
+        if (!d || d.bezig || !/^\d{4}-\d\d-\d\d$/.test(ds)) return;
+        if (ds < RobawsAPI._localDateStr(new Date())) return;
+        if (d.datums.has(ds)) d.datums.delete(ds); else d.datums.add(ds);
+        this.renderDagplanning();
+    },
+
+    dpExtraDatum(ds) {
+        if (!ds) return;
+        const d = this._dp;
+        if (d && !d.datums.has(ds)) this.dpDag(ds);
+    },
+
+    dpSnel(soort) {
+        const d = this._dp;
+        if (!d || d.bezig) return;
+        const nu = new Date();
+        const dag = (offset) => { const x = new Date(nu.getFullYear(), nu.getMonth(), nu.getDate() + offset, 12); return x; };
+        if (soort === 'wis') d.datums.clear();
+        else if (soort === 'morgen') d.datums.add(this._dpVolgendeWerkdag());
+        else if (soort === 'week') {
+            for (let i = 0; i < 7; i++) {
+                const x = dag(i);
+                if (i > 0 && x.getDay() === 1) break;
+                if (x.getDay() >= 1 && x.getDay() <= 5) d.datums.add(RobawsAPI._localDateStr(x));
+            }
+        } else if (soort === 'volgende') {
+            const totMa = ((8 - nu.getDay()) % 7) || 7;
+            for (let i = 0; i < 5; i++) d.datums.add(RobawsAPI._localDateStr(dag(totMa + i)));
+        }
+        this.renderDagplanning();
+    },
+
+    dpUren(start, eind) {
+        const d = this._dp;
+        if (!d || d.bezig) return;
+        if (start) d.start = start;
+        if (eind) d.eind = eind;
+        this.renderDagplanning();
+    },
+
+    dpType(id) {
+        const d = this._dp;
+        if (!d) return;
+        d.typeId = id || null;
+        d.typeHandmatig = true;
+        this.renderDagplanning();
+    },
+
+    /** Tekstvelden bewaren zonder te hertekenen (typen mag niet springen). */
+    dpVeld(veld, waarde) {
+        const d = this._dp;
+        if (!d) return;
+        if (veld === 'summary') d.summary = String(waarde || '');
+        else if (veld === 'beschrijving') d.beschrijving = String(waarde || '');
+        else if (veld === 'regie') d.regie = !!waarde;
+        const knop = document.querySelector('#dpInhoud .dp-bewaar');
+        const fout = this._dpValideer();
+        if (knop && !d.bezig) knop.disabled = !!fout;
+        const foutEl = document.querySelector('#dpInhoud .dp-fout');
+        if (foutEl) foutEl.textContent = fout;
+        else if (fout && knop) {
+            const div = document.createElement('div');
+            div.className = 'dp-fout';
+            div.textContent = fout;
+            knop.parentNode.insertBefore(div, knop);
+        }
+        if (!fout) { const f2 = document.querySelector('#dpInhoud .dp-fout'); if (f2) f2.remove(); }
+    },
+
+    async dpBewaar() {
+        const d = this._dp;
+        if (!d || d.bezig) return;
+        const fout = this._dpValideer();
+        if (fout) { this.toast(fout, true); return; }
+        const datums = Array.from(d.datums).sort();
+        const empIds = Array.from(d.emp);
+        const empKey = empIds.slice().sort().join(',');
+        const namen = empIds.map(id => {
+            const e = (this._dpEmps || []).find(x => String(x.employeeId) === id);
+            return e ? this._dpEmpLabel(e) : '#' + id;
+        });
+        const conflicten = [];
+        empIds.forEach((id, k) => {
+            const bz = this._dpBezetting(id);
+            if (bz && bz.wat.length) conflicten.push(namen[k] + ': ' + bz.wat.join('; '));
+        });
+        d.bezig = true;
+        this.renderDagplanning();
+        let bestaand = [];
+        try { bestaand = await RobawsAPI.getProjectPlanning(d.project.id); } catch (_e) {}
+        const isDubbel = (lijst, dt) => lijst.some(i => i.datum === dt && this._prjTijd(i.start) === d.start
+            && i.employeeIds.slice().sort().join(',') === empKey);
+        const dubbel = datums.filter(dt => isDubbel(bestaand, dt));
+        let vraag = (datums.length === 1 ? '1 dagplanning' : datums.length + ' dagplanningen') + ' maken?\n\n'
+            + d.project.naam + '\n' + namen.join(', ') + ' · ' + d.start + '–' + d.eind + '\n'
+            + datums.map(x => this._prjDag(x)).join(', ');
+        if (conflicten.length) vraag += '\n\nLet op:\n• ' + conflicten.join('\n• ');
+        if (dubbel.length) vraag += '\n\nStaat er al en wordt overgeslagen: ' + dubbel.map(x => this._prjDag(x)).join(', ');
+        const teDoen = datums.filter(dt => dubbel.indexOf(dt) < 0);
+        if (!teDoen.length) {
+            d.bezig = false;
+            this.renderDagplanning();
+            this.toast('Die planning(en) stonden er al — niets aangemaakt');
+            return;
+        }
+        if (!confirm(vraag)) { d.bezig = false; this.renderDagplanning(); return; }
+        const gelukt = [], mislukt = [], opmerkingen = [];
+        for (const dt of teDoen) {
+            try {
+                const r = await RobawsAPI.createProjectDagplanning({
+                    project: d.project, datum: dt, startTijd: d.start, eindTijd: d.eind,
+                    employeeIds: empIds, typeId: d.typeId, summary: String(d.summary).trim(),
+                    beschrijving: this._dpTekstNaarHtml(d.beschrijving), regie: d.regie,
+                });
+                gelukt.push(dt);
+                if (!r.bewijs) opmerkingen.push(this._prjDag(dt) + ' niet teruggelezen');
+                if (d.regie && !r.regieOk) opmerkingen.push(this._prjDag(dt) + ': regie-vinkje niet gezet');
+            } catch (e) {
+                // Mislukt of time-out ná verwerking? Eerst vers kijken of hij er toch staat.
+                let toch = false;
+                try { toch = isDubbel(await RobawsAPI.getProjectPlanning(d.project.id), dt); } catch (_e) {}
+                if (toch) gelukt.push(dt);
+                else mislukt.push({ dt, fout: (e && e.message) || '?' });
+            }
+            await new Promise(r => setTimeout(r, 250));
+        }
+        d.bezig = false;
+        if (mislukt.length) {
+            d.datums = new Set(mislukt.map(m => m.dt));  // alleen de mislukte dagen blijven aangevinkt
+            this.renderDagplanning();
+            this.toast((gelukt.length ? gelukt.length + ' ingepland; ' : '') + mislukt.length + ' mislukt ('
+                + mislukt.map(m => this._prjDag(m.dt)).join(', ') + '): ' + mislukt[0].fout + '\nTik opnieuw op inplannen voor de mislukte dagen.', true);
+            this._prjPlanItems = null;
+            return;
+        }
+        try { if (window.QEMarble && QEMarble.haptic) QEMarble.haptic('success'); } catch (_e) {}
+        this.toast((gelukt.length === 1 ? '1 dagplanning ingepland' : gelukt.length + ' dagplanningen ingepland')
+            + (opmerkingen.length ? ' — ' + opmerkingen.join(', ') : ''), opmerkingen.length > 0);
+        this._prjPlanItems = null;
+        this._dp = null;
+        this.goBack();
     },
 };
 
