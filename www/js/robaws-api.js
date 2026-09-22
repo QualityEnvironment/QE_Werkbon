@@ -316,6 +316,100 @@ const RobawsAPI = {
             return bekend.indexOf(String(key)) < 0;
         } catch (_e) { return true; }
     },
+
+    /** v395: LOGISTIEK PER PERSOON (vraag Levi 15 sep: monteurs zien de
+     *  gasflessen en het voertuig waarvoor ze verantwoordelijk zijn; in de
+     *  instellingen per persoon aan te duiden). `rollen` = voor wie het
+     *  onderdeel aan te vinken valt. Beheren (verplaatsen, keuringen, boeken)
+     *  blijft ALTIJD bureel — voor anderen is alles alleen-lezen. De Worker
+     *  (v436) bewaart enkel de keuze per e-mail (KV app:logistiek). */
+    LOG_DELEN: [
+        { key: 'voertuigen',   naam: 'Voertuigen',       rollen: ['bureel'] },
+        { key: 'gereedschap',  naam: 'Gereedschap',      rollen: ['bureel'] },
+        { key: 'budget',       naam: 'Werknemersbudget', rollen: ['bureel'] },
+        { key: 'gasflessen',   naam: 'Gasflessen',       rollen: ['bureel', 'monteur', 'technieker'] },
+        { key: 'mijnvoertuig', naam: 'Eigen voertuig',   rollen: ['monteur', 'technieker'] },
+    ],
+    /** Zonder bewaarde keuze: de standaard van de rol. */
+    LOG_STANDAARD: {
+        bureel: ['voertuigen', 'gereedschap', 'budget', 'gasflessen'],
+        monteur: ['gasflessen', 'mijnvoertuig'],
+        technieker: [],
+    },
+    _logRol(rol) { return (rol === 'bureel' || rol === 'monteur') ? rol : 'technieker'; },
+    /** Onderdelen die voor deze rol aan te vinken zijn (vaste volgorde). */
+    logistiekDelenMogelijk(rol) {
+        const r = this._logRol(rol);
+        return this.LOG_DELEN.filter(d => d.rollen.indexOf(r) >= 0).map(d => d.key);
+    },
+    /** Effectieve onderdelen voor een rol + bewaarde keuze ({delen, bekend} of null).
+     *  Een onderdeel dat nog niet bestond toen de keuze bewaard werd, volgt de
+     *  standaard van de rol (zelfde belofte als bij de andere toegangsrechten). */
+    logistiekDelenVoor(rol, keuze) {
+        const r = this._logRol(rol);
+        const mag = this.logistiekDelenMogelijk(r);
+        const std = (this.LOG_STANDAARD[r] || []).filter(k => mag.indexOf(k) >= 0);
+        if (!keuze || !Array.isArray(keuze.delen)) return std;
+        const bekend = Array.isArray(keuze.bekend) ? keuze.bekend : this.LOG_DELEN.map(d => d.key);
+        const gekozen = keuze.delen.map(String).filter(k => mag.indexOf(k) >= 0);
+        for (const k of std) if (bekend.indexOf(k) < 0 && gekozen.indexOf(k) < 0) gekozen.push(k);
+        return mag.filter(k => gekozen.indexOf(k) >= 0);
+    },
+    /** Wat mag de ingelogde persoon in Logistiek zien? [] = geen Logistiek-tab. */
+    mijnLogistiekDelen() {
+        try {
+            const u = this.getLoggedInUser();
+            if (!u) return [];
+            // bureel: de bestaande schakelaar "Logistiek" blijft de hoofdschakelaar
+            if (u.role === 'bureel' && !this.magAppTool('logistiek')) return [];
+            let keuze = null;
+            try { keuze = JSON.parse(localStorage.getItem('qe_app_logistiek') || 'null'); } catch (_e) {}
+            // een keuze van iemand anders op hetzelfde toestel telt niet
+            if (keuze && keuze.email && String(keuze.email) !== String(u.email || '').toLowerCase().trim()) keuze = null;
+            return this.logistiekDelenVoor(u.role, keuze);
+        } catch (_e) { return []; }
+    },
+    magLogistiekDeel(key) { return this.mijnLogistiekDelen().indexOf(String(key)) >= 0; },
+    _zetMijnLogistiek(keuze, email) {
+        try {
+            if (keuze && Array.isArray(keuze.delen)) {
+                const u = this.getLoggedInUser();
+                localStorage.setItem('qe_app_logistiek', JSON.stringify({
+                    email: String(email || (u && u.email) || '').toLowerCase().trim() || null,
+                    delen: keuze.delen.map(String),
+                    bekend: Array.isArray(keuze.bekend) ? keuze.bekend.map(String) : null,
+                }));
+            } else {
+                localStorage.removeItem('qe_app_logistiek');
+            }
+        } catch (_e) {}
+    },
+    /** v395: eigen toegangsrechten opnieuw ophalen (bij het opstarten van de
+     *  app) — een wijziging in de instellingen werkt zo zonder opnieuw in te
+     *  loggen. Oude Worker of geen verbinding = de bewaarde stand blijft.
+     *  Geeft true als er iets veranderde. */
+    async verversAppRechten() {
+        const u = this.getLoggedInUser();
+        let alg = null;
+        try { alg = JSON.parse(localStorage.getItem('qe_api_alg') || 'null'); } catch (_e) {}
+        if (!u || !u.email || !alg || !alg.key || !alg.secret) return false;
+        const voor = JSON.stringify([localStorage.getItem('qe_app_tools'), localStorage.getItem('qe_app_logistiek')]);
+        const res = await this._fetchWithTimeout(this.WORKER_AUTH_URL + '/bel-api/app-rechten',
+            { headers: { 'X-App-Key': alg.key + ':' + alg.secret } }, 8000);
+        if (!res.ok) return false;
+        const j = await res.json();
+        const em = String(u.email).toLowerCase().trim();
+        const r = (j && j.rechten) || {};
+        if (Array.isArray(r[em])) localStorage.setItem('qe_app_tools', JSON.stringify(r[em]));
+        else localStorage.removeItem('qe_app_tools');
+        if (j && Array.isArray(j.tools)) localStorage.setItem('qe_app_tools_bekend', JSON.stringify(j.tools.map(t => t.key)));
+        // alleen een Worker die de logistiek-keuze kent (v436) mag die bijwerken
+        if (j && j.logistiek && j.logistiek.personen) {
+            const l = j.logistiek.personen[em];
+            this._zetMijnLogistiek(Array.isArray(l) ? { delen: l, bekend: j.logistiek.bekend } : null, em);
+        }
+        return JSON.stringify([localStorage.getItem('qe_app_tools'), localStorage.getItem('qe_app_logistiek')]) !== voor;
+    },
     TASK_KEYS: { FACTUREN: 'facturen', OPVOLGING: 'opvolging', ARTIKELS: 'artikels', URENAANPASSING: 'urenAanpassing', OFFERTES: 'offertes', KEURINGEN: 'keuringen', URENBEWAKING: 'urenBewaking' },
     _taakGebruikers: {},
     _taakOntvangersToepassen(map) {
@@ -578,12 +672,16 @@ const RobawsAPI = {
         return result;
     },
 
-    async post(endpoint, body) {
+    async post(endpoint, body, opts) {
         this._invalidateCache(endpoint);   // v184: cache van het betrokken record wissen
         const url = this.BASE_URL + '/' + endpoint.replace(/^\//, '');
+        // v401: opts.idempotencyKey / opts.headers → extra headers. Factuurlijnen
+        // dragen een Idempotency-Key, zodat een herkansing (ook na een time-out)
+        // nooit een dubbele lijn geeft. Dezelfde headers op de 429-herkansing.
+        const headers = this._postHeaders(opts);
         let res = await this._fetchWithTimeout(url, {   // v207: timeout
             method: 'POST',
-            headers: this.getHeaders(),
+            headers,
             body: JSON.stringify(body),
         });
         this._captureRateHeaders(res, 'live');
@@ -596,20 +694,130 @@ const RobawsAPI = {
             await new Promise(r => setTimeout(r, 1200));
             res = await this._fetchWithTimeout(url, {
                 method: 'POST',
-                headers: this.getHeaders(),
+                headers,
                 body: JSON.stringify(body),
             });
             this._captureRateHeaders(res, 'live');
         }
+        // v401: Robaws markeert een herhaalde Idempotency-Key met deze header —
+        // de lijn bestond dan al en de respons is de originele.
+        const cached = !!(res.headers && typeof res.headers.get === 'function' && String(res.headers.get('x-robaws-idempotency-cached-response')).toLowerCase() === 'true');
         // 204 No Content of lege body veilig afhandelen
-        if (res.status === 204) return { code: 204, data: null };
+        if (res.status === 204) return { code: 204, data: null, cached };
         const txt = await res.text();
-        if (!txt) return { code: res.status, data: null };
+        if (!txt) return { code: res.status, data: null, cached };
         try {
-            return { code: res.status, data: JSON.parse(txt) };
+            return { code: res.status, data: JSON.parse(txt), cached };
         } catch (e) {
-            return { code: res.status, data: { raw: txt } };
+            return { code: res.status, data: { raw: txt }, cached };
         }
+    },
+
+    /** v401: headers voor een POST, met optionele Idempotency-Key en extra headers. */
+    _postHeaders(opts) {
+        const h = this.getHeaders();
+        if (opts && opts.idempotencyKey) h['Idempotency-Key'] = String(opts.idempotencyKey).slice(0, 128);
+        if (opts && opts.headers) Object.assign(h, opts.headers);
+        return h;
+    },
+
+    // ================================================================
+    // v401: FACTUURLIJNEN ROBUUST. Robaws weigerde in de praktijk af en toe
+    // één lijn (onmiddellijk antwoord, niet aan het artikel te wijten, de
+    // volgende lijn ging gewoon door — 11 facturen sinds 19 sep 2026). De app
+    // deed maar één poging (alleen 429 kreeg een herkansing), controleerde
+    // niets achteraf en gooide de Robaws-fouttekst weg. Nu: tot 3 pogingen
+    // per lijn met dezelfde Idempotency-Key (geen dubbele lijn mogelijk),
+    // daarna de factuur teruglezen en wat ontbreekt alsnog zetten. Pas wat
+    // dán nog ontbreekt blokkeert de betaling — mét de echte foutmelding.
+    // ================================================================
+    _FACTUURLIJN_WACHT: [0, 1200, 2500],   // ms vóór poging 1, 2, 3 (tests zetten dit op nul)
+
+    /** Leesbare tekst uit een Robaws-foutantwoord (object, string of leeg). */
+    _robawsFoutTekst(data, code) {
+        let t = '';
+        if (typeof data === 'string') t = data;
+        else if (data && typeof data === 'object') {
+            t = data.message || data.error || data.detail || data.title || data.raw || '';
+            if (!t && Array.isArray(data.errors)) t = data.errors.map(e => (e && (e.message || e.defaultMessage || e.field)) || JSON.stringify(e)).join('; ');
+            if (!t) { try { t = JSON.stringify(data); } catch (_e) { t = String(data); } }
+        } else if (data != null) t = String(data);
+        t = String(t).replace(/\s+/g, ' ').trim().slice(0, 220);
+        return (code ? 'code ' + code : 'geen antwoord') + (t ? ': ' + t : '');
+    },
+
+    /** Eén factuurlijn wegschrijven: tot 3 pogingen met dezelfde Idempotency-Key.
+     *  401/403/404 worden niet herhaald. Geeft {ok, code, data, pogingen, fout, cached}. */
+    async _postFactuurLijn(invoiceId, lineData, ctx) {
+        const key = ctx && ctx.key;
+        const label = (ctx && ctx.label) || (lineData && lineData.description) || 'lijn';
+        const wacht = this._FACTUURLIJN_WACHT;
+        let laatste = { code: 0, fout: 'geen antwoord' };
+        for (let p = 0; p < wacht.length; p++) {
+            if (wacht[p]) await new Promise(r => setTimeout(r, wacht[p]));
+            try {
+                const r = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData, key ? { idempotencyKey: key } : undefined);
+                if (r.code === 200 || r.code === 201) {
+                    if (p > 0) console.warn('[Factuur] lijn "' + label + '" gelukt bij poging ' + (p + 1) + (r.cached ? ' (Robaws had ze al)' : ''));
+                    return { ok: true, code: r.code, data: r.data, pogingen: p + 1, cached: !!r.cached };
+                }
+                laatste = { code: r.code, fout: this._robawsFoutTekst(r.data, r.code), data: r.data };
+                console.warn('[Factuur] lijn "' + label + '" geweigerd bij poging ' + (p + 1) + ': ' + laatste.fout);
+                if (r.code === 401 || r.code === 403 || r.code === 404) return Object.assign({ ok: false, pogingen: p + 1 }, laatste);
+            } catch (e) {
+                laatste = { code: 0, fout: 'geen antwoord: ' + ((e && e.message) || 'netwerkfout') };
+                console.warn('[Factuur] lijn "' + label + '" poging ' + (p + 1) + ': ' + laatste.fout);
+            }
+        }
+        return Object.assign({ ok: false, pogingen: wacht.length }, laatste);
+    },
+
+    /** Voor lijnen die de app ná createInvoice zelf toevoegt (eenmalige artikels). */
+    async postFactuurLijn(invoiceId, lineData, label) {
+        const key = 'qe-fl-' + invoiceId + '-x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        return this._postFactuurLijn(invoiceId, lineData, { key, label });
+    },
+
+    /** Is de bestaande factuurlijn `b` dezelfde als de bedoelde lijn `a`? */
+    _factuurLijnGelijk(a, b) {
+        const norm = s => String(s == null ? '' : s).replace(/\r\n/g, '\n').trim();
+        const ta = String(a.type || 'LINE').toUpperCase(), tb = String(b.type || 'LINE').toUpperCase();
+        if (ta !== tb) return false;
+        if (norm(a.description) !== norm(b.description)) return false;
+        if (ta === 'TEXT') return true;
+        if (a.articleId != null && String(a.articleId) !== String(b.articleId == null ? '' : b.articleId)) return false;
+        const qa = Number(a.quantity) || 0, qb = Number(b.quantity) || 0;
+        const pa = Number(a.price) || 0, pb = Number(b.price) || 0;
+        return Math.abs(qa - qb) < 0.001 && Math.abs(pa - pb) < 0.005;
+    },
+
+    /** Factuur live teruglezen en vergelijken met de bedoelde lijnen; wat ontbreekt
+     *  alsnog zetten (nieuwe sleutel). Een lijn die "mislukt" leek maar er tóch
+     *  staat, telt als gelukt (geen dubbel). Geeft {gecontroleerd, ontbraken,
+     *  aangevuld, nogWeg} of {gecontroleerd:false, fout}. */
+    async _controleerFactuurLijnen(invoiceId, bedoeld) {
+        let lijst = null;
+        try {
+            const r = await this.get(`sales-invoices/${invoiceId}/line-items?limit=100`, { bypassCache: true });
+            const items = r && r.data && (Array.isArray(r.data.items) ? r.data.items : (Array.isArray(r.data) ? r.data : null));
+            if (r && r.code === 200 && items) lijst = items;
+            else return { gecontroleerd: false, fout: 'lijnen niet leesbaar (code ' + (r && r.code) + ')' };
+        } catch (e) { return { gecontroleerd: false, fout: 'lijnen niet leesbaar (' + ((e && e.message) || 'netwerkfout') + ')' }; }
+        const vrij = lijst.slice();
+        const weg = [];
+        for (const b of bedoeld) {
+            const i = vrij.findIndex(x => this._factuurLijnGelijk(b.lijn, x));
+            if (i >= 0) { vrij.splice(i, 1); b.ok = true; }
+            else weg.push(b);
+        }
+        let aangevuld = 0;
+        for (const b of weg) {
+            const r = await this._postFactuurLijn(invoiceId, b.lijn, { key: b.key + '-c', label: b.label });
+            b.pogingen = (b.pogingen || 0) + (r.pogingen || 0);
+            if (r.ok) { b.ok = true; aangevuld++; }
+            else { b.ok = false; b.code = r.code; b.fout = r.fout; }
+        }
+        return { gecontroleerd: true, ontbraken: weg.length, aangevuld, nogWeg: weg.filter(b => !b.ok).map(b => b.label) };
     },
 
     async put(endpoint, body) {
@@ -1455,6 +1663,24 @@ const RobawsAPI = {
         { naam: 'Westfalen',        supplierId: '623',  match: /westfalen/i },
     ],
     GAS_LEVERANCIER_STANDAARD: 'Antwerp Gasdepot',
+    // ---- v397: vulstand + logboek (vraag Levi 16 sep) ----
+    /** Hoeveel zit er nog in? De sleutel staat in de code, het LABEL gaat naar
+     *  Robaws (leesbaar in het extraveld "Vulstand"). */
+    GAS_VULSTANDEN: [
+        { key: 'vol',     label: 'Vol',     kleur: '#3E7A54', wash: '#E3F0E7', emoji: '🟢' },
+        { key: 'halfvol', label: 'Halfvol', kleur: '#B37514', wash: '#FAEFD9', emoji: '🟡' },
+        { key: 'leeg',    label: 'Leeg',    kleur: '#B4372F', wash: '#FBE6E3', emoji: '🔴' },
+    ],
+    /** Twee extravelden op Materieel die LEVI nog moet aanmaken. Zonder die
+     *  velden blijft alles werken: de vulstand-knoppen melden het eerlijk en
+     *  het logboek wordt gewoon niet bewaard (nooit een actie blokkeren). */
+    GAS_VELD_VULSTAND: 'Vulstand',
+    GAS_VELD_LOG: 'Fles logboek',
+    /** "Ik zet ze terug" → hier gaat de fles naartoe (gemeten: stocklocatie #3
+     *  heet GROOT MAGAZIJN). Terugval: de eerste locatie met 'magazijn' in de
+     *  naam die geen camionet is. */
+    GAS_MAGAZIJN_MATCH: /groot\s*magazijn/i,
+    GAS_LOG_MAX: 60,
     /** Messer Belgium NV factureert de cilinderHUUR (gemeten 11 sep 2026):
      *  per huurtype een lijn met het aantal CILINDERDAGEN × dagprijs
      *  ('Huur Cilinder Industrieel 932 × € 0,4964'). Gedeeld door de
@@ -1533,6 +1759,72 @@ const RobawsAPI = {
     gasHuurSinds(m) { return this._gasVeld(m, 'Huur sinds') || (m && m.createdAt ? String(m.createdAt).slice(0, 10) : null); },
     gasIngeleverdOp(m) { return this._gasVeld(m, 'Ingeleverd op'); },
     gasIsIngeleverd(m) { return String((m && m.status) || '').toLowerCase() === 'ingeleverd'; },
+
+    // ---- v397: VULSTAND ----
+    /** Sleutel ('vol' | 'halfvol' | 'leeg') uit het extraveld, of null. */
+    gasVulstand(m) {
+        const rauw = String(this._gasVeldRuw(m, this.GAS_VELD_VULSTAND) || '').trim().toLowerCase();
+        if (!rauw) return null;
+        if (/^(half|halfvol|halfleeg|1\/2|50)/.test(rauw)) return 'halfvol';
+        if (/^(vol|full|100)/.test(rauw)) return 'vol';
+        if (/^(leeg|empty|0)/.test(rauw)) return 'leeg';
+        return null;
+    },
+    gasVulstandInfo(key) { return this.GAS_VULSTANDEN.find(v => v.key === key) || null; },
+    _gasVeldRuw(m, naam) {
+        const f = m && m.extraFields && m.extraFields[naam];
+        return f ? (f.stringValue ?? f.value ?? null) : null;
+    },
+    /** Waar gaat een fles naartoe als ze terugkomt: GROOT MAGAZIJN. */
+    gasMagazijnLocatie(locs) {
+        const lijst = locs || [];
+        const plaat = /\d-[A-Z]{2,3}-\d{2,3}/i;
+        const groot = lijst.find(l => this.GAS_MAGAZIJN_MATCH.test(String(l.name || '')));
+        const l2 = groot || lijst.find(l => /magazijn/i.test(String(l.name || '')) && !plaat.test(String(l.name || '')));
+        return l2 ? { id: String(l2.id), naam: String(l2.name || 'Magazijn') } : null;
+    },
+
+    // ---- v397: LOGBOEK (wie had welke fles wanneer) ----
+    /** Regels uit het extraveld, nieuwste eerst; onleesbaar = lege lijst. */
+    gasLog(m) {
+        const rauw = this._gasVeldRuw(m, this.GAS_VELD_LOG);
+        if (!rauw) return [];
+        try {
+            const o = JSON.parse(String(rauw));
+            const r = Array.isArray(o) ? o : (o && Array.isArray(o.r) ? o.r : []);
+            return r.filter(x => x && x.d);
+        } catch (_e) { return []; }
+    },
+    /** Tijdstempel in Brusselse tijd, tot op de minuut: '2026-09-16T08:12'. */
+    _gasNu() {
+        const d = new Date();
+        const s = d.toLocaleString('sv-SE', { timeZone: 'Europe/Brussels' });   // 'YYYY-MM-DD HH:MM:SS'
+        return s.slice(0, 10) + 'T' + s.slice(11, 16);
+    },
+    /** Eén leesbare zin per logregel (app én hub gebruiken deze woorden). */
+    gasLogZin(r) {
+        const wie = String((r && r.w) || 'Iemand');
+        const naar = String((r && r.n) || '');
+        switch (r && r.a) {
+            case 'mee':    return wie + ' nam ze mee' + (naar ? ' naar ' + naar : '');
+            case 'terug':  return wie + ' zette ze terug in ' + (naar || 'het magazijn');
+            case 'vul':    return wie + ' zette de fles op ' + (naar || '?');
+            case 'plaats': return 'Verplaatst naar ' + (naar || '?') + ' door ' + wie;
+            case 'wie':    return naar ? (naar + ' is nu verantwoordelijk (gezet door ' + wie + ')') : (wie + ' haalde de verantwoordelijke weg');
+            case 'in':     return wie + ' leverde ze in bij de leverancier';
+            case 'uit':    return wie + ' zette ze weer in huur';
+            case 'nieuw':  return 'Geregistreerd door ' + wie;
+            default:       return wie + (naar ? ' · ' + naar : '');
+        }
+    },
+    /** '2026-09-16T08:12' → '16 sep 08:12' */
+    gasLogDatum(d) {
+        const s = String(d || '');
+        if (s.length < 10) return s;
+        const dt = new Date(s.slice(0, 10) + 'T12:00:00');
+        const dag = dt.toLocaleDateString('nl-BE', { day: 'numeric', month: 'short' });
+        return dag + (s.length >= 16 ? ' ' + s.slice(11, 16) : '');
+    },
 
     /** Dagen in huur: van 'Huur sinds' tot vandaag (of tot de inleverdatum). */
     gasDagen(m, vandaagISO) {
@@ -1617,32 +1909,180 @@ const RobawsAPI = {
 
     /** Waar staat de fles: óf op een project, óf op een stocklocatie —
      *  nooit allebei (één waarheid). */
-    async setMaterialWaar(materialId, { projectId, locId }) {
+    async setMaterialWaar(materialId, { projectId, locId, naam, wie }) {
         const body = projectId
             ? { assignedProjectId: String(projectId), stockLocationId: null }
             : { assignedProjectId: null, stockLocationId: locId ? String(locId) : null };
+        if (wie) { await this._gasSchrijf(materialId, body, { a: 'plaats', n: naam || null, wie }); return true; }   // v397: mét logboek
         const res = await this.patchMerge('materials/' + materialId, body);
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
         return true;
     },
-    async setMaterialEmployee(materialId, empId) {
-        const res = await this.patchMerge('materials/' + materialId, { assignedEmployeeId: empId ? String(empId) : null });
+    async setMaterialEmployee(materialId, empId, opties) {
+        const body = { assignedEmployeeId: empId ? String(empId) : null };
+        if (opties && opties.wie) { await this._gasSchrijf(materialId, body, { a: 'wie', n: opties.naam || null, wie: opties.wie }); return true; }   // v397
+        const res = await this.patchMerge('materials/' + materialId, body);
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
         return true;
     },
-    async gasflesInleveren(materialId, datumISO) {
+    // =============================================================
+    // v397: ÉÉN schrijfweg voor gasflessen — muteren + logboek bijschrijven
+    // + teruglezen als bewijs. Het logboek ("Fles logboek", LONG_TEXT) is
+    // BEST EFFORT: bestaat het veld niet, dan gaat de actie gewoon door.
+    // =============================================================
+    async _gasLees(materialId) {
+        const g = await this.get('materials/' + materialId, { bypassCache: true });
+        if (!g || g.code !== 200 || !g.data) return null;
+        return g.data.id ? g.data : (g.data.data || null);
+    },
+    /** Nieuwe regel vooraan, oudste eruit boven GAS_LOG_MAX. */
+    _gasLogNieuw(oud, regel) {
+        const r = Object.assign({ d: this._gasNu() }, regel || {});
+        return [r].concat((oud || []).filter(x => x && x.d)).slice(0, this.GAS_LOG_MAX);
+    },
+    /**
+     * @param {object} body     merge-PATCH-velden op het materiaal
+     * @param {object|object[]} [log]  {a, n, wie:{naam,id}} → regel in het logboek;
+     *                          v398: ook een lijst (één regel per wijziging, de eerste bovenaan)
+     * @returns {object|null}   het verse materiaal ná de schrijfactie (null = niet kunnen lezen)
+     */
+    async _gasSchrijf(materialId, body, log) {
+        const logs = !log ? [] : (Array.isArray(log) ? log : [log]);
+        let voor = null;
+        if (logs.length) { try { voor = await this._gasLees(materialId); } catch (_e) { voor = null; } }
+        const patch = Object.assign({}, body);
+        if (logs.length) {
+            let regels = this.gasLog(voor);
+            // achterstevoren vooraan zetten: de eerste regel van de lijst eindigt bovenaan
+            for (let i = logs.length - 1; i >= 0; i--) {
+                const l = logs[i] || {}, w = l.wie || {};
+                regels = this._gasLogNieuw(regels, { w: String(w.naam || 'Onbekend'), wi: w.id ? String(w.id) : null, a: l.a, n: l.n || null });
+            }
+            patch.extraFields = Object.assign({}, patch.extraFields || {}, {
+                [this.GAS_VELD_LOG]: { type: 'LONG_TEXT', stringValue: JSON.stringify({ v: 1, r: regels }) },
+            });
+        }
+        const res = await this.patchMerge('materials/' + materialId, patch);
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
+        try { return await this._gasLees(materialId); } catch (_e) { return null; }
+    },
+
+    // =============================================================
+    // v398: ÉÉN OPSLAG voor de fiche (vraag Levi 18 sep: "geen pas-toe-knop
+    // per veld maar één opslaan-knop die alle wijzigingen toepast"). Alles gaat
+    // in ÉÉN merge-PATCH met één logregel per wijziging; daarna teruglezen —
+    // wat Robaws niet overnam komt terug in `nietBewaard` ('emp' | 'waar' |
+    // 'vulstand' | 'huurSinds' | 'status'). Mislukt de PATCH zelf: throw.
+    //   wijz:  { vulstand?: 'vol'|'halfvol'|'leeg'|null,
+    //            waar?: {locId?, projectId?, naam?}   (leeg object = plaats onbekend),
+    //            emp?: {id, naam} | null,  huurSinds?: 'YYYY-MM-DD'|null,
+    //            inleverDatum?: 'YYYY-MM-DD'  (enkel bij soort 'in') }
+    //   soort: null (gewoon opslaan) | 'mee' | 'terug' | 'in' | 'uit'
+    //          → bepaalt de logregel; 'in'/'uit' zetten ook de status.
+    // Volgorde van de velden = die van de oude functies (zelfde PATCH-lichaam).
+    // =============================================================
+    async gasflesBewaar(materialId, wijz, wie, soort) {
+        const w = wijz || {};
+        const heeft = (k) => Object.prototype.hasOwnProperty.call(w, k);
+        const s = (x) => String(x == null ? '' : x);
+        const body = {};
+        const extra = {};
+        if (heeft('emp')) body.assignedEmployeeId = (w.emp && w.emp.id) ? String(w.emp.id) : null;
+        let plaatsNaam = null;
+        if (heeft('waar')) {
+            const p = w.waar || {};
+            plaatsNaam = p.naam || null;
+            if (p.projectId) { body.assignedProjectId = String(p.projectId); body.stockLocationId = null; }
+            else { body.stockLocationId = p.locId ? String(p.locId) : null; body.assignedProjectId = null; }
+        }
+        if (soort === 'in') {
+            body.status = 'ingeleverd'; body.assignedProjectId = null; body.stockLocationId = null; body.assignedEmployeeId = null;
+            extra['Ingeleverd op'] = { type: 'DATE', dateValue: s(w.inleverDatum || new Date().toISOString()).slice(0, 10) };
+        } else if (soort === 'uit') {
+            body.status = 'actief';
+            extra['Ingeleverd op'] = { type: 'DATE', dateValue: null };
+        }
+        let vulInfo = null;
+        if (heeft('vulstand')) {
+            vulInfo = w.vulstand ? this.gasVulstandInfo(w.vulstand) : null;
+            if (w.vulstand && !vulInfo) throw new Error('Onbekende vulstand');
+            extra[this.GAS_VELD_VULSTAND] = { type: 'TEXT', stringValue: vulInfo ? vulInfo.label : null };
+        }
+        if (heeft('huurSinds')) extra['Huur sinds'] = { type: 'DATE', dateValue: w.huurSinds ? s(w.huurSinds).slice(0, 10) : null };
+        if (Object.keys(extra).length) body.extraFields = extra;
+        if (!Object.keys(body).length) return { nietBewaard: [], na: null, niets: true };
+        // één logregel per wijziging (zelfde woorden als de hub/Worker)
+        const logs = [];
+        if (wie) {
+            if (soort === 'mee' || soort === 'terug') logs.push({ a: soort, n: plaatsNaam });
+            else if (soort === 'in' || soort === 'uit') logs.push({ a: soort, n: null });
+            else {
+                if (heeft('waar')) logs.push({ a: 'plaats', n: plaatsNaam || 'plaats onbekend' });
+                if (heeft('emp')) logs.push({ a: 'wie', n: body.assignedEmployeeId ? ((w.emp && w.emp.naam) || null) : null });
+            }
+            if (vulInfo) logs.push({ a: 'vul', n: vulInfo.label });
+            logs.forEach(l => { l.wie = wie; });
+        }
+        const na = await this._gasSchrijf(materialId, body, logs.length ? logs : null);
+        // bewijs: wat nam Robaws niet over? (niet kunnen teruglezen = de 2xx telt)
+        const niet = [];
+        if (na) {
+            if ('assignedEmployeeId' in body && s(na.assignedEmployeeId) !== s(body.assignedEmployeeId)) niet.push('emp');
+            if ('stockLocationId' in body && (s(na.stockLocationId) !== s(body.stockLocationId) || s(na.assignedProjectId) !== s(body.assignedProjectId))) niet.push('waar');
+            if (heeft('vulstand') && s(this.gasVulstand(na)) !== s(vulInfo ? vulInfo.key : null)) niet.push('vulstand');
+            if (heeft('huurSinds') && s(this._gasVeld(na, 'Huur sinds')) !== s(extra['Huur sinds'].dateValue)) niet.push('huurSinds');
+            if (body.status && s(na.status).toLowerCase() !== body.status) niet.push('status');
+        }
+        return { nietBewaard: niet, na };
+    },
+
+    /** Vulstand zetten (vol | halfvol | leeg). Plakt het niet, dan bestaat het
+     *  extraveld nog niet — dat zeggen we met zoveel woorden. (v398: via gasflesBewaar) */
+    async setGasVulstand(materialId, key, wie) {
+        if (!this.gasVulstandInfo(key)) throw new Error('Onbekende vulstand');
+        const r = await this.gasflesBewaar(materialId, { vulstand: key }, wie || null, null);
+        if (r.nietBewaard.indexOf('vulstand') >= 0) throw new Error('Het veld "' + this.GAS_VELD_VULSTAND + '" bestaat nog niet in Robaws — vraag het bureel om het aan te maken');
+        return true;
+    },
+
+    /** v396/v397: "Ik neem deze fles mee" — verantwoordelijke = ik, en de fles
+     *  gaat naar de gekozen plaats (camionet OF werf, nooit allebei).
+     *  `waar` = {locId} | {projectId} | locId (oude vorm). (v398: via gasflesBewaar) */
+    async gasflesMeenemen(materialId, empId, waar, wie) {
+        if (!empId) throw new Error('Geen werknemer');
+        const w = (waar && typeof waar === 'object') ? waar : { locId: waar };
+        const wijz = { emp: { id: String(empId) } };
+        if (w.projectId || w.locId) wijz.waar = { projectId: w.projectId || null, locId: w.locId || null, naam: w.naam || null };
+        const r = await this.gasflesBewaar(materialId, wijz, wie || null, 'mee');
+        if (r.nietBewaard.indexOf('emp') >= 0) throw new Error('Robaws nam de verantwoordelijke niet over');
+        if (r.nietBewaard.indexOf('waar') >= 0) throw new Error(w.projectId ? 'Robaws nam de werf niet over' : 'Robaws nam de plaats niet over');
+        return true;
+    },
+
+    /** v397: "Ik zet ze terug" — verantwoordelijke weg, fles naar het magazijn. (v398: via gasflesBewaar) */
+    async gasflesTerug(materialId, locId, wie) {
+        if (!locId) throw new Error('Geen magazijn gevonden');
+        const r = await this.gasflesBewaar(materialId, { emp: null, waar: { locId: String(locId), naam: (wie && wie.plaats) || null } }, wie || null, 'terug');
+        if (r.nietBewaard.indexOf('emp') >= 0) throw new Error('Robaws liet de verantwoordelijke staan');
+        if (r.nietBewaard.indexOf('waar') >= 0) throw new Error('Robaws nam de plaats niet over');
+        return true;
+    },
+
+    async gasflesInleveren(materialId, datumISO, wie) {
         const d = String(datumISO || new Date().toISOString().slice(0, 10)).slice(0, 10);
-        const res = await this.patchMerge('materials/' + materialId, {
-            status: 'ingeleverd', assignedProjectId: null, stockLocationId: null,
+        const body = {
+            status: 'ingeleverd', assignedProjectId: null, stockLocationId: null, assignedEmployeeId: null,
             extraFields: { 'Ingeleverd op': { type: 'DATE', dateValue: d } },
-        });
+        };
+        if (wie) { await this._gasSchrijf(materialId, body, { a: 'in', wie }); return true; }   // v397
+        const res = await this.patchMerge('materials/' + materialId, body);
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
         return true;
     },
-    async gasflesHeractiveer(materialId) {
-        const res = await this.patchMerge('materials/' + materialId, {
-            status: 'actief', extraFields: { 'Ingeleverd op': { type: 'DATE', dateValue: null } },
-        });
+    async gasflesHeractiveer(materialId, wie) {
+        const body = { status: 'actief', extraFields: { 'Ingeleverd op': { type: 'DATE', dateValue: null } } };
+        if (wie) { await this._gasSchrijf(materialId, body, { a: 'uit', wie }); return true; }   // v397
+        const res = await this.patchMerge('materials/' + materialId, body);
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('Robaws gaf status ' + res.code);
         return true;
     },
@@ -2493,6 +2933,8 @@ const RobawsAPI = {
                         // v391: lijst van onderdelen die de server kent (nieuwe blijven anders zichtbaar)
                         if (Array.isArray(wj.appToolsBekend)) localStorage.setItem('qe_app_tools_bekend', JSON.stringify(wj.appToolsBekend));
                         else localStorage.removeItem('qe_app_tools_bekend');
+                        // v395: logistiek per persoon (null/afwezig = standaard van de rol)
+                        this._zetMijnLogistiek(wj.mijnLogistiek || null, emailLower);
                     } catch (_e) {}
                 }
                 if (wres.ok && wj.taakOntvangers) {
@@ -4181,6 +4623,7 @@ const RobawsAPI = {
                 planningTypeId: item.planningTypeId || null,
                 hourTypeId: item.hourTypeId || null,
                 hasWerkbon: hasWerkbon,
+                projectId: item.projectId != null ? String(item.projectId) : null,   // v400: werkpakket-keuze (nacalculatie)
                 timeAndMaterial: planRegie,   // v182: regie komt ENKEL van de dagplanning
                 client: null,
                 endClient: null,  // v102+: ook eindklant ophalen
@@ -5771,6 +6214,18 @@ const RobawsAPI = {
         // Het werfadres wordt als TEXT-lijn bovenaan de factuur gezet (zoals Wappy dat doet).
         let addedLines = 0;
         const errors = [];
+        // v401: elke lijn via _postFactuurLijn (3 pogingen, vaste Idempotency-Key
+        // per lijn) en onthouden wat we WILDEN zetten, voor de controle in stap 3e.
+        const lijnBasis = 'qe-fl-' + invoiceId + '-' + Date.now().toString(36);
+        const bedoeld = [];   // {lijn, label, key, ok, code, fout, pogingen}
+        const zetLijn = async (lineData, label) => {
+            const b = { lijn: lineData, label: label || lineData.description || 'lijn', key: lijnBasis + '-' + (bedoeld.length + 1), ok: false };
+            bedoeld.push(b);
+            const r = await this._postFactuurLijn(invoiceId, lineData, { key: b.key, label: b.label });
+            b.ok = r.ok; b.code = r.code; b.fout = r.fout; b.pogingen = r.pogingen;
+            if (r.ok) addedLines++;
+            return r;
+        };
 
         // 3a: Notities als tekstlijn
         if (notes && notes.trim()) {
@@ -5780,8 +6235,7 @@ const RobawsAPI = {
             };
             if (woSalesOrderId) textLineData.orderId = woSalesOrderId;
 
-            const textResult = await this.post(`sales-invoices/${invoiceId}/line-items`, textLineData);
-            if (textResult.code === 201 || textResult.code === 200) addedLines++;
+            await zetLijn(textLineData, 'opmerking (tekstlijn)');   // v401
         }
 
         // 3b: v112 — Postcode-tekstlijn (uit dagplanning werfadres) zodat de
@@ -5799,9 +6253,7 @@ const RobawsAPI = {
                 description: postcodeText,
             };
             if (woSalesOrderId) postcodeLine.orderId = woSalesOrderId;
-            const r = await this.post(`sales-invoices/${invoiceId}/line-items`, postcodeLine);
-            if (r.code === 201 || r.code === 200) addedLines++;
-            else console.warn('[Invoice] postcode-lijn POST faalde:', r.code, r.data);
+            await zetLijn(postcodeLine, 'werfadres ' + postcodeText + ' (tekstlijn)');   // v401
         }
 
         // 3c: Materialen van frontend (betrouwbaarder dan WO material-entries)
@@ -5820,12 +6272,7 @@ const RobawsAPI = {
                     lineData.articleId = toStr(articleId);
                 }
 
-                const addResult = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData);
-                if (addResult.code === 201 || addResult.code === 200) {
-                    addedLines++;
-                } else {
-                    errors.push({ line: lineData.description, code: addResult.code, error: addResult.data });
-                }
+                await zetLijn(lineData, lineData.description);   // v401: 3 pogingen + controle achteraf
             }
         } else {
             // Fallback: lees material-entries van werkorder
@@ -5847,9 +6294,7 @@ const RobawsAPI = {
                         lineData.unitType = me.unitType || me.article.unitType;
                     }
 
-                    const addResult = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData);
-                    if (addResult.code === 201 || addResult.code === 200) addedLines++;
-                    else errors.push({ line: lineData.description, code: addResult.code, error: addResult.data });
+                    await zetLijn(lineData, lineData.description);   // v401
                 }
             }
         }
@@ -5900,9 +6345,7 @@ const RobawsAPI = {
                     lineData.articleId = toStr(group.articleId);
                 }
                 console.log('[Factuur] Uren lijn:', rawHrs, 'u → afgerond:', billableHrs, 'u @', group.salePrice);
-                const addResult = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData);
-                if (addResult.code === 201 || addResult.code === 200) addedLines++;
-                else errors.push({ line: desc, code: addResult.code, error: addResult.data });
+                await zetLijn(lineData, desc + ' ' + billableHrs + 'u');   // v401
             }
         } else if (!onderhoud) {
             // Fallback: time-entries van werkorder (NIET bij onderhoud — dan worden uren niet gefactureerd)
@@ -5940,9 +6383,7 @@ const RobawsAPI = {
                 if (woSalesOrderId) lineData.orderId = woSalesOrderId;
                 if (aId && aId !== '_default') lineData.articleId = toStr(aId);
                 console.log('[Factuur] Uren lijn (fallback):', group.totalHrs, 'u → afgerond:', billableHrs, 'u');
-                const addResult = await this.post(`sales-invoices/${invoiceId}/line-items`, lineData);
-                if (addResult.code === 201 || addResult.code === 200) addedLines++;
-                else errors.push({ line: group.desc, code: addResult.code, error: addResult.data });
+                await zetLijn(lineData, group.desc);   // v401
             }
         }
 
@@ -5961,13 +6402,24 @@ const RobawsAPI = {
                 vatTariffId: toStr(vatTariffId),
             };
             if (woSalesOrderId) kortingLine.orderId = woSalesOrderId;
-            const kortingRes = await this.post(`sales-invoices/${invoiceId}/line-items`, kortingLine);
-            if (kortingRes.code === 201 || kortingRes.code === 200) {
-                addedLines++;
-                console.log('[Factuur] Kortinglijn:', kortingLine.description, kortingLine.price);
-            } else {
-                errors.push({ line: kortingLine.description, code: kortingRes.code, error: kortingRes.data });
-            }
+            const kortingRes = await zetLijn(kortingLine, kortingLine.description);   // v401
+            if (kortingRes.ok) console.log('[Factuur] Kortinglijn:', kortingLine.description, kortingLine.price);
+        }
+
+        // Stap 3e (v401): factuur teruglezen en vergelijken met wat we wilden
+        // zetten; wat ontbreekt gaat er alsnog op. Pas wat dán nog ontbreekt is
+        // een geld-fout (errors → de app blokkeert de betaling en maakt de
+        // bureel-taak, nu mét de echte foutmelding van Robaws).
+        let lijnControle = { gecontroleerd: false };
+        try {
+            lijnControle = await this._controleerFactuurLijnen(invoiceId, bedoeld);
+        } catch (e) { lijnControle = { gecontroleerd: false, fout: (e && e.message) || 'controle mislukt' }; }
+        if (!lijnControle.gecontroleerd) statusErrors.push('factuurlijnen niet gecontroleerd (' + (lijnControle.fout || '?') + ')');
+        else if (lijnControle.aangevuld) console.warn('[Factuur] ' + lijnControle.aangevuld + ' lijn(en) alsnog gezet na teruglezen');
+        addedLines = bedoeld.filter(b => b.ok).length;
+        for (const b of bedoeld) {
+            if (b.ok) continue;
+            errors.push({ line: b.label, code: b.code || 0, error: b.fout || 'geweigerd', pogingen: b.pogingen || 0 });
         }
 
         // Stap 4: Factuur ophalen voor totalen + OGM
@@ -6139,6 +6591,7 @@ const RobawsAPI = {
             lineItemsAdded: addedLines,
             errors,
             statusErrors,  // v211: niet-blokkerende status-fouten (apart van geld-fouten)
+            lijnControle,  // v401: {gecontroleerd, ontbraken, aangevuld, nogWeg} — teruglezen na het schrijven
             paymentMethod,
             salesOrderId: woSalesOrderId,
             workOrder: {

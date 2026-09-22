@@ -60,7 +60,8 @@
         screenFactuurDetail:{ sub: 'Aankoopfactuur goedkeuren', title: 'Factuur' },
         screenMaterieelDetail:{ sub: 'Reserveren & beschikbaarheid', title: 'Materieel' },
         screenMaterieelAanvragen:{ sub: 'Jouw materieel-aanvragen', title: 'Vorige aanvragingen' },
-        screenHandleiding: { sub: 'Alles over de app · typ om te zoeken', title: 'Handleiding' }
+        screenHandleiding: { sub: 'Alles over de app · typ om te zoeken', title: 'Handleiding' },
+        screenRegelboek:   { sub: 'Welke uren tellen en welke niet', title: 'Regelboek uren' }   // v399
         /* screenHandleidingH: hoofdstuk rendert zijn eigen Marble-kop */
         // screenDagoverzicht: kop wordt door loadDagoverzicht zelf gerenderd (maand + pijltjes)
         // detail/werkbon/betaal-schermen: hebben hun eigen kop
@@ -239,8 +240,14 @@
         ] },
         screenDagoverzicht: { name: 'MIJN UREN', steps: [
             ['Maandoverzicht', 'De cijfers bovenaan tellen je maand op; met de pijltjes blader je naar vorige maanden. Je komt hier via de knop op het Klok-scherm.', '#mbUrenStats'],
+            ['Regelboek', 'Welke uren tellen en welke niet: de rit naar de werf, vroeger beginnen, vroeger klaar en laden en lossen. Tik de kaart om alle regels te lezen.', '#urenRegelboekKaart'],
             ['Dagdetail', 'Elke rij is een dag met het type uren. Ziekte of verlof staat er ook tussen.'],
             ['Aanpassing vragen', 'Klopt iets niet? Tik op de dag en kies een reden ("Vergeten in te klokken", "Verkeerd tijdstip", …) — je aanvraag gaat als taak naar Vince.']
+        ] },
+        /* v399: regelboek uren (alleen tekst) */
+        screenRegelboek: { name: 'REGELBOEK', steps: [
+            ['Welke uren tellen', 'Alle regels over je uren op één plek: hoe je dag begint, de ritten, vroeger beginnen of vroeger klaar, en laden en lossen.'],
+            ['Afspraken', 'Iets afgesproken met de projectleider? Zet het bij het uitklokken in "Opmerking voor het bureel". Dan ziet het bureel het meteen.']
         ] },
         screenUitgevoerd: { name: 'UITGEVOERD', steps: [
             ['Afgewerkte werkbonnen', 'De laatste 7 dagen, met uren, artikels en betaalstatus.', '#uitgevoerdList'],
@@ -275,6 +282,18 @@
             ['Wanneer', 'Tik dagen aan in de kalender (meerdere mag) of gebruik de snelknoppen. Elke dag wordt een eigen dagplanning.'],
             ['Uren, kleur en titel', 'Standaard 06:45–15:30, de kleur van de gekozen monteur en het projectnummer als titel — alles aanpasbaar.'],
             ['Inplannen', 'De app slaat dagen over die al precies zo op dit project staan en controleert na het bewaren of elke planning echt in Robaws staat.']
+        ] },
+        /* v395: Logistiek ook voor monteurs (per persoon ingesteld) */
+        screenLogistiek: { name: 'LOGISTIEK', steps: [
+            ['Wat je hier ziet', 'Welke kaarten je ziet, stelt het bureel per persoon in. Monteurs zien standaard hun eigen voertuig en de gasflessen.'],
+            ['Mijn voertuig', 'Het voertuig dat in Robaws op jouw naam staat, met de gasflessen die erin staan.'],
+            ['Gasflessen', 'Waar staat welke fles en wie is er verantwoordelijk voor. De weergave "Bij mij" toont de flessen op jouw naam en in jouw camionet.']
+        ] },
+        screenGasflessen: { name: 'GASFLESSEN', steps: [
+            ['De lijst', '"Bij mij" toont de flessen op jouw naam en in jouw camionet, "Alle flessen" alle flessen per plaats. De kleur zegt hoe vol een fles is.', '#gasflesList'],
+            ['Een fles aanpassen', 'Tik een fles open en duid aan hoeveel er nog in zit. Wat je aanpast krijgt een oranje stip; tik daarna één keer op "Opslaan" om alles te bewaren.'],
+            ['Meenemen of terugzetten', '"Ik neem deze fles mee" vraagt waar je ze zet: je camionet of een werf. "Ik zet ze terug" brengt ze naar het groot magazijn. Een aangeduide vulstand gaat meteen mee.'],
+            ['Scannen', 'Met "Scan een fles" lees je het etiket op de fles en open je meteen haar fiche.']
         ] },
         screenToestel: { name: 'TOESTEL', steps: [
             ['Toestemmingen', 'Hier zie je welke toestemmingen de app heeft. "Alles in één keer toestaan" vraagt ze meteen allemaal.', '#toestelInhoud'],
@@ -348,6 +367,12 @@
                 list.push('screenProjecten');
             }
         } catch (e) { /* rondleiding mag nooit crashen op een rol-check */ }
+        /* v395: Logistiek zit in de rondleiding voor wie de tab heeft */
+        var navLog = document.getElementById('navLogistiek');
+        if (navLog && navLog.style.display !== 'none') {
+            var ui = list.indexOf('screenUitgevoerd');
+            list.splice(ui >= 0 ? ui + 1 : list.length, 0, 'screenLogistiek');
+        }
         var admin = document.getElementById('adminCard');
         var ana = document.getElementById('urenAnalyseCard');
         if (admin && admin.style.display !== 'none') list.push('screenAdmin');
