@@ -113,6 +113,9 @@
     <div id="wachtBanner" onclick="app.openWachtOverzicht()"
         style="display:none;align-items:center;gap:10px;padding:11px 14px;margin-bottom:14px;border-radius:12px;border:1px solid var(--cb,#e5e2da);background:var(--card,#FDFCFA);font-size:13.5px;cursor:pointer"></div>
 
+    <!-- v404: Check in @ work (gevuld door app._ciawBanner; alleen vandaag en alleen op een Check in @ work-project) -->
+    <div id="ciawBanner" style="display:none"></div>
+
     <!-- Clock-in/out status bar -->
     <div id="clockStatusBar" style="display:none;padding:12px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer" onclick="app.navigate('screenClock')">
         <div style="display:flex;align-items:center;justify-content:space-between">
@@ -1501,7 +1504,12 @@
 <div class="screen" id="screenGasflessen">
     <div class="section-header"><h2>Gasflessen</h2></div>
     <div id="gfKop" style="font-size:12.5px;color:var(--qe-grey);margin:-4px 4px 10px;line-height:1.45"></div>
-    <button class="btn btn-primary btn-full" style="padding:16px;font-size:16px;margin-bottom:12px" onclick="app.openGasScan()">📷 Scan een fles</button>
+    <button class="btn btn-primary btn-full" style="padding:16px;font-size:16px;margin-bottom:8px" onclick="app.openGasScan()">📷 Fles scannen</button>
+    <!-- v403: drie knoppen (bureel). Monteurs zien enkel "Fles scannen". -->
+    <div id="gfBeheerKnoppen" style="display:flex;gap:8px;margin-bottom:12px">
+        <button class="btn btn-outline" id="gfWisselKnop" style="flex:1" onclick="app.gfVervangStart()">🔄 Fles vervangen</button>
+        <button class="btn btn-outline" style="flex:1" onclick="app.gfBeheerStart()">＋ Toevoegen / inleveren</button>
+    </div>
     <!-- v397: wie niet beheert krijgt twee grote knoppen i.p.v. de keuzelijsten -->
     <div id="gfTabs" style="display:none;gap:8px;margin-bottom:10px"></div>
     <input type="text" id="gfZoek" class="form-input" placeholder="Zoek op flesnummer, werf of naam…" style="width:100%;margin-bottom:10px;font-size:16px;padding:13px" oninput="app.gfZet('zoek', this.value)">
@@ -1517,7 +1525,6 @@
             <option value="">Alle gassen</option>
         </select>
     </div>
-    <button class="btn btn-outline btn-full" id="gfNieuwKnop" style="margin-bottom:12px" onclick="app.openGasflesNieuw()">+ Nieuwe fles registreren</button>
     <div id="gfVeldHint"></div>
     <div id="gasflesList"><div class="spinner"></div></div>
 </div>
@@ -1598,55 +1605,56 @@
     <div class="rb-kaart">
         <div class="rb-kop">Rechtstreeks naar de werf</div>
         <div class="rb-regel"><span class="rb-nr">1</span><div>Klok in met de <b>tag in de camionet</b> als je thuis vertrekt.</div></div>
-        <div class="rb-regel"><span class="rb-nr">2</span><div>De rit van thuis naar de werf wordt <b>betaald</b>, op voorwaarde dat je <b>8 uur op de werf</b> werkt. De rit telt niet mee in die 8 uur.</div></div>
-        <div class="rb-regel"><span class="rb-nr">3</span><div>Werk je <b>minder dan 8 uur</b> op de werf, dan wordt de rit <b>niet betaald</b>. Behalve met duidelijk overleg en toestemming van de projectleider.</div></div>
-        <div class="rb-vb"><b>Voorbeeld.</b> Je vertrekt om 06:45 en bent om 07:30 op de werf. Werk je daar 8 uur, pauze niet meegerekend, dan wordt ook je rit van 45 minuten betaald. Werk je er minder dan 8 uur en is er geen toestemming, dan tellen je uren pas vanaf 07:30.</div>
+        <div class="rb-regel"><span class="rb-nr">2</span><div>Je moet om <b>06:45 op de werf aankomen</b>. Vertrek dus op tijd.</div></div>
+        <div class="rb-regel"><span class="rb-nr">3</span><div>De rit van thuis naar de werf wordt <b>betaald</b>, op voorwaarde dat je <b>8 uur op de werf</b> werkt. De rit telt niet mee in die 8 uur.</div></div>
+        <div class="rb-regel"><span class="rb-nr">4</span><div>Werk je <b>minder dan 8 uur</b> op de werf, dan wordt de rit <b>niet betaald</b>. Behalve met duidelijk overleg en toestemming van de projectleider.</div></div>
+        <div class="rb-vb"><b>Voorbeeld.</b> Je vertrekt om 06:00 en bent om 06:45 op de werf. Werk je daar 8 uur, pauze niet meegerekend, dan wordt ook je rit van 45 minuten betaald. Werk je er minder dan 8 uur en is er geen toestemming, dan tellen je uren pas vanaf 06:45.</div>
     </div>
 
     <div class="rb-kaart">
         <div class="rb-kop">Eerst naar het bureau</div>
         <div class="rb-sub">Om materiaal te halen of een collega op te pikken.</div>
-        <div class="rb-regel"><span class="rb-nr">4</span><div>Klok in met de <b>tag aan het bureau</b>. Je uren tellen vanaf die inklok.</div></div>
-        <div class="rb-regel"><span class="rb-nr">5</span><div>Klok je in <b>vóór je startuur</b>, dan start je uur pas op je startuur.</div></div>
-        <div class="rb-regel"><span class="rb-nr">6</span><div>De rit van het bureau naar de werf wordt <b>betaald</b> en telt mee in je 8 uur.<span class="rb-waarom">We kunnen niet verwachten dat je twee verplaatsingen doet en dan nog 8 uur op de werf blijft.</span></div></div>
+        <div class="rb-regel"><span class="rb-nr">5</span><div>Klok in met de <b>tag aan het bureau</b>. Je uren tellen vanaf die inklok.</div></div>
+        <div class="rb-regel"><span class="rb-nr">6</span><div>Klok je in <b>vóór je startuur</b>, dan start je uur pas op je startuur.</div></div>
+        <div class="rb-regel"><span class="rb-nr">7</span><div>De rit van het bureau naar de werf wordt <b>betaald</b> en telt mee in je 8 uur.<span class="rb-waarom">We kunnen niet verwachten dat je twee verplaatsingen doet en dan nog 8 uur op de werf blijft.</span></div></div>
     </div>
 
     <div class="rb-deel">De rit naar huis</div>
     <div class="rb-kaart">
-        <div class="rb-regel"><span class="rb-nr">7</span><div>Enkel de <b>eerste rit</b> naar de werf wordt betaald. De tweede rit, terug naar huis, <b>nooit</b>. Klok dus uit op de werf, vóór je naar huis vertrekt.</div></div>
+        <div class="rb-regel"><span class="rb-nr">8</span><div>Enkel de <b>eerste rit</b> naar de werf wordt betaald. De tweede rit, terug naar huis, <b>nooit</b>. Klok dus uit op de werf, vóór je naar huis vertrekt.</div></div>
     </div>
 
     <div class="rb-deel">Vroeger beginnen</div>
     <div class="rb-kaart">
-        <div class="rb-regel"><span class="rb-nr">8</span><div>Moet je vroeger beginnen, dan mag je <b>vroeger inklokken in de camionet</b>. Enkel als dat <b>afgesproken is met de projectleider</b>.</div></div>
+        <div class="rb-regel"><span class="rb-nr">9</span><div>Moet je vroeger beginnen, dan mag je <b>vroeger inklokken in de camionet</b>. Enkel als dat <b>afgesproken is met de projectleider</b>.</div></div>
     </div>
 
     <div class="rb-deel">Vroeger klaar op de werf</div>
     <div class="rb-kaart">
-        <div class="rb-regel"><span class="rb-nr">9</span><div>Je kan <b>altijd terug naar het magazijn</b> komen om daar je 8 uur af te maken.</div></div>
-        <div class="rb-regel"><span class="rb-nr">10</span><div>Wil je dat niet en is je werk klaar, dan kan je <b>na overleg met de projectleider</b> naar huis. De overige uren worden dan <b>niet betaald</b>.</div></div>
+        <div class="rb-regel"><span class="rb-nr">10</span><div>Ben je vroeger klaar, dan <b>overleg je eerst met de projectleider</b> vóór je vertrekt naar het magazijn of naar huis. Zo kan de projectleider bevestigen dat het werk klaar is. Daarna kan je <b>altijd terug naar het magazijn</b> komen om daar je 8 uur af te maken.</div></div>
+        <div class="rb-regel"><span class="rb-nr">11</span><div>Wil je dat niet, dan kan je na dat overleg naar huis. De overige uren worden dan <b>niet betaald</b>.</div></div>
     </div>
 
     <div class="rb-deel">Laden en lossen</div>
     <div class="rb-kaart">
-        <div class="rb-regel"><span class="rb-nr">11</span><div>Heb je materiaal nodig voor morgen, dan kan je ’s avonds op het bureau komen <b>laden en lossen</b>. Scan daarvoor de L&amp;L-tag. Deze uren <b>tellen mee in je 8 werkuren</b>.</div></div>
+        <div class="rb-regel"><span class="rb-nr">12</span><div>Heb je materiaal nodig voor morgen, dan kan je ’s avonds op het bureau komen <b>laden en lossen</b>. Scan daarvoor de L&amp;L-tag. Deze uren <b>tellen mee in je 8 werkuren</b>.</div></div>
     </div>
 
     <div class="rb-deel">Afspraken met de projectleider</div>
     <div class="rb-kaart">
-        <div class="rb-regel"><span class="rb-nr">12</span><div>Iets afgesproken met de projectleider, zoals vroeger beginnen, de rit toch betaald of vroeger naar huis? Zet het bij het uitklokken in het vak <b>"Opmerking voor het bureel"</b>, met de naam van de projectleider. Zo ziet het bureel het meteen bij het nakijken van je uren.</div></div>
+        <div class="rb-regel"><span class="rb-nr">13</span><div>Iets afgesproken met de projectleider, zoals vroeger beginnen, de rit toch betaald of vroeger naar huis? Zet het bij het uitklokken in het vak <b>"Opmerking voor het bureel"</b>, met de naam van de projectleider. Zo ziet het bureel het meteen bij het nakijken van je uren.</div></div>
     </div>
 
     <div class="rb-deel">Wat altijd geldt</div>
     <div class="rb-kaart">
-        <div class="rb-regel"><span class="rb-nr">13</span><div>Je tijd wordt afgerond op <b>kwartieren</b>, met 4 minuten speling. Laden en lossen rondt af op 5 minuten.</div></div>
-        <div class="rb-regel"><span class="rb-nr">14</span><div>Klok je in <b>ná je startuur</b>, dan staat die dag als "te laat".</div></div>
-        <div class="rb-regel"><span class="rb-nr">15</span><div>Je <b>pauze</b> gaat er automatisch af, één keer per dag.</div></div>
-        <div class="rb-regel"><span class="rb-nr">16</span><div>Meer dan <b>8 uur</b> op één dag zijn <b>overuren</b>. Zaterdag en zondag zijn altijd overuren.</div></div>
-        <div class="rb-regel"><span class="rb-nr">17</span><div>Vul je <b>kilometers</b> altijd in, heen en terug, ook voor een rit die niet betaald wordt. Kilometers en uren zijn twee aparte dingen.</div></div>
+        <div class="rb-regel"><span class="rb-nr">14</span><div>Je tijd wordt afgerond op <b>kwartieren</b>, met 4 minuten speling. Laden en lossen rondt af op 5 minuten.</div></div>
+        <div class="rb-regel"><span class="rb-nr">15</span><div>Klok je in <b>ná je startuur</b>, dan staat die dag als "te laat".</div></div>
+        <div class="rb-regel"><span class="rb-nr">16</span><div>Je <b>pauze</b> gaat er automatisch af, één keer per dag.</div></div>
+        <div class="rb-regel"><span class="rb-nr">17</span><div>Meer dan <b>8 uur</b> op één dag zijn <b>overuren</b>. Zaterdag en zondag zijn altijd overuren.</div></div>
+        <div class="rb-regel"><span class="rb-nr">18</span><div>Vul je <b>kilometers</b> altijd in, heen en terug, ook voor een rit die niet betaald wordt. Kilometers en uren zijn twee aparte dingen.</div></div>
     </div>
 
-    <p class="rb-voet">Klopt een dag niet? Tik in Uren op die dag om een aanpassing aan te vragen.<br>Bijgewerkt op 21 september 2026.</p>
+    <p class="rb-voet">Klopt een dag niet? Tik in Uren op die dag om een aanpassing aan te vragen.<br>Bijgewerkt op 24 september 2026.</p>
 </div>
 
 <!-- ========== SCREEN: MAANDRECAP (Terugblik-lijst) v288 ========== -->
