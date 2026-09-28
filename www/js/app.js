@@ -174,6 +174,18 @@ const app = {
                     try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
                     return;
                 }
+                // 0b. v406: Google-reviewscherm sluiten + pop compenseren
+                if (document.getElementById('reviewQrScherm')) {
+                    this.sluitReviewQr();
+                    try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
+                    return;
+                }
+                // 0c. v408: in de rekenmachine eerst een stap terug (berekening → module → start)
+                if (this.currentScreen === 'screenReken' && this._reken && this._reken.kanTerug()) {
+                    this._reken.terug();
+                    try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
+                    return;
+                }
                 // 1. Modal heeft prioriteit: sluit hem en compenseer de pop
                 const modal = document.getElementById('modalOverlay');
                 if (modal && modal.classList.contains('show')) {
@@ -645,6 +657,8 @@ const app = {
 
         // Achtergrond: sync artikelen als nodig + verwerk offline wachtrij
         this.backgroundSync();
+        // v409: wachtende laden-&-lossen-regels naar hun werf-werkbon (stil, geen calls als er niets wacht)
+        this._lnlWachtStil();
         // Kloksysteem: internet-tijd laden + tags laden + pending sync
         if (typeof QEClock !== 'undefined') {
             // Laad internet-tijd offset (Brussel) zodat toesteltijd niet gemanipuleerd kan worden
@@ -1864,6 +1878,7 @@ const app = {
             screenAfwezigheid: 'Afwezigheid melden',  // v219
             screenAanvragen: 'Aanvragen',  // v278
             screenOrganisatie: 'Organisatie',  // v391
+            screenReken: 'Rekenmachine',  // v408
             screenProjecten: 'Projecten',  // v391
             screenProjectDetail: 'Project',  // v391
             screenDagplanningNieuw: 'Dagplanning maken',  // v391
@@ -1883,7 +1898,7 @@ const app = {
         // v391: Aanvragen is een compartiment van Organisatie — alleen wie geen hub
         // heeft (monteur/technieker) krijgt het als hoofdscherm zonder terugknop.
         const noBackScreens = ['screenPlanning', 'screenUitgevoerd', 'screenOrganisatie', 'screenLogistiek', 'screenClock', 'screenPayment', 'screenOverschrijving'];   // v395: + Logistiek (onderbalk-tab)
-        if (!this._orgMagProjecten()) noBackScreens.push('screenAanvragen');
+        // v408: de Organisatie-hub bestaat nu voor iedereen (Aanvragen + Rekenmachine), dus Aanvragen krijgt altijd een terugknop
         backBtn.classList.toggle('visible', !noBackScreens.includes(screenId));
 
         // Scroll to top
@@ -1900,6 +1915,7 @@ const app = {
         if (screenId === 'screenGoedkeuren') this.loadGoedkeuren();  // v278
         // v391: Organisatie · Projecten · Toestel
         if (screenId === 'screenOrganisatie') this.loadOrganisatie();
+        if (screenId === 'screenReken') this.loadReken();   // v408
         if (screenId === 'screenProjecten') this.loadProjecten();
         if (screenId === 'screenProjectDetail') { this.renderProjectDetail(); this.loadProjectPlanning(); }
         if (screenId === 'screenDagplanningNieuw' && !this._dp) setTimeout(() => this.goBack(), 0);
@@ -1992,6 +2008,8 @@ const app = {
     },
 
     goBack() {
+        // v408: rekenmachine: eerst een stap terug binnen de rekenmachine zelf
+        if (this.currentScreen === 'screenReken' && this._reken && this._reken.kanTerug()) { this._reken.terug(); return; }
         // Vanaf betaalscherm/overschrijving: factuur is al aangemaakt, ga altijd naar planning
         if (this.currentScreen === 'screenPayment' || this.currentScreen === 'screenOverschrijving') {
             this.screenHistory = [];
@@ -2338,6 +2356,12 @@ const app = {
         const regieChip = isRegie
             ? `<span class="wo-regie-tag">${this.icon('cash', { size: 13 })} Regie</span>`
             : '';
+        // v409: laden-&-lossen-uren die op deze werkbon wachten tot hij verstuurd is
+        let lnlChip = '';
+        try {
+            const lnlW = RobawsAPI.lnlWachtVoor(wo.id, this.currentUser && this.currentUser.robawsEmployeeId);
+            if (lnlW) lnlChip = `<span style="margin-left:6px;font-size:11px;color:var(--purple2);font-weight:600" title="Laden & lossen — komt op de werkbon zodra je hem verstuurt">📦 ${this.escapeHtml(RobawsAPI.lnlUrenTekst(lnlW))} L&amp;L wacht</span>`;
+        } catch (_e) {}
 
         return `
             <div class="card card-clickable" onclick="app.openWorkorder('${wo.id}')">
@@ -2349,7 +2373,7 @@ const app = {
                         <h3>${this.escapeHtml(clientName)}</h3>
                         ${wo.summary ? `<div style="font-size:13px;color:var(--qe-darkblue);font-weight:500;margin:2px 0">${this.escapeHtml(wo.summary)}</div>` : ''}
                         ${address ? `<div class="wo-address">${this.icon('map-pin', { size: 14 })} ${this.escapeHtml(address)}</div>` : ''}
-                        <span class="wo-type ${type}">${typeLabel}</span>${regieChip}
+                        <span class="wo-type ${type}">${typeLabel}</span>${regieChip}${lnlChip}
                         ${orderNr ? `<span style="margin-left:6px;font-size:11px;color:var(--qe-purple);font-weight:500">${this.escapeHtml(orderNr)}</span>` : ''}
                         ${histBadge}
                         ${hasMaterials || hasHours ? `<span style="margin-left:6px;font-size:11px;color:var(--qe-green)">${this.icon('check', { size: 12, style: 'vertical-align:-2px' })} In bewerking</span>` : ''}
@@ -6282,7 +6306,10 @@ const app = {
         // handtekening) én gooide de bridge alles weg met een fake-succes →
         // offline werkbonnen waren definitief verloren.
         try {
-            const payload = this._buildWerkbonPayload(data);
+            // v407: de werkbon-snapshot van de flow gebruiken (v252-regel: this.currentWO
+            // kan tijdens het wachten op de time-out al een andere bon zijn).
+            const _qWo = (extra && extra.wo) || null;
+            const payload = this._buildWerkbonPayload(data, _qWo);
             // Eenmalige artikels apart meegeven — de queue-verwerking zet ze
             // als line-item op de werkbon (zelfde v93-afhandeling als online).
             payload.customArticles = (data.materials || [])
@@ -6310,9 +6337,10 @@ const app = {
                 } else {
                     this.toast('Geen internet — werkbon staat in de wachtrij en wordt automatisch verstuurd');
                 }
-                this._markWOSubmitted(data);
+                this._markWOSubmitted(data, _qWo ? _qWo.id : undefined);
                 this.navigate('screenPlanning', false);
                 this.screenHistory = [];
+                return true;   // v407: de aanroeper weet dat de bon in de wachtrij staat
             } else {
                 // v206: GEEN fake-succes — de invoer blijft in woData bewaard.
                 this.toast('Kon werkbon niet in wachtrij plaatsen: ' + ((result && result.error) || 'onbekend') + ' — je invoer blijft bewaard', true);
@@ -6320,6 +6348,7 @@ const app = {
         } catch (e) {
             this.toast('Werkbon kon niet offline bewaard worden — je invoer blijft op dit toestel staan', true);
         }
+        return false;
     },
 
     // ========================================
@@ -6891,6 +6920,7 @@ const app = {
                 this.navigate('screenPlanning', false);
                 this.screenHistory = [];
                 this.loadPlanning();
+                this._reviewNaWerkbon(wo);  // v407: ook zonder factuur (nooit bij monteurs)
                 return;
             }
 
@@ -7209,6 +7239,7 @@ const app = {
                 this.navigate('screenPlanning', false);
                 this.screenHistory = [];
                 this.loadPlanning();
+                this._reviewNaFactuur(invoiceResult);  // v406
             }
 
         } catch (err) {
@@ -7227,10 +7258,12 @@ const app = {
                 const noInvoice = !!(document.getElementById('wbNoInvoice') &&
                                      document.getElementById('wbNoInvoice').checked);
                 if (noInvoice) {
-                    await this.queueWerkbonOffline(data, {
+                    const _rvWachtrij = await this.queueWerkbonOffline(data, {
                         signatureName, signatureData,
-                        paymentMethod: null, noInvoice: true,
+                        paymentMethod: null, noInvoice: true, wo,
                     });
+                    // v407: reviewscherm ook in de wachtrij-route (de app maakt de QR zelf, werkt zonder bereik)
+                    if (_rvWachtrij) this._reviewNaWerkbon(wo);
                 } else {
                     this.toast('Geen internet — werkbon NIET verstuurd: de klant moet kunnen betalen. Probeer opnieuw zodra er verbinding is; je invoer blijft bewaard.', true);
                 }
@@ -7382,7 +7415,7 @@ const app = {
                 // v206: monteur heeft geen handtekening/factuur; betaalmethode
                 // expliciet op null zodat geen oude selectie meelekt.
                 // v208: noInvoice-vlag → bureel-taak zegt niet "factuur aanmaken".
-                await this.queueWerkbonOffline(data, { paymentMethod: null, noInvoice: true });
+                await this.queueWerkbonOffline(data, { paymentMethod: null, noInvoice: true, wo });  // v407: snapshot van deze bon
             } else if (isNetworkError) {
                 this.toast('Werkbon staat al in Robaws, maar foto\'s konden niet verstuurd worden (verbinding weg). NIET opnieuw versturen.', true);
             } else {
@@ -7589,6 +7622,151 @@ const app = {
         this.loadPlanning();
     },
 
+    // ========================================
+    // v406: GOOGLE-REVIEW NA DE FACTUUR (vraag Levi, 24 sep 2026)
+    // Na het tekenen, de factuur en de betaling opent vanzelf een scherm met
+    // een QR-code naar de Google-reviewpagina van QE. De klant scant met de
+    // EIGEN gsm en schrijft de review daar, nooit op het toestel van de
+    // technieker (Google weert reviews vanaf het bedrijfstoestel). Neutraal
+    // gevraagd, aan iedereen, zonder beloning (Google-beleid, geen sterren
+    // of "tevreden?"-filter). Eén keer per factuur (localStorage
+    // qe_review_getoond); opnieuw tonen kan met de kaart op het tabblad
+    // Klaar. De QR maakt de app zelf met ZXing (zit al in de app voor de
+    // gasfles-scanner, werkt ook zonder bereik); terugval = afbeelding van
+    // api.qrserver.com. Momenten: QR/terminal na de viering; overschrijving
+    // (betaald en niet betaald), contant en via factuur bij het afronden.
+    // v407 (vraag Levi, 25 sep 2026): ook na "Geen factuur maken", online en
+    // in de offline-wachtrij, één keer per werkbon (sleutel w<planning-id>).
+    // Nooit bij monteurs.
+    // ========================================
+    REVIEW_URL: 'https://g.page/r/Cfa_8_XtScJ8EBM/review',
+
+    _reviewNaFactuur(invoiceResult) {
+        try {
+            const inv = (invoiceResult && invoiceResult.invoice) || {};
+            let id = inv.id || (invoiceResult && invoiceResult.invoiceId) || null;
+            if (!id) {
+                try { id = (JSON.parse(localStorage.getItem('qe_last_payment_context') || '{}') || {}).invoiceId || null; } catch (_) {}
+            }
+            const p = this.toonReviewQr({ sleutel: id ? 'f' + id : null });
+            if (p && p.catch) p.catch(e => console.warn('[Review] scherm mislukt (niet erg):', e && e.message));
+        } catch (e) { console.warn('[Review] scherm openen mislukt (niet erg):', e && e.message); }
+    },
+
+    /** v407: ook na "Geen factuur maken" (garantie, terugkomwerk), online en in de
+     *  offline-wachtrij. Eén keer per werkbon (sleutel w<planning-id>). Nooit bij monteurs. */
+    _reviewNaWerkbon(wo) {
+        try {
+            if (this.isMonteur()) return;
+            const id = (wo && wo.id != null) ? String(wo.id) : null;
+            const p = this.toonReviewQr({ sleutel: id ? 'w' + id : null });
+            if (p && p.catch) p.catch(e => console.warn('[Review] scherm mislukt (niet erg):', e && e.message));
+        } catch (e) { console.warn('[Review] scherm openen mislukt (niet erg):', e && e.message); }
+    },
+
+    _reviewLijst() {
+        try { const a = JSON.parse(localStorage.getItem('qe_review_getoond') || '[]'); return Array.isArray(a) ? a : []; }
+        catch (_) { return []; }
+    },
+
+    _reviewMarkeer(sleutel) {
+        try {
+            const a = this._reviewLijst().filter(x => x !== sleutel);
+            a.push(sleutel);
+            localStorage.setItem('qe_review_getoond', JSON.stringify(a.slice(-60)));
+        } catch (_) {}
+    },
+
+    /** Het reviewscherm. opts.sleutel = de factuur (één keer), opts.handmatig = altijd tonen. */
+    async toonReviewQr(opts) {
+        opts = opts || {};
+        if (document.getElementById('reviewQrScherm')) return;
+        const sleutel = opts.sleutel || null;
+        if (!opts.handmatig && sleutel) {
+            if (this._reviewLijst().indexOf(sleutel) >= 0) return;
+            this._reviewMarkeer(sleutel);
+        }
+        // de eerste 3 keer een hulplijntje voor de technieker
+        let hintN = 0;
+        try { hintN = parseInt(localStorage.getItem('qe_review_hint_n') || '0', 10) || 0; } catch (_) {}
+        const hint = hintN < 3;
+        if (hint) { try { localStorage.setItem('qe_review_hint_n', String(hintN + 1)); } catch (_) {} }
+
+        const ov = document.createElement('div');
+        ov.id = 'reviewQrScherm';
+        ov.setAttribute('role', 'dialog');
+        ov.setAttribute('aria-modal', 'true');
+        ov.setAttribute('aria-label', 'Review op Google');
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99994;background:var(--bg,#F4F2ED);overflow-y:auto;-webkit-overflow-scrolling:touch';
+        ov.innerHTML =
+            '<div style="min-height:100%;box-sizing:border-box;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:calc(22px + env(safe-area-inset-top)) 20px calc(26px + env(safe-area-inset-bottom))">' +
+                (hint ? '<div id="reviewQrHint" style="background:var(--btn,#26334B);color:var(--btnfg,#fff);border-radius:999px;padding:7px 14px;font-size:12.5px;font-weight:600;margin-bottom:18px">Nieuw: draai je gsm naar de klant</div>' : '') +
+                '<div style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent,#F99D3E)">Uw mening telt</div>' +
+                '<div style="font-size:27px;font-weight:800;letter-spacing:-0.6px;line-height:1.15;color:var(--ink,#26334B);margin-top:6px">Hoe vond u ons werk?</div>' +
+                '<div style="width:56px;height:3px;border-radius:2px;background:linear-gradient(90deg,#F99D3E,#6A2C91);margin:14px auto 0"></div>' +
+                '<div style="font-size:15px;line-height:1.5;color:var(--txt2,#3A4356);margin-top:14px;max-width:330px">Scan de code met de camera van uw gsm en laat een review achter op Google.</div>' +
+                '<div style="margin-top:20px;background:#fff;border-radius:22px;padding:14px;border:1px solid var(--cb,#E9E6DE);box-shadow:0 6px 24px rgba(38,51,75,0.10)">' +
+                    '<div id="reviewQrVak" style="width:min(66vw,270px);height:min(66vw,270px);display:flex;align-items:center;justify-content:center;color:#85847C;font-size:13px">QR-code laden…</div>' +
+                '</div>' +
+                '<div style="font-size:12.5px;line-height:1.5;color:var(--g1,#85847C);margin-top:16px;max-width:320px">Lukt het scannen niet? Zoek op Google naar <b style="color:var(--txt2,#3A4356)">Quality Environment Schoten</b>.</div>' +
+                '<button id="reviewQrKlaar" class="btn btn-primary btn-full" style="margin-top:22px;max-width:360px;padding:15px;font-size:16px" onclick="app.sluitReviewQr()">Klaar</button>' +
+            '</div>';
+        document.body.appendChild(ov);
+        try { if (window.QENative && QENative.schermAan) QENative.schermAan(true); } catch (_) {}   // scherm niet laten slapen
+
+        const vak = document.getElementById('reviewQrVak');
+        try {
+            await this._gfLaadZxing();
+            const svg = this._reviewQrSvg(window.ZXing, this.REVIEW_URL);
+            if (vak && document.body.contains(vak)) vak.innerHTML = svg;
+        } catch (e) {
+            console.warn('[Review] QR lokaal maken mislukt, terugval op afbeelding:', e && e.message);
+            if (vak && document.body.contains(vak)) {
+                vak.innerHTML = '<img alt="QR-code review op Google" style="width:100%;height:100%;padding:0;border-radius:0" src="https://api.qrserver.com/v1/create-qr-code/?size=600x600&ecc=M&margin=0&data=' + encodeURIComponent(this.REVIEW_URL) + '">';
+            }
+        }
+    },
+
+    sluitReviewQr() {
+        const ov = document.getElementById('reviewQrScherm');
+        if (ov) ov.remove();
+        try { if (window.QENative && QENative.schermAan) QENative.schermAan(false); } catch (_) {}
+    },
+
+    /** QR als SVG: foutcorrectie H, stille zone van 4 modules, het QE-beeldmerk in het
+     *  midden (de modules onder het logo vallen weg; H herstelt tot 30 %). */
+    _reviewQrSvg(Z, url) {
+        const code = Z.QRCodeEncoder.encode(url, Z.QRCodeDecoderErrorCorrectionLevel.H, new Map());
+        const m = code.getMatrix();
+        const n = m.getWidth();
+        const q = 4;
+        const L = n >= 33 ? 9 : 7;            // logovak in modules (oneven: precies in het midden)
+        const s0 = (n - L) / 2, s1 = s0 + L;
+        const vrij = (x, y) => x >= s0 && x < s1 && y >= s0 && y < s1;
+        let d = '';
+        for (let y = 0; y < n; y++) {
+            let x = 0;
+            while (x < n) {
+                if (m.get(x, y) === 1 && !vrij(x, y)) {
+                    let e = x;
+                    while (e < n && m.get(e, y) === 1 && !vrij(e, y)) e++;
+                    d += 'M' + (x + q) + ' ' + (y + q) + 'h' + (e - x) + 'v1h' + (x - e) + 'z';
+                    x = e;
+                } else x++;
+            }
+        }
+        const t = n + 2 * q, lx = s0 + q + 0.45, lw = L - 0.9;
+        return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + t + ' ' + t + '" width="100%" height="100%" role="img" aria-label="QR-code naar de reviewpagina van Quality Environment op Google" style="display:block">' +
+            '<rect width="' + t + '" height="' + t + '" fill="#fff"/>' +
+            '<path d="' + d + '" fill="#000" shape-rendering="crispEdges"/>' +
+            '<svg x="' + lx + '" y="' + lx + '" width="' + lw + '" height="' + lw + '" viewBox="32 30 134 134">' +
+                '<rect x="44" y="35" width="110" height="110" rx="2" fill="#F99D3E"/>' +
+                '<path d="M91.9 147 L96.8 143.3 L103.5 140 L110.1 138.4 L116.8 138 L123.4 139.4 L130 141.3 L136.6 144 L143.2 146.6 L149.8 148.6 L156.4 150 L163 151 L164.7 152 L163 153.3 L156.4 155.6 L149.8 157 L143.2 156.6 L136.6 155 L130 152.3 L123.4 150 L116.8 148 L110.1 147.3 L103.5 147.3 L96.8 148 Z" fill="#6A2C91"/>' +
+                '<circle cx="80.5" cy="89.8" r="37" fill="none" stroke="#6A2C91" stroke-width="21"/>' +
+            '</svg>' +
+        '</svg>';
+    },
+
     /** Heropen het laatste betaalscherm (overschrijving of Viva Wallet) */
     reopenLastPaymentScreen(type) {
         try {
@@ -7657,6 +7835,7 @@ const app = {
                 ? 'Factuur op betaald — bank vereffent het openstaande bedrag bij ontvangst'
                 : 'Factuur blijft op opmaak');
             this.closePaymentScreen();
+            this._reviewNaFactuur(invoiceResult);  // v406
         } catch (e) {
             console.error('[Overschrijving] status zetten faalde:', e);
             this.toast('Status zetten mislukt: ' + ((e && e.message) || e) + ' — probeer opnieuw', true);
@@ -7814,6 +7993,7 @@ const app = {
     },
 
     async _onQrBetaald(status, invoiceResult) {
+        let _rvGepland = false;  // v406: Google-review na de viering
         // Geanimeerde 'Betaling geslaagd'-celebratie (Claude Design "Betaling").
         try {
             if (window.QECeleb) {
@@ -7821,9 +8001,12 @@ const app = {
                 const _amt = (_inv.totalInclVat != null)
                     ? this.formatPrice(parseFloat(_inv.totalInclVat))
                     : (status && status.amount ? '€ ' + status.amount : '');
-                QECeleb.paymentSuccess({ amountText: _amt, methodLabel: 'Bancontact · QR code' });
+                QECeleb.paymentSuccess({ amountText: _amt, methodLabel: 'Bancontact · QR code',
+                    onDone: () => this._reviewNaFactuur(invoiceResult) });
+                _rvGepland = true;
             }
         } catch (e) { /* celebratie mag de betaling nooit breken */ }
+        if (!_rvGepland) setTimeout(() => this._reviewNaFactuur(invoiceResult), 800);  // v406: zonder viering
         // v250: eerlijk zijn over de boeking — betaald is zeker (Mollie),
         // maar als de Worker de kasbeweging (nog) niet kon boeken tonen we
         // dat i.p.v. blind "automatisch geboekt" (Mollie retry't de webhook,
@@ -8157,15 +8340,19 @@ const app = {
     },
 
     async _onTerminalBetaald(status, invoiceResult) {
+        let _rvGepland = false;  // v406: Google-review na de viering
         try {
             if (window.QECeleb) {
                 const _inv = (invoiceResult && invoiceResult.invoice) || {};
                 const _amt = (_inv.totalInclVat != null)
                     ? this.formatPrice(parseFloat(_inv.totalInclVat))
                     : (status && status.amount ? '€ ' + status.amount : '');
-                QECeleb.paymentSuccess({ amountText: _amt, methodLabel: 'Bancontact · Terminal' });
+                QECeleb.paymentSuccess({ amountText: _amt, methodLabel: 'Bancontact · Terminal',
+                    onDone: () => this._reviewNaFactuur(invoiceResult) });
+                _rvGepland = true;
             }
         } catch (e) { /* celebratie mag de betaling nooit breken */ }
+        if (!_rvGepland) setTimeout(() => this._reviewNaFactuur(invoiceResult), 800);  // v406: zonder viering
         // Eerlijk over de boeking, zoals bij QR (v250)
         const geboekt = !(status && status.robawsMarked === false && status.robawsError);
         const container = document.getElementById('overschrijvingContent');
@@ -14842,6 +15029,7 @@ const app = {
             this.navigate('screenPlanning', false);
             this.screenHistory = [];
             this.loadPlanning();
+            this._reviewNaFactuur(invoiceData);  // v406
             return;
         }
 
@@ -14945,11 +15133,13 @@ const app = {
         // al op de werkbon, dus de contante facturen blijven makkelijk
         // terugvindbaar. (Was v222: registreerde de betaling automatisch, wat
         // hier niet gewenst is.)
+        const _rvCash = this._cashCtx;  // v406: factuur voor het reviewscherm
         this._cashCtx = null;
         this.toast('Werkbon verstuurd — contant');
         this.navigate('screenPlanning', false);
         this.screenHistory = [];
         this.loadPlanning();
+        this._reviewNaFactuur({ invoice: { id: _rvCash && _rvCash.invoiceId, logicId: _rvCash && _rvCash.logicId } });  // v406
     },
 
     async startTerminalPayment(invoiceId, amount, ogm, invoiceLogicId) {
@@ -17314,6 +17504,16 @@ const app = {
                 }
             } catch(e) { console.warn('[App] Laatste betaling fetch fout:', e && e.message); }
 
+            // v406: Google-review opnieuw tonen (bv. te snel weggetikt)
+            // v407: ook zonder factuur (Geen factuur maken), nooit voor monteurs
+            if (!this.isMonteur()) {
+                paymentBtns +=
+                    '<div id="uitReviewKaart" onclick="app.toonReviewQr({ handmatig: true })" style="padding:13px 18px;border-radius:14px;background:var(--card);border:1px solid var(--cb);border-left:3px solid var(--accent,#F99D3E);box-shadow:0 2px 10px rgba(38,51,75,0.05);cursor:pointer;margin-bottom:12px">' +
+                        '<div style="font-size:13.5px;font-weight:600;color:var(--ink)">Google-review · QR-code tonen</div>' +
+                        '<div style="font-size:12.5px;color:var(--g1);margin-top:3px">De klant scant de code met de eigen gsm</div>' +
+                    '</div>';
+            }
+
             // v268 (Marble 1:1, prototype "UITGEVOERD"): pwash-infokaart +
             // platte werkbon-rijen met hairline i.p.v. kaarten/emoji's.
             // MOTOR-SYNC: alleen de HTML-opmaak wijkt af van 1.x.
@@ -18136,6 +18336,217 @@ const app = {
     },
     _uitklokOpmWis(workOrderId, employeeId) {
         try { localStorage.removeItem(this._uitklokOpmSleutel(workOrderId, employeeId)); } catch (_) {}
+    },
+
+    // ============================================================
+    // v409: LADEN & LOSSEN → WERF KIEZEN (vraag Levi 28 sep 2026)
+    // Bij het afsluiten van laden & lossen MOET de werknemer de werf
+    // (dagplanning) kiezen waar die uren bij horen. Volledig scherm zoals
+    // het km-formulier: eerst de dagplanningen van vandaag, met pijltjes
+    // naar vorige dagen. Geen keuze = geen afsluiting (de L&L blijft lopen).
+    // ============================================================
+
+    /**
+     * @param {object} session  klok-sessie (employeeId, llStartTime, llWerfKeuze)
+     * @param {object} info     { van: 'HH:MM', minuten: n } — voor het kopje
+     * @returns {Promise<object|null>} gekozen werf, of null bij annuleren
+     */
+    async promptLnlWerf(session, info) {
+        const inf = info || {};
+        const user = this.currentUser || RobawsAPI.getLoggedInUser() || {};
+        const empId = String((session && session.employeeId) || user.robawsEmployeeId || '');
+        const userId = user.robawsUserId != null ? String(user.robawsUserId) : '';
+        const vandaag = this._localDateStr(new Date());
+        const esc = (s) => this.escapeHtml(String(s == null ? '' : s));
+        // een vorig, nog open keuzescherm netjes afsluiten (dubbele scan)
+        if (typeof this._lnlWerfResolve === 'function') { try { this._lnlWerfResolve(null); } catch (_e) {} }
+        return new Promise((resolve) => {
+            this._lnlWerfResolve = resolve;
+            let m = document.getElementById('lnlWerfModal');
+            if (m) m.remove();
+            m = document.createElement('div');
+            m.id = 'lnlWerfModal';
+            m.style.cssText = 'position:fixed;inset:0;z-index:99998;background:var(--bg,var(--qe-white,#fff));display:flex;animation:mbSheet 0.35s cubic-bezier(0.22,1,0.36,1)';
+            const duurTekst = inf.van
+                ? ('Gestart om ' + esc(inf.van) + (inf.minuten != null ? ' · loopt al ' + esc(inf.minuten) + ' min' : ''))
+                : 'Laden & lossen loopt';
+            m.innerHTML = `
+                <div style="display:flex;flex-direction:column;width:100%;height:100%;box-sizing:border-box">
+                    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:18px 20px 4px">
+                        <div style="flex:1;min-width:0">
+                            <div style="font:400 22px var(--font,inherit);letter-spacing:-0.5px;color:var(--ink,var(--qe-darkblue,#001E45))">Laden &amp; lossen — welke werf?</div>
+                            <div style="font-size:13px;color:var(--g2,var(--qe-grey,#666));margin-top:3px;line-height:1.4">Kies de werf (dagplanning) waar deze uren bij horen. Zonder werf kan je niet afsluiten.</div>
+                            <div style="display:inline-block;margin-top:8px;font-size:12.5px;font-weight:700;padding:4px 10px;border-radius:999px;color:var(--purple2,#6A2C91);background:var(--pwash,var(--wash,#EFEDE6))">📦 ${duurTekst}</div>
+                        </div>
+                        <button id="lnlWerfClose" type="button" aria-label="Sluiten" style="width:36px;height:36px;border-radius:50%;border:1px solid var(--b1,#ddd);background:none;color:var(--g2,var(--qe-grey,#666));font-size:15px;cursor:pointer;flex-shrink:0">✕</button>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;padding:10px 20px 6px">
+                        <button id="lnlWerfVorige" type="button" class="btn btn-outline" style="flex:0 0 auto;padding:9px 12px;min-width:44px" aria-label="Vorige dag">‹</button>
+                        <div id="lnlWerfDatum" style="flex:1;text-align:center;font-weight:700;color:var(--ink);font-size:14px;line-height:1.3"></div>
+                        <button id="lnlWerfVolgende" type="button" class="btn btn-outline" style="flex:0 0 auto;padding:9px 12px;min-width:44px" aria-label="Volgende dag">›</button>
+                    </div>
+                    <div id="lnlWerfLijst" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:6px 20px 16px"></div>
+                    <div style="padding:10px 20px 16px;border-top:1px solid var(--cb,var(--b1,#e5e2da));background:var(--bg,#fff)">
+                        <button id="lnlWerfOk" type="button" disabled style="width:100%;padding:16px;background:var(--btn);color:var(--btnfg);border:none;border-radius:2px;font:600 14px var(--font);cursor:pointer;opacity:.45">Afsluiten en uren op deze werf zetten</button>
+                        <button id="lnlWerfCancel" type="button" style="width:100%;margin-top:8px;padding:12px;border:none;background:none;color:var(--g1,var(--qe-grey,#888));font-size:13px;font-weight:500;cursor:pointer">Annuleren — laden &amp; lossen blijft lopen</button>
+                    </div>
+                </div>`;
+            document.body.appendChild(m);
+
+            const st = { datum: vandaag, cache: {}, keuze: null, laden: false, andereOpen: false, eerste: true };
+            const onthouden = (session && session.llWerfKeuze) || null;
+            const lijstEl = m.querySelector('#lnlWerfLijst');
+            const datumEl = m.querySelector('#lnlWerfDatum');
+            const okBtn = m.querySelector('#lnlWerfOk');
+            const vorigeBtn = m.querySelector('#lnlWerfVorige');
+            const volgendeBtn = m.querySelector('#lnlWerfVolgende');
+            const oudste = this._localDateStr(new Date(), -RobawsAPI.LNL_KEUZE_DAGEN_TERUG);
+            const schuif = (datum, dagen) => this._localDateStr(new Date(datum + 'T12:00:00'), dagen);
+            const datumLabel = (d) => {
+                let t = '';
+                try { t = new Date(d + 'T12:00:00').toLocaleDateString('nl-BE', { weekday: 'long', day: 'numeric', month: 'long' }); } catch (_e) { t = d; }
+                if (d === vandaag) return 'Vandaag · ' + t;
+                if (d === schuif(vandaag, -1)) return 'Gisteren · ' + t;
+                return t;
+            };
+            const zetOk = () => {
+                const kan = !!st.keuze;
+                okBtn.disabled = !kan;
+                okBtn.style.opacity = kan ? '1' : '.45';
+            };
+            const chip = (kleur, bg, tekst) => '<span style="display:inline-block;font-size:12px;font-weight:700;padding:3px 9px;border-radius:999px;margin-top:6px;color:' + kleur + ';background:' + bg + '">' + tekst + '</span>';
+            const kaart = (it, kiesbaar) => {
+                const gekozen = st.keuze && st.keuze.planningId === it.planningId && st.keuze.werfDatum === st.datum;
+                const b = it.werkbon;
+                let status = '';
+                if (b && b.vergrendeld) status = chip('var(--amber2,#E88A2A)', 'var(--awash2,#F7E9D8)', '🔒 werkbon ' + esc(b.nr) + ' is afgesloten door het bureel — gaat via een taak');
+                else if (b && b.vanMij) status = chip('var(--green2,#2E7042)', 'var(--gwash,#EDF3EE)', 'werkbon ' + esc(b.nr) + ' verstuurd' + (b.lnlUren ? ' · al ' + esc(RobawsAPI.lnlUrenTekst(b.lnlUren)) + ' L&amp;L erop' : ''));
+                else if (b) status = chip('var(--g2,#666)', 'var(--wash,#EFEDE6)', 'werkbon ' + esc(b.nr) + ' van een collega');
+                else if (it.eigen) status = chip('var(--amber2,#E88A2A)', 'var(--awash2,#F7E9D8)', 'werkbon nog niet verstuurd — de uren komen erbij zodra je hem verstuurt');
+                else status = chip('var(--g2,#666)', 'var(--wash,#EFEDE6)', 'nog geen werkbon — niet te kiezen');
+                if (it.wachtUren) status += ' ' + chip('var(--purple2,#6A2C91)', 'var(--pwash,var(--wash,#EFEDE6))', esc(RobawsAPI.lnlUrenTekst(it.wachtUren)) + ' L&amp;L wacht al op deze werkbon');
+                const kop = it.klant || it.titel || 'Dagplanning #' + it.planningId;
+                const sub = (it.klant && it.titel && it.titel !== it.klant) ? it.titel : '';
+                const tijd = it.start ? (it.start + (it.eind ? ' – ' + it.eind : '')) : '';
+                return '<div class="lnl-kaart" data-pid="' + esc(it.planningId) + '" role="' + (kiesbaar ? 'radio' : 'presentation') + '" aria-checked="' + (gekozen ? 'true' : 'false') + '"'
+                    + ' style="display:flex;gap:12px;align-items:flex-start;padding:12px 14px;margin-bottom:10px;border-radius:14px;background:var(--card,#FDFCFA);'
+                    + 'border:2px solid ' + (gekozen ? 'var(--accent,#F99D3E)' : 'var(--cb,#e5e2da)') + ';' + (kiesbaar ? 'cursor:pointer' : 'opacity:.55') + '">'
+                    + '<div style="flex:0 0 22px;height:22px;margin-top:1px;border-radius:50%;border:2px solid ' + (gekozen ? 'var(--accent,#F99D3E)' : 'var(--b2,#c9c5bb)') + ';display:flex;align-items:center;justify-content:center">'
+                    + (gekozen ? '<div style="width:11px;height:11px;border-radius:50%;background:var(--accent,#F99D3E)"></div>' : '') + '</div>'
+                    + '<div style="flex:1;min-width:0">'
+                    + '<div style="font-size:15px;font-weight:700;color:var(--ink);line-height:1.3">' + esc(kop) + '</div>'
+                    + (sub ? '<div style="font-size:13px;color:var(--qe-darkblue,var(--ink));margin-top:2px">' + esc(sub) + '</div>' : '')
+                    + (it.adres ? '<div style="font-size:12.5px;color:var(--g2,#666);margin-top:3px">' + this.icon('map-pin', { size: 13, style: 'vertical-align:-2px' }) + ' ' + esc(it.adres) + '</div>' : '')
+                    + (tijd ? '<div style="font-size:12.5px;color:var(--g2,#666);margin-top:2px">' + this.icon('clock', { size: 13, style: 'vertical-align:-2px' }) + ' ' + esc(tijd) + '</div>' : '')
+                    + '<div>' + status + '</div>'
+                    + '</div></div>';
+            };
+            const render = () => {
+                datumEl.textContent = datumLabel(st.datum);
+                vorigeBtn.disabled = st.datum <= oudste;
+                volgendeBtn.disabled = st.datum >= vandaag;
+                vorigeBtn.style.opacity = vorigeBtn.disabled ? '.4' : '1';
+                volgendeBtn.style.opacity = volgendeBtn.disabled ? '.4' : '1';
+                const d = st.cache[st.datum];
+                if (st.laden || !d) {
+                    lijstEl.innerHTML = '<div style="padding:26px 0;text-align:center;color:var(--g2,#666);font-size:13px">Werven van deze dag ophalen…</div>';
+                    zetOk();
+                    return;
+                }
+                if (d.fout) {
+                    lijstEl.innerHTML = '<div class="empty-state" style="padding:20px 0"><div class="empty-icon">' + this.icon('alert', { size: 40, stroke: 1.6 }) + '</div>'
+                        + '<h3>Werven ophalen mislukt</h3><p style="font-size:12.5px;color:var(--qe-grey);word-break:break-word">' + esc(d.fout) + '</p>'
+                        + '<button type="button" class="btn btn-primary btn-sm" id="lnlWerfOpnieuw">Opnieuw proberen</button></div>';
+                    const ob = lijstEl.querySelector('#lnlWerfOpnieuw');
+                    if (ob) ob.onclick = () => { delete st.cache[st.datum]; laad(st.datum); };
+                    zetOk();
+                    return;
+                }
+                let h = '';
+                if (d.eigen.length) {
+                    h += '<div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--amber2,#E88A2A);margin:6px 0 8px">Jouw werven</div>';
+                    h += d.eigen.map(it => kaart(it, it.kiesbaar)).join('');
+                } else {
+                    h += '<div style="padding:16px 14px;margin:6px 0 10px;border-radius:12px;background:var(--card,#FDFCFA);border:1px solid var(--cb,#e5e2da);font-size:13.5px;color:var(--ink);line-height:1.45">'
+                        + '<b>Geen dagplanning voor jou op deze dag.</b><br><span style="color:var(--g2,#666)">Ga met de pijl naar een vorige dag' + (d.andere.length ? ', of kies hieronder een andere werf van deze dag' : '') + '.</span></div>';
+                }
+                if (d.andere.length) {
+                    h += '<button type="button" id="lnlWerfAndere" style="width:100%;text-align:left;padding:10px 0;border:none;background:none;color:var(--purple2,#6A2C91);font:600 13px var(--font,inherit);cursor:pointer">'
+                        + (st.andereOpen ? '▾' : '▸') + ' Andere werven van deze dag (' + d.andere.length + ')</button>';
+                    if (st.andereOpen) h += d.andere.map(it => kaart(it, it.kiesbaar)).join('');
+                }
+                lijstEl.innerHTML = h;
+                const ab = lijstEl.querySelector('#lnlWerfAndere');
+                if (ab) ab.onclick = () => { st.andereOpen = !st.andereOpen; render(); };
+                lijstEl.querySelectorAll('.lnl-kaart[role="radio"]').forEach(el => {
+                    el.onclick = () => {
+                        const pid = el.getAttribute('data-pid');
+                        const it = d.eigen.concat(d.andere).find(x => x.planningId === pid);
+                        if (!it || !it.kiesbaar) return;
+                        st.keuze = Object.assign({ werfDatum: st.datum }, it);
+                        render();
+                    };
+                });
+                zetOk();
+            };
+            const laad = async (datum) => {
+                st.laden = true;
+                render();
+                try {
+                    st.cache[datum] = await RobawsAPI.getLnlWerfKeuzes(datum, { employeeId: empId, userId: userId });
+                } catch (e) {
+                    st.cache[datum] = { fout: (e && e.message) || String(e), eigen: [], andere: [] };
+                }
+                st.laden = false;
+                if (st.datum !== datum) return;   // intussen van dag gewisseld
+                const d = st.cache[datum];
+                if (!d.fout) {
+                    // onthouden keuze (herkansing) of de enige eigen werf vooraf aanvinken
+                    const alle = d.eigen.concat(d.andere);
+                    let vooraf = null;
+                    if (onthouden && String(onthouden.werfDatum) === datum) vooraf = alle.find(x => x.planningId === String(onthouden.planningId) && x.kiesbaar) || null;
+                    if (!vooraf && st.eerste && d.eigen.length === 1 && d.eigen[0].kiesbaar) vooraf = d.eigen[0];
+                    if (vooraf && !st.keuze) st.keuze = Object.assign({ werfDatum: datum }, vooraf);
+                }
+                st.eerste = false;
+                render();
+            };
+            const sluit = (uit) => {
+                this._lnlWerfResolve = null;
+                try { m.remove(); } catch (_e) {}
+                resolve(uit);
+            };
+            vorigeBtn.onclick = () => { if (st.datum <= oudste) return; st.datum = schuif(st.datum, -1); if (st.cache[st.datum]) render(); else laad(st.datum); };
+            volgendeBtn.onclick = () => { if (st.datum >= vandaag) return; st.datum = schuif(st.datum, 1); if (st.cache[st.datum]) render(); else laad(st.datum); };
+            m.querySelector('#lnlWerfClose').onclick = () => sluit(null);
+            m.querySelector('#lnlWerfCancel').onclick = () => sluit(null);
+            okBtn.onclick = () => {
+                if (!st.keuze) return;
+                const k = st.keuze;
+                sluit({
+                    planningId: k.planningId, werfDatum: k.werfDatum, projectId: k.projectId || null,
+                    titel: k.titel || '', klant: k.klant || '', adres: k.adres || '', eigen: !!k.eigen,
+                    werkbon: k.werkbon ? { id: k.werkbon.id, nr: k.werkbon.nr, vergrendeld: !!k.werkbon.vergrendeld, vanMij: !!k.werkbon.vanMij } : null,
+                });
+            };
+            if (onthouden && onthouden.werfDatum && onthouden.werfDatum !== vandaag && onthouden.werfDatum >= oudste) st.datum = String(onthouden.werfDatum);
+            render();
+            laad(st.datum);
+        });
+    },
+
+    /** Wachtende L&L-regels stil doorsturen (na het openen van de app en bij de 5-min-poll). */
+    _lnlWachtStil(vertraging) {
+        try {
+            const u = this.currentUser || {};
+            if (!u.robawsEmployeeId) return;
+            if (!RobawsAPI.lnlWachtLees().length) return;   // niets te doen = geen calls
+            setTimeout(() => {
+                RobawsAPI.lnlWachtVerwerk({ employeeId: u.robawsEmployeeId, userId: u.robawsUserId })
+                    .then(r => { if (r && r.verwerkt) this.toast('Laden & lossen: ' + r.verwerkt + ' regel' + (r.verwerkt === 1 ? '' : 's') + ' op de werf-werkbon gezet'); })
+                    .catch(() => {});
+            }, vertraging == null ? 4000 : vertraging);
+        } catch (_e) {}
     },
 
     /**
@@ -19100,6 +19511,7 @@ const app = {
         // garantie dat gequeue'de werkbonnen binnen 5 min na herstel vertrekken.
         // (Fire-and-forget; processOfflineQueue stopt zelf direct bij count=0.)
         this.processOfflineQueue();
+        this._lnlWachtStil(500);   // v409: wachtende L&L-regels (geen calls als er niets wacht)
         if (!navigator.onLine) return;
         // (v307 / 1.x v302) scherm uit / app in achtergrond → poll-tik overslaan
         // (de wachtrij-poging hierboven blijft wél lopen; bij terugkeren pakt de
@@ -20505,14 +20917,65 @@ const app = {
     },
 
     openOrganisatie() {
-        if (!this._orgMagProjecten()) { this.navigate('screenAanvragen'); return; }
+        // v408: de hub bestaat voor iedereen (Aanvragen + Rekenmachine; Projecten enkel bureel)
         this.navigate('screenOrganisatie');
+    },
+
+    // ========================================
+    // v408: REKENMACHINE — Organisatie → Rekenmachine. Motor, modules en UI zijn
+    // dezelfde bestanden als in de hub (bron QE-Software/, kopie via sync-reken.js);
+    // ze worden pas geladen bij het eerste openen (±120 KB, geen OTA-gewicht bij het opstarten).
+    // ========================================
+    openReken(id) {
+        this._rekenOpenId = id || null;
+        this.navigate('screenReken', true);
+    },
+    _rkScript(pad) {
+        return new Promise((ok, nee) => {
+            const sc = document.createElement('script');
+            sc.src = pad;
+            sc.onload = () => ok();
+            sc.onerror = () => nee(new Error(pad + ' laden mislukt'));
+            document.head.appendChild(sc);
+        });
+    },
+    _rekenLaad() {
+        if (window.QERekenUI) return Promise.resolve();
+        if (this._rekenBelofte) return this._rekenBelofte;
+        const lijst = ['js/reken-kern.js', 'js/reken-mod-verwarming.js', 'js/reken-mod-sanitair.js', 'js/reken-mod-elektriciteit.js', 'js/reken-mod-ventilatie.js', 'js/reken-mod-omrekenen.js', 'js/reken-ui.js'];
+        this._rekenBelofte = lijst.reduce((p, pad) => p.then(() => this._rkScript(pad)), Promise.resolve())
+            .then(() => { if (!window.QERekenUI) throw new Error('QERekenUI ontbreekt'); })
+            .catch(e => { this._rekenBelofte = null; throw e; });
+        return this._rekenBelofte;
+    },
+    loadReken() {
+        const host = document.getElementById('rekenHost');
+        if (!host) return;
+        if (this._reken) {
+            if (this._rekenOpenId) { this._reken.open(this._rekenOpenId); this._rekenOpenId = null; }
+            return;
+        }
+        host.innerHTML = '<div class="spinner"></div>';
+        this._rekenLaad().then(() => {
+            if (this._reken) return;
+            this._reken = QERekenUI.mount(host, {
+                onTitel: (t) => { if (this.currentScreen === 'screenReken') { const el = document.getElementById('headerTitle'); if (el) el.textContent = t; } },
+                toast: (t) => this.toast(t)
+            });
+            if (this._rekenOpenId) { this._reken.open(this._rekenOpenId); this._rekenOpenId = null; }
+        }).catch(e => {
+            host.innerHTML = '<p class="text-grey text-sm text-center">De rekenmachine kon niet laden: ' + ((e && e.message) || e) + '</p>';
+        });
     },
 
     loadOrganisatie() {
         try { this._refreshAanvraagGoedkeurCount(); } catch (_e) {}
+        // v408: Projecten-kaart alleen voor bureel met het recht (de hub is nu voor iedereen)
+        const mag = this._orgMagProjecten();
+        const kp = document.getElementById('orgKaartProjecten');
+        if (kp) kp.style.display = mag ? '' : 'none';
         const sub = document.getElementById('orgProjectenSub');
-        if (!sub) return;
+        if (!sub || !mag) return;
         Promise.all([RobawsAPI.getProjectenOverzicht(), RobawsAPI.getActiveEmployees().catch(() => [])]).then(([lijst, emps]) => {
             this._prjLijst = lijst;
             this._prjZetLeiders(emps);

@@ -78,7 +78,7 @@
             ['Ik ben vergeten in te klokken!', 'Geen paniek. Klok → Mijn uren bekijken → tik op de dag → kies "Vergeten in te klokken". Kantoor zet het recht.'],
             ['De tag doet niets.', '1) Kijk of NFC aan staat. 2) Haal je telefoon uit een dikke hoes. 3) Houd de bóvenkant tegen de tag en tel tot twee. Blijft het niet lukken? Bel — dan wordt je tijd handmatig gezet.'],
             ['Moet ik ook inklokken als ik rechtstreeks naar de werf rijd?', 'Scan dan de tag in de camionet. Geen tag in de buurt? Bel het bureau, zij klokken je in.'],
-            ['Wat is "L&L" / laden & lossen?', 'Een aparte tag voor laden en lossen ná je werkuren. Die uren komen apart op je telling. Alleen gebruiken als het je gevraagd wordt.'],
+            ['Wat is "L&L" / laden & lossen?', 'Een aparte tag voor laden en lossen ná je werkuren. Die uren komen apart op je telling. Bij het stoppen kies je de werf (dagplanning) waar die uren bij horen — zonder werf kan je L&L niet afsluiten. Alleen gebruiken als het je gevraagd wordt.'],
             ['Ik was te vroeg. Krijg ik die tijd betaald?', 'Je uren tellen vanaf je startuur. Vroeger komen mag, maar de teller start op je normale beginuur.'],
         ] },
     ] },
@@ -271,6 +271,19 @@
         ] },
     ] },
 
+    { slug: 'review', deel: 'Betalen bij de klant', rol: 'technieker', kick: 'Na het versturen', titel: 'Google-review vragen', lead: 'Na de betaling, of meteen na het versturen bij "Geen factuur maken", toont de app een QR-code. Draai je gsm naar de klant.', scherm: 'screenUitgevoerd', blokken: [
+        { t: 'stap', n: 1, h: 'Na de betaling opent vanzelf het scherm <b>"Hoe vond u ons werk?"</b> met een QR-code. Bij QR-code en Bancontact komt het na "Betaald", bij contant, overschrijving en via factuur zodra je afrondt. Bij <b>"Geen factuur maken"</b> komt het meteen na het versturen, ook zonder internet.' },
+        { t: 'stap', n: 2, h: '<b>Draai je gsm naar de klant</b> en vraag het gewoon: <i>"Wilt u ons een review geven op Google? Scan deze code met de camera van uw gsm."</i>' },
+        { t: 'stap', n: 3, h: 'De klant scant met de <b>eigen gsm</b> en schrijft de review daar. Tik daarna op <b>"Klaar"</b>.' },
+        { t: 'letop', h: '<b>Schrijf nooit zelf een review</b> voor de klant, niet op jouw gsm en niet op die van de klant. Beloof geen korting of cadeau. En vraag het <b>aan iedereen</b>, ook als het werk niet vlot liep. Anders verwijdert Google de reviews en kan het ons bedrijfsprofiel straffen.' },
+        { t: 'faq', items: [
+            ['Ik tikte te snel op "Klaar".', 'Ga naar het tabblad Klaar en tik op "Google-review · QR-code tonen".'],
+            ['Het scherm kwam niet.', 'Het komt één keer per werkbon. Via het tabblad Klaar kan je het altijd tonen.'],
+            ['De klant heeft geen smartphone.', 'Geen probleem, tik op "Klaar". Wie wil, zoekt later op Google naar Quality Environment Schoten.'],
+            ['Scannen lukt niet.', 'Hou je gsm stil, op 20 à 30 cm van de camera van de klant. Lukt het echt niet: onderaan het scherm staat hoe de klant ons op Google vindt.'],
+        ] },
+    ] },
+
     /* ══ DEEL: NAKIJKEN & RECHTZETTEN ══ */
     { slug: 'uitklokken', deel: 'Nakijken & rechtzetten', kick: 'Einde van de dag', titel: 'Uitklokken + kilometers', lead: 'Scan de tag. Vul je kilometers in. Bevestig. In die volgorde.', scherm: 'screenClock', blokken: [
         { t: 'stap', n: 1, h: 'Houd je telefoon <b>tegen de NFC-tag</b>, net zoals ’s morgens.' },
@@ -286,7 +299,7 @@
             ['Ik weet mijn kilometers niet precies.', 'Kijk op de teller van de camionet, of schat eerlijk. Zelfde rit als altijd? Dan weet je het getal zo.'],
             ['Ik reed rechtstreeks van de werf naar huis.', 'Vink dan het vakje "Rechtstreeks van werf naar thuis gereden" aan op het kilometer-scherm.'],
             ['Ik was passagier, moet ik ook km invullen?', 'Vul de rit in en kies "Passagier" bij mobiliteit. Dan klopt alles voor de administratie.'],
-            ['Ik moet ’s avonds nog laden voor morgen.', 'Dat is L&L (laden & lossen): scan de aparte L&L-tag ná je gewone uitklok. Die uren komen er netjes bij.'],
+            ['Ik moet ’s avonds nog laden voor morgen.', 'Dat is L&L (laden & lossen): scan de aparte L&L-tag ná je gewone uitklok. Bij de tweede scan kies je de werf waar die uren bij horen (vandaag, of met de pijl een vorige dag). Die uren komen er netjes bij.'],
         ] },
     ] },
 
@@ -472,7 +485,7 @@
             ['Uurcode', 'Het soort uren op de werkorder. Staat bijna altijd al juist — alleen veranderen als kantoor het vraagt.'],
             ['Overuren', 'Uren boven de 8 per dag, en álle uren in het weekend. De app rekent ze zelf uit.'],
             ['Kwartier-afronding', 'Je kloktijd wordt afgerond op kwartieren, met 4 minuten speling (06:48 telt als 06:45).'],
-            ['L&L (laden & lossen)', 'Aparte tag voor laden/lossen ná je werkuren. Alleen gebruiken als het gevraagd wordt.'],
+            ['L&L (laden & lossen)', 'Aparte tag voor laden/lossen ná je werkuren. Bij het stoppen kies je de werf waar de uren bij horen. Alleen gebruiken als het gevraagd wordt.'],
             ['Wacht(dienst)', 'De technieker die die week oproepbaar is buiten de uren. Zie de wacht-balk boven je planning; het bureau plant de beurtrol.'],
             ['Wachtrij', 'Waar je werkbon even wacht als er geen internet is. Vertrekt vanzelf zodra er weer bereik is.'],
             ['Synchroniseren', 'Alles wat nog op je telefoon klaarstond alsnog versturen. Knop onderaan het Klok-scherm.'],
