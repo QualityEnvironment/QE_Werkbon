@@ -299,6 +299,7 @@ const RobawsAPI = {
         OFFERTES:       '5',  // Vince
         KEURINGEN:      '5',  // Vince
         URENBEWAKING:   '8',  // Levi
+        MATERIEEL:      '8',  // Levi — defect gemeld via een materieel-tag (v419)
     },
     /** v384: mag de ingelogde persoon dit app-onderdeel zien? Geen lijst in
      *  localStorage = geen beperking (ook nieuwe onderdelen zichtbaar). */
@@ -404,6 +405,7 @@ const RobawsAPI = {
         else localStorage.removeItem('qe_app_tools');
         if (j && Array.isArray(j.tools)) localStorage.setItem('qe_app_tools_bekend', JSON.stringify(j.tools.map(t => t.key)));
         if (j && j.gasConfig) this.gasConfigZet(j.gasConfig);   // v403
+        if (j && Object.prototype.hasOwnProperty.call(j, 'wwvTag')) this.wwvTagZet(j.wwvTag);   // v417
         // alleen een Worker die de logistiek-keuze kent (v436) mag die bijwerken
         if (j && j.logistiek && j.logistiek.personen) {
             const l = j.logistiek.personen[em];
@@ -411,7 +413,7 @@ const RobawsAPI = {
         }
         return JSON.stringify([localStorage.getItem('qe_app_tools'), localStorage.getItem('qe_app_logistiek')]) !== voor;
     },
-    TASK_KEYS: { FACTUREN: 'facturen', OPVOLGING: 'opvolging', ARTIKELS: 'artikels', URENAANPASSING: 'urenAanpassing', OFFERTES: 'offertes', KEURINGEN: 'keuringen', URENBEWAKING: 'urenBewaking' },
+    TASK_KEYS: { FACTUREN: 'facturen', OPVOLGING: 'opvolging', ARTIKELS: 'artikels', URENAANPASSING: 'urenAanpassing', OFFERTES: 'offertes', KEURINGEN: 'keuringen', URENBEWAKING: 'urenBewaking', MATERIEEL: 'materieel' },
     _taakGebruikers: {},
     _taakOntvangersToepassen(map) {
         if (!map || typeof map !== 'object') return;
@@ -1903,6 +1905,10 @@ const RobawsAPI = {
             case 'in':     return wie + ' leverde ze in bij de leverancier';
             case 'uit':    return wie + ' zette ze weer in huur';
             case 'nieuw':  return 'Geregistreerd door ' + wie;
+            // v419: materieel-tags (NFC)
+            case 'defect': return wie + ' meldde een defect' + (naar ? ': ' + naar : '');
+            case 'ok':     return wie + ' meldde: weer in orde' + (naar ? ' (' + naar + ')' : '');
+            case 'koppel': return 'NFC-tag ' + (naar || 'gekoppeld') + ' door ' + wie;
             default:       return wie + (naar ? ' · ' + naar : '');
         }
     },
@@ -2669,6 +2675,111 @@ const RobawsAPI = {
         return true;
     },
 
+    // =============================================================
+    // v419: MATERIEEL-TAGS (NFC). De tag draagt als EERSTE record het
+    // QE-merkteken (MIME application/vnd.qe.materieel): enkel zo'n tag opent de
+    // app (APK 1.246) — een bankkaart of klok-tag nooit, dus een betaling wordt
+    // niet onderbroken. Het tag-ID staat in "NFC Tag"; het logboek deelt het veld
+    // "Fles logboek" met de gasflessen (zelfde vorm, zelfde woorden in app, hub en
+    // Worker): mee · terug · defect · ok · koppel · plaats · wie.
+    // =============================================================
+    MAT_NFC_MIME: 'application/vnd.qe.materieel',
+    MAT_NFC_URL: 'https://mijnqe.be/t/',
+    // v420: KLOK-tags openen de app (APK 1.247). Eigen merkteken: een klok-tag telt nooit als
+    // materieel en omgekeerd. De klok zelf blijft op het tag-ID werken.
+    KLOK_NFC_MIME: 'application/vnd.qe.klok',
+    /** Draagt de gelezen tag (event "nfc") het QE-klokmerkteken? */
+    klokNfcHeeftMerk(d) {
+        const recs = (d && Array.isArray(d.ndef)) ? d.ndef : [];
+        const mt = this.KLOK_NFC_MIME;
+        return recs.some(r => r && (String(r.mime || '').toLowerCase() === mt || String(r.type || '').toLowerCase() === mt));
+    },
+    /** Schrijfopdracht voor één klok-tag (brug v4, APK 1.247): enkel het klok-merkteken, enkel díe tag. */
+    klokNfcSchrijfOpdracht(uid, opties) {
+        const o = opties || {};
+        return { records: [{ soort: 'mime', mime: this.KLOK_NFC_MIME, tekst: '1' }],
+            alleen: [String(uid || '').replace(/[^0-9a-f]/gi, '').toUpperCase()],
+            vergrendel: !!o.vergrendel, geldigSec: Math.max(5, Math.min(300, Number(o.geldigSec) || 60)) };
+    },
+    /** Draagt de gelezen tag (event "nfc" van de APK) het QE-merkteken? */
+    matNfcHeeftMerk(d) {
+        const recs = (d && Array.isArray(d.ndef)) ? d.ndef : [];
+        const mt = this.MAT_NFC_MIME;
+        return recs.some(r => r && (String(r.mime || '').toLowerCase() === mt || String(r.type || '').toLowerCase() === mt));
+    },
+    /** Schrijfopdracht voor de APK. Brug v3 (APK 1.246): merkteken eerst, dan het
+     *  webadres met het tag-ID (iPhone of gsm zonder de app), tags in gebruik
+     *  weigeren. Brug v2 (APK 1.245): enkel het merkteken (één record). */
+    matNfcSchrijfOpdracht(apiVersie, opties) {
+        const o = opties || {};
+        const sec = Math.max(5, Math.min(300, Number(o.geldigSec) || 60));
+        if (Number(apiVersie) >= 3) {
+            const records = [{ soort: 'mime', mime: this.MAT_NFC_MIME, tekst: '1' }];
+            if (!o.zonderUrl) records.push({ soort: 'url', url: this.MAT_NFC_URL + '{uid}' });
+            return { records, weiger: (o.weiger || []).map(x => String(x).toUpperCase()), vergrendel: !!o.vergrendel, geldigSec: sec };
+        }
+        return { mime: this.MAT_NFC_MIME, base64: 'MQ==', vergrendel: !!o.vergrendel, geldigSec: sec };
+    },
+    /** Het gemelde defect dat nog openstaat: de laatste 'defect' zonder 'ok' erna. */
+    matDefect(m) {
+        for (const r of this.gasLog(m)) {   // nieuwste eerst
+            if (r.a === 'ok') return null;
+            if (r.a === 'defect') return r;
+        }
+        return null;
+    },
+    /** Enkel een logregel ('defect' | 'ok' | 'koppel'); geeft het verse materiaal terug. */
+    async matLogRegel(materialId, a, n, wie) {
+        return await this._gasSchrijf(materialId, {}, { a, n: n ? String(n).slice(0, 200) : null, wie: wie || null });
+    },
+    /** Tag koppelen + logregel in één merge-PATCH; teruglezen als bewijs. */
+    async matTagZet(materialId, uid, wie) {
+        const tag = uid ? String(uid).trim().toLowerCase() : null;
+        const na = await this._gasSchrijf(materialId,
+            { extraFields: { 'NFC Tag': { type: 'TEXT', stringValue: tag } } },
+            wie ? { a: 'koppel', n: null, wie } : null);
+        if (na) {
+            const f = na.extraFields && na.extraFields['NFC Tag'];
+            const v = f ? String(f.stringValue ?? f.value ?? '').trim().toLowerCase() : '';
+            if (v !== (tag || '')) throw new Error('Robaws nam de tag niet over');
+        }
+        return na;
+    },
+    /** Defect gemeld via de tag: foto (mag) → taak voor het bureel (MOET lukken) →
+     *  logregel. Een mislukte taak gooit een fout met `docId`, zodat een tweede
+     *  poging de foto niet opnieuw oplaadt. */
+    async matDefectMelden(materialId, { tekst, fotoDataUrl, docId, naam, plaats, wie }) {
+        const t = String(tekst || '').trim();
+        if (!t) throw new Error('Beschrijf kort wat er mis is');
+        const wat = String(naam || ('materieel #' + materialId));
+        let doc = docId || null, fotoFout = null;
+        if (!doc && fotoDataUrl) {
+            try {
+                doc = await this.uploadMaterialDocument(materialId, fotoDataUrl,
+                    'Defect ' + wat.replace(/[^0-9A-Za-zÀ-ÿ .,()_-]/g, ' ').trim().slice(0, 60) + ' ' + this._gasNu().slice(0, 10) + '.jpg');
+            } catch (e) { fotoFout = (e && e.message) || 'opladen mislukt'; }
+        }
+        const body = {
+            title: 'Defect gemeld: ' + wat.slice(0, 120),
+            description: ((wie && wie.naam) || 'Iemand') + ' meldde op ' + this.gasLogDatum(this._gasNu()) + ' via de NFC-tag een defect aan ' + wat + ':\n\n' + t +
+                (plaats ? '\n\nWaar: ' + plaats : '') +
+                (doc ? '\n\nFoto: bij de documenten van het materieel.' : (fotoFout ? '\n\nDe foto opladen mislukte (' + fotoFout + ').' : '')) +
+                '\n\nIn de app: Logistiek → Gereedschap → de fiche. Opgelost? Tik daar op "Weer in orde".',
+            assignedUserId: String(this.TASK_USERS.MATERIEEL || '8'),
+        };
+        // een taak "op" het materieel is nog niet bewezen: bij een validatiefout (400/422) zonder
+        let r = await this.post('tasks', Object.assign({ relatedResource: '/materials/' + materialId }, body));
+        if (r.code === 400 || r.code === 422) r = await this.post('tasks', body);
+        if (r.code !== 200 && r.code !== 201) {
+            const e = new Error('Robaws gaf status ' + r.code);
+            e.docId = doc;
+            throw e;
+        }
+        let na = null, logOk = true;
+        try { na = await this._gasSchrijf(materialId, {}, { a: 'defect', n: t.slice(0, 200), wie: wie || null }); } catch (_e) { logOk = false; }
+        return { taak: r.data || null, docId: doc, fotoFout, logOk, na };
+    },
+
     // v368: DOCUMENTMAPPEN op een werknemersfiche. GEMETEN 24 aug:
     //  - map aanmaken = JSON-POST { name, directory:true, parentId? }
     //  - bestand in een map = multipart met het veld `parentId`
@@ -3209,6 +3320,179 @@ const RobawsAPI = {
         return parts.join(', ') || '';
     },
 
+    // ================================================================
+    // v415: PIN-KLUIS, SESSIE EN PROFIEL WISSELEN (Worker v471)
+    // De PIN staat niet meer leesbaar in Robaws maar als hash in de Worker (KV). Bij elke
+    // aanmelding geeft de Worker een ondertekend bewijs mee (qe_sessie): nodig voor het
+    // PIN-beheer (bureel) en voor profiel wisselen (alleen de beheerder, nu enkel Levi).
+    // Wisselen: de eigen stand (alles wat bij één persoon hoort, zelfde lijst als het
+    // afmelden) gaat één keer opzij in qe_beheer_terug; de gekozen werknemer krijgt een
+    // propere stand zonder persoonlijke sleutel; "Terug" zet alles exact terug.
+    // ================================================================
+    sessieZet(s) {
+        try {
+            if (s && s.token) localStorage.setItem('qe_sessie', JSON.stringify({ token: String(s.token), email: String(s.email || ''), beheerder: !!s.beheerder }));
+            else localStorage.removeItem('qe_sessie');
+        } catch (_e) {}
+    },
+    sessieLees() {
+        try { const s = JSON.parse(localStorage.getItem('qe_sessie') || 'null'); return (s && s.token) ? s : null; }
+        catch (_e) { return null; }
+    },
+    /** Mag deze aanmelding van profiel wisselen? (de Worker beslist; dit is alleen voor het scherm) */
+    isBeheerder() { const s = this.sessieLees(); return !!(s && s.beheerder); },
+    async _authPost(pad, body, timeoutMs) {
+        const res = await this._fetchWithTimeout(this.WORKER_AUTH_URL + pad, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+        }, timeoutMs || 12000);
+        let j = null;
+        try { j = await res.json(); } catch (_e) {}
+        return { status: res.status, ok: res.ok, j };
+    },
+    /** PIN-beheer via de Worker. null = geen sessie (oude Worker of nog niet opnieuw aangemeld) → oude weg. */
+    async _pinBeheer(actie, extra) {
+        const s = this.sessieLees();
+        if (!s) return null;
+        const r = await this._authPost('/auth/pin-beheer', Object.assign({ sessie: s.token, actie: actie }, extra || {}), 20000);
+        if (!r.j || r.j.v !== 'auth1') throw new Error('De Worker kent het PIN-beheer nog niet (Worker v471 plakken)');
+        if (!r.ok || !r.j.ok) throw new Error(r.j.error || ('Mislukt (' + r.status + ')'));
+        return r.j;
+    },
+    /** Beheer: PIN van een werknemer zetten (onboarding). */
+    async adminSetPin(employeeId, pin) {
+        if (!/^\d{4,6}$/.test(String(pin))) throw new Error('PIN = 4 tot 6 cijfers');
+        const j = await this._pinBeheer('zet', { employeeId: String(employeeId), pin: String(pin) });
+        if (j) return true;
+        return this._savePinToRobaws(employeeId, pin);   // oude Worker
+    },
+    /** Beheer: alle PIN's die nog leesbaar in Robaws staan naar de kluis (4 per ronde). */
+    async pinVerhuisAlles(opVoortgang) {
+        const tot = { verhuisd: 0, opgeruimd: 0, fouten: [], rest: 0 };
+        for (let ronde = 0; ronde < 12; ronde++) {
+            const j = await this._pinBeheer('verhuis');
+            if (!j) throw new Error('Meld je opnieuw aan om dit te gebruiken.');
+            tot.verhuisd += j.verhuisd || 0;
+            tot.opgeruimd += j.opgeruimd || 0;
+            tot.fouten = j.fouten || [];
+            tot.rest = j.rest || 0;
+            if (opVoortgang) { try { opVoortgang(tot); } catch (_e) {} }
+            if (!tot.rest || ((j.verhuisd || 0) + (j.opgeruimd || 0)) === 0) break;
+        }
+        return tot;
+    },
+
+    WISSEL_SLEUTEL: 'qe_beheer_terug',
+    // alles wat bij één persoon hoort (zelfde als het afmelden + de instellingen van de aanmelding)
+    WISSEL_EXACT: ['qe_user', 'qe_woData', 'qe_fav_materials', 'qe_missing_materials', 'qe_last_overschrijving',
+        'qe_pending_payments', 'qe_submitted_wos', 'qe_timer', 'qe_timer_pending_block', 'qe_mollie_pending',
+        'qe_active_role_override', 'qe_api_cred', 'qe_app_tools', 'qe_app_tools_bekend', 'qe_app_logistiek', 'qe_ciaw_open'],
+    WISSEL_PREFIX: ['planItem_', 'qe_last_payment', 'qe_last_wo_', 'qe_last_tr_', 'qe_last_uitg_'],
+    _wisselSleutelsNu() {
+        const uit = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && (this.WISSEL_EXACT.indexOf(k) >= 0 || this.WISSEL_PREFIX.some(p => k.indexOf(p) === 0))) uit.push(k);
+        }
+        return uit;
+    },
+    _wisselWisHuidig(behoud) {
+        for (const k of this._wisselSleutelsNu()) {
+            if (behoud && behoud.indexOf(k) >= 0) continue;
+            try { localStorage.removeItem(k); } catch (_e) {}
+        }
+    },
+    /** De opzijgezette eigen stand, of null als er niet gewisseld is. */
+    wisselStand() {
+        try { const st = JSON.parse(localStorage.getItem(this.WISSEL_SLEUTEL) || 'null'); return (st && st.echt && st.data) ? st : null; }
+        catch (_e) { return null; }
+    },
+    /** Wissel naar een andere werknemer. Gooit bij een fout; dan is er niets gewijzigd. */
+    async wisselNaar(employeeId) {
+        const s = this.sessieLees();
+        if (!s || !s.beheerder) throw new Error('Profiel wisselen is alleen voor de beheerder.');
+        const r = await this._authPost('/auth/wissel', { sessie: s.token, naar: String(employeeId) }, 15000);
+        if (!r.j || r.j.v !== 'auth1') throw new Error('De Worker kent profiel wisselen nog niet (Worker v471 plakken)');
+        if (!r.ok || !r.j.ok) throw new Error(r.j.error || ('Wisselen mislukt (' + r.status + ')'));
+        const w = r.j;
+        const f = await this.get('employees/' + w.employeeId, { bypassCache: true });
+        if (f.code !== 200 || !f.data) throw new Error('Fiche van ' + (w.naam || 'deze werknemer') + ' niet gevonden (' + f.code + ')');
+        const doel = await this._gebruikerVanFiche(f.data, w.email);
+        // 1. eigen stand één keer opzij (bij een volgende wissel blijft de eerste staan)
+        if (!this.wisselStand()) {
+            const echt = this.getLoggedInUser();
+            if (!echt) throw new Error('Niet aangemeld');
+            const data = {};
+            for (const k of this._wisselSleutelsNu()) data[k] = localStorage.getItem(k);
+            localStorage.setItem(this.WISSEL_SLEUTEL, JSON.stringify({ v: 1, t: Date.now(),
+                echt: { email: echt.email, naam: echt.name, employeeId: String(echt.robawsEmployeeId || '') }, data: data }));
+            const terug = this.wisselStand();
+            if (!terug || Object.keys(terug.data).length !== Object.keys(data).length || terug.data.qe_user !== data.qe_user) {
+                try { localStorage.removeItem(this.WISSEL_SLEUTEL); } catch (_e) {}
+                throw new Error('Je eigen gegevens konden niet veilig opzijgezet worden — er is niets gewijzigd.');
+            }
+        }
+        // 2. huidige stand weg (jezelf of de vorige wissel), de gekozen werknemer erin — zonder persoonlijke sleutel
+        this._wisselWisHuidig();
+        this._activeKey = null; this._activeSecret = null; this._activeSoort = null; this._credRestoreDone = true;
+        doel.wissel = true;
+        localStorage.setItem('qe_user', JSON.stringify(doel));
+        try {
+            if (Array.isArray(w.mijnTools)) localStorage.setItem('qe_app_tools', JSON.stringify(w.mijnTools));
+            if (Array.isArray(w.appToolsBekend)) localStorage.setItem('qe_app_tools_bekend', JSON.stringify(w.appToolsBekend));
+            this._zetMijnLogistiek(w.mijnLogistiek || null, w.email);
+        } catch (_e) {}
+        return doel;
+    },
+    /** Eigen stand exact terugzetten (zonder netwerk). Geeft de echte gebruiker terug of null. */
+    _wisselHerstel() {
+        const st = this.wisselStand();
+        if (!st) return null;
+        this._wisselWisHuidig();
+        for (const k of Object.keys(st.data)) {
+            try { if (st.data[k] != null) localStorage.setItem(k, st.data[k]); } catch (_e) {}
+        }
+        try { localStorage.removeItem(this.WISSEL_SLEUTEL); } catch (_e) {}
+        this._activeKey = null; this._activeSecret = null; this._activeSoort = null; this._credRestoreDone = false;   // eigen sleutel komt lazy terug
+        return st.echt;
+    },
+    /** Terug naar jezelf (+ regel in het logboek van de Worker, hoogstens 4 s wachten). */
+    async wisselTerug() {
+        const st = this.wisselStand();
+        if (!st) return null;
+        const nu = this.getLoggedInUser();
+        const s = this.sessieLees();
+        if (s) {
+            try {
+                await Promise.race([
+                    this._authPost('/auth/wissel', { sessie: s.token, terug: true, van: nu ? String(nu.robawsEmployeeId || '') : '', vanNaam: nu ? nu.name : '' }, 4000),
+                    new Promise(r => setTimeout(r, 4000)),
+                ]);
+            } catch (_e) {}
+        }
+        return this._wisselHerstel();
+    },
+    /** Laatste wissels (logboek van de Worker). */
+    async wisselLog() {
+        const s = this.sessieLees();
+        if (!s) return [];
+        const r = await this._authPost('/auth/wissel', { sessie: s.token, log: true }, 10000);
+        return (r.ok && r.j && Array.isArray(r.j.log)) ? r.j.log : [];
+    },
+    /** Bij een aanmelding: een achtergebleven wissel opruimen (bv. de app werd bijgewerkt tijdens een wissel). */
+    _wisselOpruimenBijAanmelding(emailLower) {
+        const st = this.wisselStand();
+        if (!st) return;
+        const vers = ['qe_user', 'qe_api_cred', 'qe_app_tools', 'qe_app_tools_bekend', 'qe_app_logistiek'];   // net door deze aanmelding gezet
+        this._wisselWisHuidig(vers);
+        if (st.echt && String(st.echt.email || '').toLowerCase() === emailLower) {
+            for (const k of Object.keys(st.data)) {
+                if (vers.indexOf(k) >= 0) continue;
+                try { if (st.data[k] != null) localStorage.setItem(k, st.data[k]); } catch (_e) {}
+            }
+        }
+        try { localStorage.removeItem(this.WISSEL_SLEUTEL); } catch (_e) {}
+    },
+
     // =============================================
     // LOGIN
     // =============================================
@@ -3223,6 +3507,9 @@ const RobawsAPI = {
         // e-mail + PIN met het API-account; antwoorden dragen v:'auth1' —
         // een oude Worker (zonder kluis) of netwerkfout wordt genegeerd en
         // de bestaande flow loopt gewoon door (gedeelde of bewaarde key).
+        // v415: workerStand = 'kv' (Worker v471+: hij bewaart en controleert de PIN zelf),
+        // 'oud' (Worker zonder PIN-kluis) of 'weg' (geen antwoord).
+        let workerStand = 'weg';
         try {
             const wres = await this._fetchWithTimeout(this.WORKER_AUTH_URL + '/auth/login', {
                 method: 'POST',
@@ -3232,9 +3519,15 @@ const RobawsAPI = {
             let wj = null;
             try { wj = await wres.json(); } catch (_e) {}
             if (wj && wj.v === 'auth1') {
+                workerStand = (wj.pinOpslag === 'kv') ? 'kv' : 'oud';
                 if (wres.status === 401) return { success: false, error: 'PIN onjuist' };
-                if (wres.status === 429) return { success: false, error: 'Te veel pogingen — probeer over een kwartier opnieuw.' };
+                if (wres.status === 429) return { success: false, error: wj.error || 'Te veel pogingen — probeer over een kwartier opnieuw.' };
                 if (wres.status === 403) return { success: false, error: 'Dit account is stopgezet. Neem contact op met kantoor.' };
+                // v415: met de PIN-kluis beslist de Worker; geen eigen zoektocht of controle meer
+                if (workerStand === 'kv' && wres.status === 404) return { success: false, error: 'Werknemer niet gevonden — vraag kantoor om het e-mailadres op je fiche na te kijken.' };
+                if (workerStand === 'kv' && !wres.ok) return { success: false, error: wj.error || ('Aanmelden mislukt (' + wres.status + ')') };
+                // v415: ondertekend bewijs van deze aanmelding (PIN-beheer en, voor de beheerder, profiel wisselen)
+                if (wres.ok) this.sessieZet(workerStand === 'kv' && wj.sessie ? { token: wj.sessie, email: emailLower, beheerder: !!wj.beheerder } : null);
                 // v333: de algemene key (API-account, apikey:standaard) komt
                 // bij elke login mee — dat is voortaan het gewone verkeer.
                 if (wres.ok && wj.algemeen && wj.algemeen.key && wj.algemeen.secret) {
@@ -3256,6 +3549,7 @@ const RobawsAPI = {
                         this._zetMijnLogistiek(wj.mijnLogistiek || null, emailLower);
                     } catch (_e) {}
                 }
+                if (wres.ok && wj && Object.prototype.hasOwnProperty.call(wj, 'wwvTag')) this.wwvTagZet(wj.wwvTag);   // v417
                 if (wres.ok && wj.taakOntvangers) {
                     try { localStorage.setItem('qe_taak_ontvangers', JSON.stringify(wj.taakOntvangers)); } catch (_e) {}
                     this._taakOntvangersToepassen(wj.taakOntvangers);
@@ -3448,40 +3742,28 @@ const RobawsAPI = {
             return { success: false, error: 'Dit account is stopgezet. Neem contact op met kantoor.' };
         }
 
-        // PIN checken via extra veld "Pincode" (groep "QE Werkbon app", type TEXT).
-        // v132: ook andere veld-naam-varianten + value-types proberen voor het geval
-        // de PIN handmatig in Robaws onder een afwijkende key is gezet.
-        const extraFields = employee.extraFields || {};
-        console.log('[RobawsAPI] extraFields keys:', Object.keys(extraFields));
-        let storedPin = '';
-        const tryKeys = ['Pincode', 'PIN', 'Pin', 'pincode', 'pin'];
-        for (const k of tryKeys) {
-            const pf = extraFields[k];
-            if (!pf) continue;
-            const v = pf.stringValue ?? pf.intValue ?? pf.value ?? pf.numberValue ?? null;
-            if (v != null && String(v).trim()) { storedPin = String(v).trim(); break; }
-        }
-        if (!storedPin) {
-            // Scan alle extraFields op key die "pin" bevat
-            for (const [k, pf] of Object.entries(extraFields)) {
-                if (!/pin/i.test(k)) continue;
-                const v = pf && (pf.stringValue ?? pf.intValue ?? pf.value ?? pf.numberValue);
-                if (v != null && String(v).trim()) { storedPin = String(v).trim(); break; }
+        // v415: met de PIN-kluis (Worker v471) controleerde de Worker de PIN al. Het veld
+        // "Pincode" in Robaws wordt dan niet meer gelezen of geschreven.
+        if (workerStand !== 'kv') {
+            const storedPin = this._pinUitFiche(employee);
+            console.log('[RobawsAPI] storedPin:', storedPin ? '***(' + storedPin.length + ' chars)' : '(leeg)');
+            if (!storedPin) {
+                if (workerStand === 'oud') {
+                    // Oude Worker: zoals vroeger de gekozen PIN op de fiche bewaren
+                    console.log('[RobawsAPI] Geen pincode in Robaws, sla ingevoerde PIN op:', emailLower);
+                    try {
+                        await this._savePinToRobaws(employee.id, pin);
+                    } catch(e) {
+                        console.warn('[RobawsAPI] PIN opslaan in Robaws mislukt:', e);
+                    }
+                } else if (!(await this._lokaleLoginOk(emailLower, pin))) {
+                    // Worker onbereikbaar: nooit een nieuwe PIN aanvaarden zonder de kluis. Wel dezelfde
+                    // PIN als bij de laatste aanmelding op dit toestel (binnen 7 dagen).
+                    return { success: false, error: 'Geen verbinding met de sleutelkluis — probeer over een minuut opnieuw.' };
+                }
+            } else if (String(pin) !== storedPin) {
+                return { success: false, error: 'PIN onjuist' };
             }
-        }
-        console.log('[RobawsAPI] storedPin:', storedPin ? '***(' + storedPin.length + ' chars)' : '(leeg)');
-
-        if (!storedPin) {
-            // Geen PIN in Robaws → accepteer de ingevoerde PIN en sla op in Robaws
-            console.log('[RobawsAPI] Geen pincode in Robaws, sla ingevoerde PIN op:', emailLower);
-            try {
-                await this._savePinToRobaws(employee.id, pin);
-                console.log('[RobawsAPI] PIN opgeslagen in Robaws voor', emailLower);
-            } catch(e) {
-                console.warn('[RobawsAPI] PIN opslaan in Robaws mislukt:', e);
-            }
-        } else if (String(pin) !== storedPin) {
-            return { success: false, error: 'PIN onjuist' };
         }
 
         // PIN lokaal cachen voor offline fallback (binnen 7 dagen)
@@ -3503,6 +3785,28 @@ const RobawsAPI = {
             }));
         } catch(e) {}
 
+        const user = await this._gebruikerVanFiche(employee, emailLower);
+        console.log('[RobawsAPI] Login OK:', user.name, '→ employeeId:', employee.id, ', userId:', user.robawsUserId || 'GEEN');
+        this._wisselOpruimenBijAanmelding(emailLower);   // v415: achtergebleven profielwissel
+        localStorage.setItem('qe_user', JSON.stringify(user));
+
+        // Vernieuw de avatar-cache vanuit Robaws (achtergrond, niet awaited
+        // zodat de login-flow niet wacht op de download). Tijdens app-gebruik
+        // gebruikt get-avatar gewoon de lokale cache.
+        this.refreshAvatarFromRobaws(emailLower, employee.id).catch(() => {});
+
+        // v318: met een eigen kluis-key na 5 s de zelftest draaien (console)
+        // — de opstart-vloed is dan voorbij en we zien per module de status.
+        if (this.hasPersonalKey && this.hasPersonalKey()) {
+            setTimeout(() => { this.kluisZelftest().catch(() => {}); }, 5000);
+        }
+
+        return { success: true, user };
+    },
+
+    /** v415: rol + Robaws-gebruiker van een werknemersfiche → het user-object van de app
+     *  (zelfde regels als bij het aanmelden; ook gebruikt bij het wisselen van profiel). */
+    async _gebruikerVanFiche(employee, emailLower) {
         // Stap 3: Rol ophalen uit werknemersrol / planning groep
         let roleName = '';
         let roleKey = '';
@@ -3554,24 +3858,42 @@ const RobawsAPI = {
             role: normalRole,
             roleName: roleName || normalRoleName,
         };
-        console.log('[RobawsAPI] Login OK:', empName, '→ employeeId:', employee.id, ', userId:', resolvedUserId || 'GEEN');
-        localStorage.setItem('qe_user', JSON.stringify(user));
-
-        // Vernieuw de avatar-cache vanuit Robaws (achtergrond, niet awaited
-        // zodat de login-flow niet wacht op de download). Tijdens app-gebruik
-        // gebruikt get-avatar gewoon de lokale cache.
-        this.refreshAvatarFromRobaws(emailLower, employee.id).catch(() => {});
-
-        // v318: met een eigen kluis-key na 5 s de zelftest draaien (console)
-        // — de opstart-vloed is dan voorbij en we zien per module de status.
-        if (this.hasPersonalKey && this.hasPersonalKey()) {
-            setTimeout(() => { this.kluisZelftest().catch(() => {}); }, 5000);
-        }
-
-        return { success: true, user };
+        return user;
     },
 
-    // PIN opslaan in Robaws (extra veld "Pincode" op werknemer, type TEXT)
+    /** Leesbare PIN op de fiche (alleen nog voor een Worker zonder PIN-kluis). */
+    _pinUitFiche(employee) {
+        const extraFields = employee.extraFields || {};
+        let storedPin = '';
+        const tryKeys = ['Pincode', 'PIN', 'Pin', 'pincode', 'pin'];
+        for (const k of tryKeys) {
+            const pf = extraFields[k];
+            if (!pf) continue;
+            const v = pf.stringValue ?? pf.intValue ?? pf.value ?? pf.numberValue ?? null;
+            if (v != null && String(v).trim()) { storedPin = String(v).trim(); break; }
+        }
+        if (!storedPin) {
+            // Scan alle extraFields op key die "pin" bevat
+            for (const [k, pf] of Object.entries(extraFields)) {
+                if (!/pin/i.test(k)) continue;
+                const v = pf && (pf.stringValue ?? pf.intValue ?? pf.value ?? pf.numberValue);
+                if (v != null && String(v).trim()) { storedPin = String(v).trim(); break; }
+            }
+        }
+        return storedPin;
+    },
+
+    /** v415: aanmelden zonder de Worker = alleen met dezelfde PIN als de laatste keer op dit toestel (7 dagen). */
+    async _lokaleLoginOk(email, pin) {
+        try {
+            if (!(await this.hasPin(email))) return false;
+            const last = parseInt(localStorage.getItem('qe_last_online_login_' + email) || '0', 10);
+            if (!last || Date.now() - last > 7 * 24 * 60 * 60 * 1000) return false;
+            return await this.verifyPin(email, pin);
+        } catch (_e) { return false; }
+    },
+
+    // PIN opslaan in Robaws (extra veld "Pincode" op werknemer, type TEXT) — alleen nog voor een Worker zonder PIN-kluis
     async _savePinToRobaws(employeeId, pin) {
         const empRes = await this.get(`employees/${employeeId}`, { bypassCache: true });  // v223: vers vóór full-replace-PUT
         if (empRes.code !== 200 || !empRes.data) throw new Error('Werknemer niet gevonden');
@@ -3591,11 +3913,31 @@ const RobawsAPI = {
         }
     },
 
-    // PIN wijzigen (lokaal + Robaws)
+    // PIN wijzigen. v415: in de PIN-kluis van de Worker (v471); de oude weg (Robaws) alleen
+    // nog als de Worker de kluis niet kent én er geen sessie van een nieuwe Worker is.
     async changePin(email, oldPin, newPin) {
         if (!/^\d{4,6}$/.test(newPin)) return { success: false, error: 'PIN moet 4 tot 6 cijfers zijn' };
+        const lower = String(email || '').toLowerCase().trim();
+        let r = null;
+        try {
+            r = await this._authPost('/auth/pin-wijzig', { email: lower, oud: String(oldPin), nieuw: String(newPin) }, 12000);
+        } catch (_e) { r = null; }
+        if (r && r.j && r.j.v === 'auth1' && r.j.pinOpslag === 'kv') {
+            if (!r.ok || !r.j.ok) return { success: false, error: r.j.error || ('PIN wijzigen mislukt (' + r.status + ')') };
+            // Alleen voor de eigen aanmelding (niet tijdens een profielwissel): de offline-reserve op dit
+            // toestel en het nieuwe aanmeldbewijs (de Worker trekt de oude in).
+            const s = this.sessieLees();
+            const eigen = !s || String(s.email || '').toLowerCase() === lower;
+            if (eigen) { try { await this.setPin(lower, newPin); } catch (_e) {} }
+            if (eigen && s && r.j.sessie) this.sessieZet({ token: r.j.sessie, email: lower, beheerder: !!s.beheerder });
+            return { success: true };
+        }
+        if (this.sessieLees() || !r) {
+            // Wel een sessie van een nieuwe Worker (of geen antwoord): nooit terugvallen op Robaws
+            return { success: false, error: 'Geen verbinding met de sleutelkluis — probeer opnieuw.' };
+        }
 
-        // Controleer oude PIN lokaal
+        // Oude Worker: zoals vroeger. Controleer oude PIN lokaal
         const ok = await this.verifyPin(email, oldPin);
         if (!ok) return { success: false, error: 'Huidige PIN klopt niet' };
 
@@ -3661,6 +4003,20 @@ const RobawsAPI = {
             if (page >= ((res.data && res.data.totalPages) || 1)) break;
         } while (page < 10);
         out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        // v415: PIN-kluis (Worker v471) — hasPin = in de kluis of nog leesbaar in Robaws;
+        // pinLeesbaar = staat nog in klare tekst in Robaws (moet verhuizen).
+        this._pinKluisStand = null;
+        for (const e of out) e.pinLeesbaar = e.hasPin;
+        try {
+            const st = await this._pinBeheer('status');
+            if (st) {
+                const kluis = new Set((st.pinIds || []).map(String));
+                for (const e of out) e.hasPin = e.pinLeesbaar || kluis.has(String(e.id));
+                this._pinKluisStand = { ok: true, leesbaar: out.filter(e => e.pinLeesbaar).length };
+            }
+        } catch (err) {
+            this._pinKluisStand = { ok: false, fout: (err && err.message) || '?' };
+        }
         return out;
     },
 
@@ -3767,6 +4123,14 @@ const RobawsAPI = {
     WACHT_TYPE_ID: '40',
     _wachtCache: null,  // { at, weken }
 
+    /** v418: is dit planning-item een wacht-dagplanning (type 40 "Wacht")? Die toont alleen wie
+     *  de wacht heeft: het is geen opdracht waarvoor een werkbon ingevuld moet worden, en geen werf.
+     *  ALLEEN op het type: dagplanningen als "Dax: INTERVENTIE WACHT ZONDAG" of "Depannage wacht"
+     *  (type 34) zijn echte opdrachten met een werkbon (gemeten 6 okt 2026). */
+    isWachtPlanning(item) {
+        return !!item && item.planningTypeId != null && String(item.planningTypeId) === this.WACHT_TYPE_ID;
+    },
+
     /** Wachtweken vanaf maandag van deze week, `wekenVooruit` weken ver.
      *  Resultaat: [{ maandag:'YYYY-MM-DD', zondag:'YYYY-MM-DD',
      *                employeeIds:['12'], namen:['Olivier'] }] — alleen weken
@@ -3863,6 +4227,9 @@ const RobawsAPI = {
 
     /** PIN resetten: Pincode-veld leegmaken → werknemer stelt bij volgende login zelf in. */
     async adminResetPin(employeeId) {
+        // v415: met de PIN-kluis wist de Worker de PIN (+ de waarde in Robaws en de foutteller)
+        const j = await this._pinBeheer('reset', { employeeId: String(employeeId) });
+        if (j) return true;
         return this._adminMutateEmployee(employeeId, (emp) => {
             emp.extraFields = emp.extraFields || {};
             emp.extraFields['Pincode'] = { type: 'TEXT', group: 'QE Werkbon app', stringValue: '' };
@@ -3895,14 +4262,19 @@ const RobawsAPI = {
         if (createRes.code !== 200 && createRes.code !== 201) throw new Error('Aanmaken mislukt (' + createRes.code + ')');
         const newId = createRes.data && createRes.data.id;
         if (!newId) throw new Error('Geen ID teruggekregen');
+        const kluis = !!this.sessieLees();   // v415: met de PIN-kluis gaat de PIN NIET op de fiche
         await this._adminMutateEmployee(newId, (emp) => {
             emp.email = email;
             emp.status = 'actief';
             emp.employeeRoleId = m.employeeRoleId;
             emp.planningGroup = m.planningGroup;
             emp.extraFields = emp.extraFields || {};
-            if (pin) emp.extraFields['Pincode'] = { type: 'TEXT', group: 'QE Werkbon app', stringValue: String(pin) };
+            if (pin && !kluis) emp.extraFields['Pincode'] = { type: 'TEXT', group: 'QE Werkbon app', stringValue: String(pin) };
         });
+        if (pin && kluis) {
+            try { await this._pinBeheer('zet', { employeeId: String(newId), pin: String(pin) }); }
+            catch (e) { return { id: newId, pinFout: (e && e.message) || 'PIN niet gezet' }; }
+        }
         return { id: newId };
     },
 
@@ -3921,6 +4293,9 @@ const RobawsAPI = {
         const email = String(emp.email || '').trim().toLowerCase();
         const statusStr = String(emp.status || '').toLowerCase();
         const pinVal = this._efValue(emp, 'Pincode');
+        // v415: PIN in de kluis (Worker v471) telt ook
+        let pinInKluis = false;
+        try { const st = await this._pinBeheer('status', { employeeId: String(employeeId) }); pinInKluis = !!(st && (st.pinIds || []).length); } catch (_e) {}
         const roleLabel = emp.planningGroupName || emp.planningGroup || '';
         const roleOk = !!(emp.employeeRoleId || roleLabel);
         // Gekoppelde login-user zoeken: users-scan (klein bestand, filters
@@ -3957,7 +4332,7 @@ const RobawsAPI = {
                 actief: { ok: !statusStr.includes('stopgezet'), value: emp.status || 'actief' },
                 rol:    { ok: roleOk, value: roleLabel || (emp.employeeRoleId ? ('rol-id ' + emp.employeeRoleId) : '') },
                 user:   { ok: !!user, value: user ? ((user.fullName || user.email || 'user') + ' (#' + user.id + ')') : '', userId: user ? user.id : null },
-                pin:    { ok: !!(pinVal && String(pinVal).trim()) },
+                pin:    { ok: pinInKluis || !!(pinVal && String(pinVal).trim()), leesbaar: !!(pinVal && String(pinVal).trim()) },
                 apiKey: { ok: apiKeyOk === true, known: apiKeyOk !== null },
             },
         };
@@ -4054,17 +4429,40 @@ const RobawsAPI = {
     async hasPin(email) {
         return !!localStorage.getItem('qe_pin_' + email.toLowerCase());
     },
+    /** v415: sterkere vorm voor de offline-reserve: PBKDF2 (100.000 rondes) met een eigen zout. */
+    async _hashPinSterk(email, pin, zoutHex) {
+        const zout = new Uint8Array((zoutHex.match(/../g) || []).map(h => parseInt(h, 16)));
+        const extra = new TextEncoder().encode('qe-pin|' + String(email).toLowerCase());
+        const salt = new Uint8Array(zout.length + extra.length);
+        salt.set(zout, 0); salt.set(extra, zout.length);
+        const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(String(pin)), 'PBKDF2', false, ['deriveBits']);
+        const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, k, 256);
+        return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
+    },
     async setPin(email, pin) {
         if (!/^\d{4,6}$/.test(pin)) return { success: false, error: 'PIN moet 4 tot 6 cijfers zijn' };
-        const hash = await this._hashPin(email, pin);
-        localStorage.setItem('qe_pin_' + email.toLowerCase(), hash);
+        let waarde = null;
+        try {
+            const zout = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join('');
+            waarde = 'p2$' + zout + '$' + (await this._hashPinSterk(email, pin, zout));
+        } catch (_e) {
+            waarde = await this._hashPin(email, pin);   // toestel zonder PBKDF2: oude vorm
+        }
+        localStorage.setItem('qe_pin_' + email.toLowerCase(), waarde);
         return { success: true };
     },
     async verifyPin(email, pin) {
         const stored = localStorage.getItem('qe_pin_' + email.toLowerCase());
         if (!stored) return false;
+        if (stored.indexOf('p2$') === 0) {
+            const delen = stored.split('$');
+            try { return delen.length === 3 && (await this._hashPinSterk(email, pin, delen[1])) === delen[2]; }
+            catch (_e) { return false; }
+        }
         const hash = await this._hashPin(email, pin);
-        return hash === stored;
+        if (hash !== stored) return false;
+        try { await this.setPin(email, pin); } catch (_e) {}   // oude vorm meteen opwaarderen
+        return true;
     },
     clearPin(email) {
         localStorage.removeItem('qe_pin_' + email.toLowerCase());
@@ -7222,10 +7620,47 @@ const RobawsAPI = {
     HOUR_TYPE_IDS: {
         werkuren: 1,
         overuren: 2,
+        verlof: 35,     // v421: gemeten 6 okt 2026 (type ABSENCE)
+        ziek: 36,       // v421: gemeten 6 okt 2026 (type ABSENCE)
         werkurenZaterdag: null,
         werkurenZondag:   null,
         overurenZaterdag: null,
         overurenZondag:   null,
+    },
+
+    /** v421 (Worker v479): ziek of verlof voor de REST van een gewerkte dag. Het bureel kiest dat in het
+     *  uren-scherm (vraag Levi 6 okt 2026: met een ziektebriefje voor de namiddag mogen de overige uren
+     *  niet van de overuren af). Zo'n regel staat zonder tijden en zonder artikel op de klok-werkbon:
+     *  - telt NOOIT als werk- of overuren (dagoverzicht, maandrapport, recap);
+     *  - de 8u-aanvulling houdt er rekening mee (ze vult alleen aan tot 8 u min de ziekte);
+     *  - een regel "rest van de dag: niet aangevuld — …" in de opmerking = geen aanvulling voor die dag.
+     *  Geeft 'ziek' | 'verlof' | null op uursoort-id (of -naam als die meekomt). */
+    urenAfwSoort(te, htNaam) {
+        if (!te) return null;
+        const id = String(te.hourTypeId != null ? te.hourTypeId : ((te.hourType && te.hourType.id) || ''));
+        if (id === String(this.HOUR_TYPE_IDS.ziek)) return 'ziek';
+        if (id === String(this.HOUR_TYPE_IDS.verlof)) return 'verlof';
+        const nm = String(htNaam || (te.hourType && te.hourType.name) || '').toLowerCase();
+        if (/^\s*ziek/.test(nm)) return 'ziek';
+        if (/^\s*verlof/.test(nm)) return 'verlof';
+        return null;
+    },
+    /** v421: de laatste regel "rest van de dag: …" in de opmerking van een klok-werkbon
+     *  → 'aanvullen' | 'ziek' | 'verlof' | 'geen' | null (zelfde regel als de Worker, urenRestKeuzeUit). */
+    leesRestKeuze(remark) {
+        let k = null;
+        const regels = String(remark || '').replace(/<br\s*\/?>|<\/p>|<\/div>/gi, '\n').replace(/<[^>]+>/g, '')
+            .replace(/&mdash;/g, String.fromCharCode(8212)).replace(/&nbsp;/g, ' ').split('\n');
+        for (const regel of regels) {
+            const m = regel.match(/^\s*rest van de dag\s*:\s*(.*)$/i);
+            if (!m) continue;
+            const w = m[1].split(String.fromCharCode(8212))[0].trim().toLowerCase();
+            if (/^ziek/.test(w)) k = 'ziek';
+            else if (/^verlof/.test(w)) k = 'verlof';
+            else if (/^niet/.test(w)) k = 'geen';
+            else if (/^aangevuld/.test(w)) k = 'aanvullen';
+        }
+        return k;
     },
 
     /** v138: probeer Robaws's hour-types endpoint en cache namen → IDs. */
@@ -7513,6 +7948,129 @@ const RobawsAPI = {
     leesUitklokOpmerkingen(remark) {
         return String(remark || '').split(/\r?\n/)
             .map(r => this.leesUitklokOpmerking(r)).filter(Boolean);
+    },
+
+
+    // =============================================
+    // v417 (beslissing Levi 5 okt 2026): WOON-WERKVERKEER-TAG
+    // Woon-werkverkeer telt alleen als de dag OP HET BUREAU eindigt. Bij die
+    // laatste tik (uitklokken op het bureau, of de woon-werkverkeer-tag na het
+    // uitklokken op de werf) schrijft de app een regel in de klok-werkbon:
+    //   "woon-werk: fiets — tag Woon-werkverkeer — <kaartlink | GPS niet beschikbaar> — 16:55"
+    // en bij elke uitklok met berekende kilometers een regel "km: …".
+    // Zelfde vorm als woonWerkUit in de Worker — wijzig je ze, dan beide.
+    // Het tag-nummer staat in de Worker-kluis (niet in Robaws: een veld op
+    // fiche 1 dat met "NFC " begint, leest een oudere app als camionet).
+    // =============================================
+    WWV_TAG_SLEUTEL: 'qe_wwv_tag',
+    WOONWERK_VERVOER: { fiets: 'Fiets', auto: 'Auto', ov: 'Openbaar vervoer' },
+    wwvTag() {
+        try { return localStorage.getItem(this.WWV_TAG_SLEUTEL) || null; } catch (_e) { return null; }
+    },
+    wwvTagZet(tag) {
+        try {
+            const s = tag ? String(tag).trim().toLowerCase() : '';
+            if (s) localStorage.setItem(this.WWV_TAG_SLEUTEL, s);
+            else localStorage.removeItem(this.WWV_TAG_SLEUTEL);
+        } catch (_e) {}
+    },
+    /** Tag-nummer bewaren in de Worker-kluis — alleen met een persoonlijke
+     *  sleutel (bureel, Tag beheer). Leeg = wissen. Geeft het bewaarde nummer. */
+    async wwvTagOpslaan(tagId) {
+        let cred = null;
+        try { cred = JSON.parse(localStorage.getItem('qe_api_cred') || 'null'); } catch (_e) {}
+        if (!cred || !cred.key || !cred.secret) throw new Error('Alleen met een persoonlijke sleutel (bureel)');
+        const u = this.getLoggedInUser();
+        const res = await this._fetchWithTimeout(this.WORKER_AUTH_URL + '/bel-api/app-wwv-tag', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-App-Key': cred.key + ':' + cred.secret },
+            body: JSON.stringify({ tag: tagId ? String(tagId) : '', door: (u && u.name) || '' }),
+        }, 10000);
+        let j = null;
+        try { j = await res.json(); } catch (_e) {}
+        if (!res.ok || !j || !j.ok) throw new Error((j && j.error) || ('Opslaan mislukte (' + res.status + ')'));
+        this.wwvTagZet(j.wwvTag);
+        return j.wwvTag || null;
+    },
+    _wwStreep() { return ' ' + String.fromCharCode(8212) + ' '; },
+    _wwSchoon(x) {
+        return String(x == null ? '' : x).replace(/[\r\n]+/g, ' ').split(String.fromCharCode(8212)).join('-').trim();
+    },
+    /** "woon-werk: <fiets|auto|ov> — <bron> — <kaartlink | GPS niet beschikbaar> — HH:MM" */
+    woonWerkRegel(vervoer, bron, gpsTekst, hhmm) {
+        if (!this.WOONWERK_VERVOER[vervoer]) return '';
+        const S = this._wwStreep();
+        const uur = /^\d{1,2}:\d{2}$/.test(String(hhmm || '')) ? String(hhmm) : '';
+        return 'woon-werk: ' + vervoer + S + (this._wwSchoon(bron) || 'app') + S
+            + (this._wwSchoon(gpsTekst) || 'GPS niet beschikbaar') + S + uur;
+    },
+    /** De geldende woon-werk-regel van een klok-werkbon (de laatste telt,
+     *  "geen" haalt weg) → { vervoer, bron, tijd } of null. */
+    leesWoonWerk(remark) {
+        let uit = null;
+        for (const regel of String(remark || '').split(/\r?\n/)) {
+            const m = regel.match(/^\s*woon-werk\s*:\s*(.+?)\s*$/i);
+            if (!m) continue;
+            const delen = m[1].split(String.fromCharCode(8212)).map(x => x.trim());
+            const v = String(delen[0] || '').toLowerCase();
+            if (/^geen/.test(v)) { uit = null; continue; }
+            const vervoer = /^fiets/.test(v) ? 'fiets' : /^(ov|openbaar)/.test(v) ? 'ov' : /^auto/.test(v) ? 'auto' : null;
+            if (!vervoer) continue;
+            const bronTxt = String(delen[1] || '');
+            const bron = /bureel/i.test(bronTxt) ? 'bureel' : /uitgeklokt/i.test(bronTxt) ? 'bureau' : /tag/i.test(bronTxt) ? 'tag' : 'ander';
+            const tijd = delen.slice(2).find(d => /^\d{1,2}:\d{2}$/.test(d)) || null;
+            uit = { vervoer: vervoer, bron: bron, tijd: tijd };
+        }
+        return uit;
+    },
+    /** "km: heen 14 (bureau → X) · terug 9 (X → thuis)" — of "km: niet berekend (reden)". */
+    kmRegel(km) {
+        if (!km || !km.ok) return 'km: niet berekend (' + this._wwSchoon((km && km.fout) || 'onbekend').slice(0, 120) + ')';
+        const plek = (p) => this._wwSchoon(p).slice(0, 90);
+        return 'km: heen ' + km.heen + ' (' + plek(km.vanLabel) + ' → ' + plek(km.eersteWerf) + ')'
+            + ' · terug ' + km.terug + ' (' + plek(km.laatsteWerf) + ' → ' + plek(km.naarLabel) + ')';
+    },
+    /** Regels toevoegen aan een klok-werkbon (die er al exact staan niet opnieuw)
+     *  + het vinkje Fietsvergoeding. Vers GET vóór de full-replace-PUT, logicId
+     *  mee (v323) met één herkansing zonder bij 400/422; 423 = vergrendeld. */
+    async woonWerkRegistreren(workOrderId, opts) {
+        const o = opts || {};
+        const getRes = await this.get('work-orders/' + workOrderId, { bypassCache: true });
+        if (getRes.code !== 200 || !getRes.data) throw new Error('GET /work-orders/' + workOrderId + ' faalde (' + getRes.code + ')');
+        const wo = getRes.data;
+        const dicht = () => { const e = new Error('Deze dag is al nagekeken en vergrendeld door het bureel'); e.code = 423; return e; };
+        if (wo.lockedAt) throw dicht();
+        const bestaand = String(wo.remark || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        const erbij = (o.regels || []).map(r => String(r || '').trim()).filter(r => r && bestaand.indexOf(r) < 0);
+        if (erbij.length) {
+            const oud = String(wo.remark || '').trim();
+            wo.remark = oud ? (oud + '\n' + erbij.join('\n')) : erbij.join('\n');
+        }
+        wo.extraFields = wo.extraFields || {};
+        if (o.fiets === true || o.fiets === false) {
+            wo.extraFields['Fietsvergoeding'] = { type: 'CHECKBOX', group: 'Tijdsregistratie', booleanValue: !!o.fiets };
+        }
+        let putRes = await this.put('work-orders/' + workOrderId, wo);
+        if (putRes.code === 400 || putRes.code === 422) {
+            const zonder = { ...wo };
+            delete zonder.logicId;
+            putRes = await this.put('work-orders/' + workOrderId, zonder);
+        }
+        if (putRes.code === 423) throw dicht();
+        if (putRes.code !== 200 && putRes.code !== 201 && putRes.code !== 204) throw new Error('Opslaan mislukte (' + putRes.code + ')');
+        return putRes;
+    },
+    /** Kilometerregels (commute entries) van een werkbon, vers gelezen. */
+    async getCommuteEntries(workOrderId) {
+        const r = await this.get('work-orders/' + workOrderId + '?include=commuteEntries', { bypassCache: true });
+        if (r.code !== 200 || !r.data) throw new Error('kilometers lezen faalde (' + r.code + ')');
+        return r.data.commuteEntries || [];
+    },
+    /** Eén kilometerregel bijwerken (merge-patch, live bewezen in Worker v361). */
+    async updateCommuteEntry(workOrderId, ceId, velden) {
+        const res = await this.patchMerge('work-orders/' + workOrderId + '/commute-entries/' + ceId, velden || {});
+        if (res.code !== 200 && res.code !== 201 && res.code !== 204) throw new Error('kilometers bijwerken faalde (' + res.code + ')');
+        return true;
     },
 
     /**
@@ -7968,8 +8526,9 @@ const RobawsAPI = {
         const userId = o.userId != null ? String(o.userId) : '';
         const datum = String(dateStr || this._localDateStr()).slice(0, 10);
         const ruw = await this._planningLijst('fromDate=' + datum + '&toDate=' + datum, 3);
-        // client-side nog eens op de dag filteren (vals-positief-les) en verlof eruit
-        const items = ruw.filter(x => x && !x.timeOffCategoryId && x.startDate && this._localDateStr(new Date(x.startDate)) === datum);
+        // client-side nog eens op de dag filteren (vals-positief-les); verlof en wacht eruit
+        // (v418: een wacht-dagplanning is geen werf, laden en lossen hoort daar nooit op)
+        const items = ruw.filter(x => x && !x.timeOffCategoryId && !this.isWachtPlanning(x) && x.startDate && this._localDateStr(new Date(x.startDate)) === datum);
         items.sort((a, b) => String(a.startDate || '').localeCompare(String(b.startDate || '')));
 
         // werkbonnen van die dag, met hun tijdsregels

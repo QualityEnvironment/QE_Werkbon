@@ -53,7 +53,7 @@
             ['Ik ben mijn PIN vergeten.', 'Bel Levi. Hij zet je PIN terug op nul. Daarna kies je bij het inloggen gewoon een nieuwe.'],
             ['Er staat "e-mailadres niet gevonden".', 'Kijk of je alles juist typte (geen spatie, geen hoofdletters nodig). Lukt het nog niet? Bel Levi — dan zet hij je account goed.'],
             ['Ik heb een nieuwe telefoon.', 'App erop (laat Levi helpen), inloggen met je e-mail en je PIN — klaar. Al je gegevens staan veilig op kantoor, niet op je oude telefoon.'],
-            ['Kan iemand anders op mijn account?', 'Niet zonder jouw PIN. Geef je PIN dus aan niemand door.'],
+            ['Kan iemand anders op mijn account?', 'Niet zonder jouw PIN. Alleen de beheerder van de app (Levi) kan de app bekijken zoals jij hem ziet, bijvoorbeeld om je te helpen; dat wordt bijgehouden. Je PIN staat onleesbaar opgeslagen: niemand kan hem opzoeken, ook kantoor niet. Geef hem dus aan niemand door.'],
         ] },
     ] },
 
@@ -70,11 +70,12 @@
 
     /* ══ DEEL: JOUW WERKDAG ══ */
     { slug: 'inklokken', deel: 'Jouw werkdag', kick: "'s Morgens", titel: 'Inklokken', lead: 'Zo weet de app hoe laat je begon. Belangrijk voor je loon.', scherm: 'screenClock', blokken: [
-        { t: 'stap', n: 1, h: 'Houd je telefoon <b>tegen de NFC-tag</b>. Die hangt aan het <b>bureau</b> en in de <b>camionet</b>. Je voelt een trilling en het scherm reageert.' },
+        { t: 'stap', n: 1, h: 'Houd je telefoon <b>tegen de NFC-tag</b>. Die hangt aan het <b>bureau</b> en in de <b>camionet</b>. Je voelt een trilling en het scherm reageert. De app hoeft niet open te staan: ontgrendel je gsm en houd hem tegen de tag.' },
         { t: 'stap', n: 2, h: 'Kijk op het Klok-scherm: staat er <b>groen "INGEKLOKT"</b> met de juiste tijd? Dan is het gelukt.' },
         { t: 'p', h: '<b>De regels, simpel uitgelegd:</b><br>• Je tijd wordt afgerond op <b>kwartieren</b>, met 4 minuten speling (inklokken om 06:48 telt als 06:45).<br>• <b>Vroeger komen mag altijd</b> — je uren tellen vanaf je startuur.<br>• Klok je <b>ná je startuur</b> in? Dan staat er "te laat" bij die dag.<br>• <b>Weekend</b> = alles telt automatisch als <b>overuren</b>.<br>• Meer dan <b>8 uur</b> op één dag? Alles erboven wordt vanzelf overuren.<br>• Je <b>pauze</b> wordt automatisch verrekend, één keer per dag.' },
         { t: 'letop', h: '<b>Ook ’s middags klokken?</b> Nee. Eén keer in als je dag begint, één keer uit als hij stopt. De pauze regelt de app zelf.' },
         { t: 'faq', items: [
+            ['Moet de app open staan om te klokken?', 'Nee. Ontgrendel je gsm en houd hem tegen de tag: de app opent vanzelf. Bij de tag in de camionet vraagt ze eerst <b>Inklokken?</b> (zo klokt een gsm die op de tag blijft liggen niet vanzelf in). Opent de app niet? Scan dan één keer met de app open: daarna werkt het ook met de app dicht.'],
             ['Ik ben vergeten in te klokken!', 'Geen paniek. Klok → Mijn uren bekijken → tik op de dag → kies "Vergeten in te klokken". Kantoor zet het recht.'],
             ['De tag doet niets.', '1) Kijk of NFC aan staat. 2) Haal je telefoon uit een dikke hoes. 3) Houd de bóvenkant tegen de tag en tel tot twee. Blijft het niet lukken? Bel — dan wordt je tijd handmatig gezet.'],
             ['Moet ik ook inklokken als ik rechtstreeks naar de werf rijd?', 'Scan dan de tag in de camionet. Geen tag in de buurt? Bel het bureau, zij klokken je in.'],
@@ -96,6 +97,7 @@
             ['Wat betekent "Regie"?', 'Dat alle tijd en materiaal aan de klant wordt doorgerekend. Vul dan extra nauwkeurig in.'],
             ['Moet ik de klanten in deze volgorde doen?', 'Meestal wel — kantoor plant de route zo. Moet je afwijken? Even bellen met het bureau.'],
             ['Wie heeft er deze week de wacht?', 'Kijk op de wacht-balk boven je planning (het schildje). Tik erop om ook de komende weken te zien. De wacht zelf wordt door het bureau gepland — klopt iets niet, bel het bureau.'],
+            ['Ik heb de wacht en er staat een dagplanning "WACHT" in mijn planning. Moet ik daar een werkbon voor invullen?', 'Nee. Die dagplanning toont alleen dat jij de wacht hebt. Ze telt niet mee als open werkbon: je kan gewoon uitklokken, ook als je die dag als monteur meehelpt.'],
         ] },
     ] },
 
@@ -111,6 +113,21 @@
             ['Ik sta op een grote werf, maar ik zie geen kaart.', 'Dan staat het project in Robaws nog niet op Check in @ work. Bel het bureel.'],
             ['Moet ik voor een collega scannen?', 'Nee. Iedereen scant met zijn eigen telefoon, zo staat de aanmelding op jouw naam.'],
             ['Het lukte niet op de RSZ-pagina.', 'Tik op <b>Niet gelukt</b> en probeer opnieuw met <b>Opnieuw scannen</b>. Blijft het mislukken? Bel het bureel — zij zien het in hun overzicht.'],
+        ] },
+    ] },
+
+    { slug: 'materieel-scan', deel: 'Jouw werkdag', kick: 'Koffers en machines', titel: 'Materieel scannen (NFC-tag)', lead: 'Op de machines en koffers van QE hangt een NFC-tag. Houd je gsm ertegen: de app toont meteen wat het is en bij wie.', scherm: 'screenPlanning', blokken: [
+        { t: 'stap', n: 1, h: 'Ontgrendel je gsm en houd de <b>achterkant</b> tegen de tag op de koffer of machine. De app opent vanzelf, ook als ze dicht was.' },
+        { t: 'stap', n: 2, h: 'Je ziet <b>bij wie</b> het staat en <b>waar</b>: het groot magazijn, een camionet of een werf.' },
+        { t: 'stap', n: 3, h: 'Neem je het mee? Tik op <b>Ik neem het mee</b> en kies <b>je camionet</b> of <b>de werf</b>. Het staat dan op jouw naam.' },
+        { t: 'stap', n: 4, h: 'Breng je het terug? Scan de tag en tik op <b>Ik breng het terug</b>. Het staat dan weer vrij in het groot magazijn.' },
+        { t: 'stap', n: 5, h: 'Iets kapot? Tik op <b>Defect melden</b>, schrijf kort wat er mis is en neem een foto. Het bureel krijgt een taak.' },
+        { t: 'tip', h: 'Onderaan staat <b>Wie had dit en wanneer?</b> Zo zie je wie het als laatste gebruikte.' },
+        { t: 'faq', items: [
+            ['De app opent niet als ik scan.', 'Ontgrendel eerst je gsm en zet NFC aan (bij de snelle instellingen). Opent ze nog niet? Open de app zelf en scan opnieuw. Op een nieuwe Android kan het zijn dat NFC-tags de app niet mogen openen: kijk bij Profiel → App bijwerken → Toestel &amp; toestemmingen.'],
+            ['Opent de app ook als ik met mijn bankkaart betaal?', 'Nee. De app reageert alleen op de tags van QE. Een bankkaart of een betaling met de gsm merkt de app niet.'],
+            ['De app zegt dat de tag nog aan geen materieel hangt.', 'Dan is de tag nog niet gekoppeld. Vraag het bureel.'],
+            ['Moet ik scannen als ik iets van een collega overneem?', 'Ja, graag: tik op <b>Ik neem het mee</b>. Zo weet iedereen waar het is.'],
         ] },
     ] },
 
@@ -287,21 +304,23 @@
     ] },
 
     /* ══ DEEL: NAKIJKEN & RECHTZETTEN ══ */
-    { slug: 'uitklokken', deel: 'Nakijken & rechtzetten', kick: 'Einde van de dag', titel: 'Uitklokken + kilometers', lead: 'Scan de tag. Vul je kilometers in. Bevestig. In die volgorde.', scherm: 'screenClock', blokken: [
+    { slug: 'uitklokken', deel: 'Nakijken & rechtzetten', kick: 'Einde van de dag', titel: 'Uitklokken + kilometers', lead: 'Scan de tag. Kijk je kilometers na. Bevestig. In die volgorde.', scherm: 'screenClock', blokken: [
         { t: 'stap', n: 1, h: 'Houd je telefoon <b>tegen de NFC-tag</b>, net zoals ’s morgens.' },
-        { t: 'stap', n: 2, h: 'De app vraagt je <b>kilometers</b>: heen en terug. Vul ze in.' },
-        { t: 'stap', n: 3, h: 'Kies je <b>mobiliteit</b>: chauffeur (alleen of met passagiers) of passagier.' },
+        { t: 'stap', n: 2, h: 'De app toont je <b>kilometers</b>, heen en terug. Die rekent de app zelf uit: je hoeft niets in te vullen.' },
+        { t: 'stap', n: 3, h: 'Kies je <b>mobiliteit</b>: chauffeur (alleen of met passagiers) of passagier. Klok je uit <b>aan het bureau</b>, dan kies je ook hoe je vandaag naar het werk kwam: <b>fiets, auto of openbaar vervoer</b>.' },
         { t: 'stap', n: 4, h: 'Iets bijzonders vandaag? Schrijf het in <b>"Opmerking voor het bureel"</b>, bv. <i>vroeger begonnen om de file voor te zijn, afgesproken met de projectleider</i>. Het bureel ziet het meteen bij het nakijken van je uren. Niets te melden? Laat het vak leeg.' },
         { t: 'stap', n: 5, h: 'Tik op <b>"Uitklokken bevestigen"</b>. Nu pas ben je uitgeklokt. Tik je op "Annuleren"? Dan blijf je gewoon ingeklokt.' },
         { t: 'stap', n: 6, h: 'Daarna zie je het <b>"Dag afgerond"-scherm</b> met je uren en kilometers. Dit scherm = alles is binnen. Op vrijdag krijg je het weekend-scherm, mét muziekje.' },
         { t: 'letop', h: '<b>Steek je telefoon pas weg als je het eindscherm zag.</b> Dan weet je zeker dat je uitgeklokt bent én je kilometers binnen zijn.' },
+        { t: 'tip', h: '<b>Met de camionet terug naar het bureau en dan met je eigen vervoer naar huis?</b> Scan na het uitklokken op de werf de <b>woon-werkverkeer-tag</b> aan het bureau (naast de bureau-tag en de L&amp;L-tag). De app rekent je terugrit opnieuw uit en vraagt hoe je naar het werk kwam. Zonder die scan telt er die dag geen woon-werkverkeer. Sluit je de dag af met <b>laden en lossen</b> aan het bureau? Dan vraagt de app het bij die tweede L&amp;L-scan en hoef je de woon-werkverkeer-tag niet te scannen.' },
         { t: 'faq', items: [
             ['Ik ben vroeger begonnen omdat het zo afgesproken was.', 'Zet het bij het uitklokken in het vak "Opmerking voor het bureel" (met wie het afgesproken was). Dan staat het bij je uren en hoeft niemand het te onthouden. Begon je duidelijk vroeger dan je startuur, dan herinnert de app je er zelf aan.'],
             ['Ik ben vergeten uit te klokken.', 'De app merkt dat de volgende ochtend en helpt je de dag netjes af te sluiten. Klopt de tijd niet? Vraag een aanpassing aan.'],
-            ['Ik weet mijn kilometers niet precies.', 'Kijk op de teller van de camionet, of schat eerlijk. Zelfde rit als altijd? Dan weet je het getal zo.'],
-            ['Ik reed rechtstreeks van de werf naar huis.', 'Vink dan het vakje "Rechtstreeks van werf naar thuis gereden" aan op het kilometer-scherm.'],
-            ['Ik was passagier, moet ik ook km invullen?', 'Vul de rit in en kies "Passagier" bij mobiliteit. Dan klopt alles voor de administratie.'],
-            ['Ik moet ’s avonds nog laden voor morgen.', 'Dat is L&L (laden & lossen): scan de aparte L&L-tag ná je gewone uitklok. Bij de tweede scan kies je de werf waar die uren bij horen (vandaag, of met de pijl een vorige dag). Die uren komen er netjes bij.'],
+            ['Mijn kilometers kloppen niet.', 'De app rekent de rit uit met je dagplanning: vanaf het bureau of van thuis naar je eerste werf, en van je laatste werf terug. Moest je een omweg maken? Zet het in "Opmerking voor het bureel". Alleen het bureel kan kilometers aanpassen.'],
+            ['Ik reed rechtstreeks van de werf naar huis.', 'Dat weet de app al: klok je uit op de werf en scan je daarna geen woon-werkverkeer-tag, dan rekent ze je terugrit naar huis.'],
+            ['Ik was passagier.', 'Kies "Passagier" bij mobiliteit. De kilometers rekent de app uit.'],
+            ['Ik vergat de woon-werkverkeer-tag te scannen.', 'Dan telt er die dag geen woon-werkverkeer. Vraag het bureel om het toe te voegen.'],
+            ['Ik moet ’s avonds nog laden voor morgen.', 'Dat is L&L (laden & lossen): scan de aparte L&L-tag ná je gewone uitklok. Bij de tweede scan kies je de werf waar die uren bij horen (vandaag, of met de pijl een vorige dag). Die uren komen er netjes bij. Klokte je al uit op de werf? Dan vraagt de app daarna ook hoe je naar het werk kwam (fiets, auto of openbaar vervoer).'],
         ] },
     ] },
 
@@ -331,6 +350,7 @@
             ['Er staat "te laat" bij een dag, maar dat klopt niet.', 'Tik op de dag en vraag een aanpassing aan met de echte tijden. Vince kijkt het na.'],
             ['Waar zie ik mijn overuren?', 'Bovenaan bij de maandtotalen (paars cijfer) en per dag met een paars label. Weekend telt automatisch als overuren.'],
             ['Ziekte of verlof — staat dat er ook tussen?', 'Ja, die dagen staan gewoon in de lijst met hun eigen label.'],
+            ['Ik ging in de namiddag naar de dokter of het ziekenhuis, met een ziektebriefje. Hoe staat dat?', 'Geef het briefje af op kantoor. Het bureel zet dan de rest van die dag op <b>ziek</b>: bij die dag zie je een rode regel "Ziek · rest van de dag". Die uren gaan <b>niet</b> van je overuren af en tellen niet bij je gewerkte uren. Bij een halve dag verlof werkt het net zo.'],
             ['Kloppen deze cijfers met mijn loonbrief?', 'Dit zijn de geklokte uren waar kantoor mee rekent. Zie je een verschil? Bel Vince.'],
         ] },
     ] },
@@ -507,7 +527,7 @@
             '<b>Bij de klant</b> — tik op de kaart, timer aan.',
             '<b>Invullen</b> — uren, materiaal en foto’s. Meteen, niet straks.',
             '<b>Versturen</b> — overzicht nakijken → "Werkbon versturen" → vinkje.',
-            '<b>Uitklokken</b> — tag scannen → kilometers → "Uitklokken bevestigen" → "Dag afgerond".',
+            '<b>Uitklokken</b> — tag scannen → kilometers nakijken → "Uitklokken bevestigen" → "Dag afgerond". Met eigen vervoer naar huis vanaf het bureau? Woon-werkverkeer-tag scannen (niet nodig als je laden en lossen afsluit).',
             '<b>Foutje?</b> — Klaar = correctie · Klok = uren-aanpassing.',
             '<b>Twijfel?</b> — ⓘ-knop of deze handleiding, of bel Levi/Vince.',
         ] },
@@ -519,7 +539,7 @@
             '<b>Nakijken</b> — werkbon samen met de klant overlopen.',
             '<b>Tekenen &amp; versturen</b> — betaalmethode kiezen → klant tekent → versturen.',
             '<b>Betalen</b> — QR eerst; anders Bancontact, cash of overschrijving. Check "Betaald".',
-            '<b>Uitklokken</b> — tag scannen → kilometers → bevestigen → "Dag afgerond".',
+            '<b>Uitklokken</b> — tag scannen → kilometers nakijken → bevestigen → "Dag afgerond". Met eigen vervoer naar huis vanaf het bureau? Woon-werkverkeer-tag scannen (niet nodig als je laden en lossen afsluit).',
             '<b>Twijfel?</b> — ⓘ-knop of deze handleiding, of bel Levi/Vince.',
         ] },
     ] },

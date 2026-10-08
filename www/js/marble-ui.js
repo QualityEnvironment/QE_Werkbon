@@ -61,7 +61,8 @@
         screenMaterieelDetail:{ sub: 'Reserveren & beschikbaarheid', title: 'Materieel' },
         screenMaterieelAanvragen:{ sub: 'Jouw materieel-aanvragen', title: 'Vorige aanvragingen' },
         screenHandleiding: { sub: 'Alles over de app · typ om te zoeken', title: 'Handleiding' },
-        screenRegelboek:   { sub: 'Welke uren tellen en welke niet', title: 'Regelboek uren' }   // v399
+        screenRegelboek:   { sub: 'Welke uren tellen en welke niet', title: 'Regelboek uren' },   // v399
+        screenWissel:      { sub: 'Alleen voor de beheerder', title: 'Wissel van profiel' }   // v415
         /* screenHandleidingH: hoofdstuk rendert zijn eigen Marble-kop */
         // screenDagoverzicht: kop wordt door loadDagoverzicht zelf gerenderd (maand + pijltjes)
         // detail/werkbon/betaal-schermen: hebben hun eigen kop
@@ -235,7 +236,8 @@
             ['NFC in- en uitklokken', 'Houd je telefoon tegen een NFC-tag: bureau, camionet of laden & lossen. De kaart toont je status en kleurt mee.', '#clockHeroCard'],
             ['Afronding', 'Kwartieren met 4 min tolerantie: 06:48 → 06:45, maar 06:50 → 07:00. De uitleg staat onder "Hoe wordt mijn tijd afgerond?" — tik om open te klappen.'],
             ['Op tijd = vóór je startuur', 'Vroeger inklokken telt pas vanaf je startuur. Elke minuut ná je startuur ben je "te laat" — ook al word je tot 4 min nog vanaf het startuur betaald.'],
-            ['Kilometers bij uitklokken', 'Bij het uitklokken vraagt de app eerst je kilometers. Iets bijzonders (bv. vroeger begonnen, afgesproken met de projectleider)? Zet het in "Opmerking voor het bureel". Pas na "Uitklokken bevestigen" ben je echt uitgeklokt — sluit je het formulier, dan blijf je ingeklokt.'],
+            ['Kilometers bij uitklokken', 'Bij het uitklokken toont de app je kilometers: die rekent ze zelf uit, je hoeft niets in te vullen. Klok je uit aan het bureau, dan kies je hoe je naar het werk kwam. Iets bijzonders (bv. vroeger begonnen, afgesproken met de projectleider)? Zet het in "Opmerking voor het bureel". Pas na "Uitklokken bevestigen" ben je echt uitgeklokt — sluit je het formulier, dan blijf je ingeklokt.'],
+            ['Woon-werkverkeer-tag', 'Uitgeklokt op de werf, met de camionet terug naar het bureau en dan met je eigen vervoer naar huis? Scan de woon-werkverkeer-tag aan het bureau. De app rekent je terugrit opnieuw uit en vraagt hoe je naar het werk kwam. Zonder die scan telt er die dag geen woon-werkverkeer. Doe je daarna nog laden en lossen? Dan vraagt de app het bij het afsluiten daarvan.'],
             ['Mijn uren & Maandrecap', 'Via "Mijn uren bekijken" open je je maandoverzicht. De Maandrecap-knop toont jouw maand als stories — die verschijnt ook vanzelf na je laatste uitklok van de maand.'],
             ['Weeklog', 'Onderaan zie je je afgeronde registraties. Weekend telt altijd als overuren.', '#clockCompletedSection']
         ] },
@@ -334,9 +336,15 @@
             ['App bijwerken', 'Controleer op updates; bureel ziet hier ook het API-tegoed van vandaag. Uitloggen staat helemaal onderaan.', '#pgHeadApp']
         ] },
         screenAdmin: { name: 'BEHEER', steps: [
-            ['Werknemers', 'Per werknemer zie je rol en status. PIN reset stuurt een nieuwe PIN, Rol wisselt de app-flow, Stopzet deactiveert de login.'],
+            ['Werknemers', 'Per werknemer zie je rol en status. PIN reset: de werknemer kiest bij de volgende aanmelding zelf een nieuwe PIN. Rol wisselt de app-flow, Stopzet deactiveert de login.'],
+            ['PIN-kluis', 'PIN\'s staan niet meer leesbaar in Robaws maar onleesbaar in de beveiligde opslag van QE. Staat er nog een leesbare PIN in Robaws, dan zie je dat bovenaan en verhuis je ze met één knop.', '#adminPinKluis'],
             ['✓ Controleren', 'De wizard checkt e-mail, status, rol, login-koppeling en PIN van een werknemer — en repareert met één tik wat kan. "+ Nieuw" maakt een fiche en opent meteen die checklist.'],
             ['Robaws', 'Alles wordt live in Robaws bewaard. Alleen de login-gebruiker zelf maak je in Robaws-web aan (Instellingen → Gebruikers, veld "Werknemer" = de fiche).']
+        ] },
+        screenWissel: { name: 'PROFIEL WISSELEN', steps: [
+            ['Werknemer kiezen', 'Tik een werknemer aan: je ziet de app zoals die persoon hem ziet (planning, klok, uren, werkbonnen), zonder PIN.', '#wisselLijst'],
+            ['Terug naar jezelf', 'De donkere balk bovenaan blijft staan zolang je als iemand anders werkt. Eén tik en je bent terug, met al je eigen gegevens.'],
+            ['Alleen jij', 'De server controleert dat alleen de beheerder kan wisselen. Goedkeuren en mailen op naam van een ander kan niet, en elke wissel staat in het logboek onderaan.', '#wisselLog']
         ] },
         screenHandleiding: { name: 'HANDLEIDING', steps: [
             ['Zoeken', 'Typ twee letters of meer — je zoekt meteen door alle hoofdstukken, stappen, vragen en de woordenlijst. Tik een resultaat om er rechtstreeks naartoe te springen.', '#hlZoekInput'],

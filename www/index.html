@@ -62,12 +62,12 @@
         </div>
         <label id="loginPinLabel" class="mb-login-label">PIN (4–6 cijfers)</label>
         <input type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6"
-               class="mb-login-input mb-login-pin" id="loginPin" placeholder="PIN" autocomplete="off"
+               class="mb-login-input mb-login-pin pin-mask" id="loginPin" placeholder="PIN" autocomplete="off"
                onkeydown="if(event.key==='Enter') app.loginSubmitPin()">
         <div id="loginPinConfirmGroup" style="display:none">
             <label class="mb-login-label">Bevestig PIN</label>
             <input type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6"
-                   class="mb-login-input mb-login-pin" id="loginPinConfirm" placeholder="PIN" autocomplete="off"
+                   class="mb-login-input mb-login-pin pin-mask" id="loginPinConfirm" placeholder="PIN" autocomplete="off"
                    onkeydown="if(event.key==='Enter') app.loginSubmitPin()">
         </div>
         <div id="loginPinError" class="mb-login-error"></div>
@@ -820,7 +820,8 @@
                 <div class="spinner"></div>
             </div>
             <div style="font-size:11px;color:var(--qe-grey);margin-top:8px;text-align:center">
-                Kies een locatie en druk op <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px"><rect x="6.5" y="3" width="11" height="18" rx="2.5"/><path d="M11 18h2"/></svg> Scan om een tag toe te wijzen
+                Kies een locatie en druk op <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px"><rect x="6.5" y="3" width="11" height="18" rx="2.5"/><path d="M11 18h2"/></svg> Scan om een tag toe te wijzen<br>
+                ✍️ zet het QE-klokmerkteken op de tag: daarna opent de app vanzelf, ook als ze dicht is (APK 1.247)
             </div>
         </div>
     </div>
@@ -1111,6 +1112,17 @@
         </button>
     </div>
 
+    <!-- ===== WISSEL VAN PROFIEL (v415) — alleen de beheerder ===== -->
+    <div class="pg-group" id="pgSectionWissel" style="display:none">
+        <button type="button" class="card pg-group-head" id="pgHeadWissel" onclick="app.navigate('screenWissel')">
+            <span class="pg-group-title" style="display:flex;align-items:center;gap:10px">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                Wissel van profiel
+            </span>
+            <span class="pg-group-chev">→</span>
+        </button>
+    </div>
+
     <!-- ===== INSTELLINGEN ===== -->
     <div class="pg-group">
         <button type="button" class="card pg-group-head" id="pgHeadInstel" onclick="app.togglePgGroup('pgBodyInstel','pgChevInstel')">
@@ -1189,11 +1201,11 @@
             </div>
             <div id="mbPinBody" style="display:none;padding:0 0 16px">
                 <input type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6"
-                       class="mb-pininput" id="profileOldPin" placeholder="Huidige PIN">
+                       class="mb-pininput pin-mask" id="profileOldPin" autocomplete="off" placeholder="Huidige PIN">
                 <input type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6"
-                       class="mb-pininput" id="profileNewPin" placeholder="Nieuwe PIN">
+                       class="mb-pininput pin-mask" id="profileNewPin" autocomplete="off" placeholder="Nieuwe PIN">
                 <input type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6"
-                       class="mb-pininput" id="profileNewPinConfirm" placeholder="Bevestig nieuwe PIN">
+                       class="mb-pininput pin-mask" id="profileNewPinConfirm" autocomplete="off" placeholder="Bevestig nieuwe PIN">
                 <div id="profilePinMsg" style="font-size:13px;text-align:center;margin-bottom:8px"></div>
                 <button style="width:100%;padding:13px;border:none;border-radius:2px;background:var(--btn);color:var(--btnfg);font:600 12.5px var(--font);cursor:pointer" onclick="app.profileChangePin()">PIN wijzigen</button>
             </div>
@@ -1354,7 +1366,21 @@
             <button class="btn btn-primary btn-sm" onclick="app.openAdminCreate()">+ Nieuw</button>
         </div>
     </div>
+    <div id="adminPinKluis"></div>   <!-- v415: staan alle PIN's in de beveiligde opslag? -->
     <div id="adminEmpList"><div class="spinner"></div></div>
+</div>
+
+<!-- ========== SCREEN: WISSEL VAN PROFIEL (v415 — alleen de beheerder) ========== -->
+<div class="screen" id="screenWissel">
+    <div class="section-header"><h2>Wissel van profiel</h2></div>
+    <div class="card" style="margin-bottom:12px;font-size:13px;color:var(--g1);line-height:1.5">
+        Kies een werknemer: je ziet en gebruikt de app zoals die persoon hem ziet, zonder PIN.
+        Alles wat je doet, gebeurt op naam van die persoon. Terug naar jezelf met de balk bovenaan.
+    </div>
+    <input type="search" class="form-input" id="wisselZoek" placeholder="Zoek een werknemer" autocomplete="off"
+           oninput="app._wisselRender(this.value)" style="margin-bottom:12px">
+    <div id="wisselLijst"><div class="spinner"></div></div>
+    <div id="wisselLog" style="margin-top:18px"></div>
 </div>
 
 <!-- ========== SCREEN: AUTOMATIONS (v344 — eigen scherm, bureel) ========== -->
@@ -1376,7 +1402,7 @@
     <div class="card" style="margin-bottom:12px">
         <div style="font-size:13px;color:var(--qe-grey);line-height:1.5">
             Welke toestemmingen heeft de app op dit toestel? Alles wat de app later nodig kan
-            hebben zit al in de app (APK 1.245): geef de toestemmingen hier in één keer, of pas
+            hebben zit al in de app (APK 1.246): geef de toestemmingen hier in één keer, of pas
             wanneer een functie erom vraagt. Niets wordt gebruikt zolang de app het niet nodig heeft.
         </div>
     </div>
@@ -1633,7 +1659,7 @@
         <div class="rb-kop">Eerst naar het bureau</div>
         <div class="rb-sub">Om materiaal te halen of een collega op te pikken.</div>
         <div class="rb-regel"><span class="rb-nr">5</span><div>Klok in met de <b>tag aan het bureau</b>. Je uren tellen vanaf die inklok.</div></div>
-        <div class="rb-regel"><span class="rb-nr">6</span><div>Klok je in <b>vóór je startuur</b>, dan start je uur pas op je startuur.</div></div>
+        <div class="rb-regel"><span class="rb-nr">6</span><div>Klok je in <b>vóór je startuur</b>, dan start je uur pas op je startuur. Dat geldt ook als je <b>vanaf 06:00</b> aan het bureau inklokt met de tag in de camionet.</div></div>
         <div class="rb-regel"><span class="rb-nr">7</span><div>De rit van het bureau naar de werf wordt <b>betaald</b> en telt mee in je 8 uur.<span class="rb-waarom">We kunnen niet verwachten dat je twee verplaatsingen doet en dan nog 8 uur op de werf blijft.</span></div></div>
     </div>
 
@@ -1669,10 +1695,11 @@
         <div class="rb-regel"><span class="rb-nr">15</span><div>Klok je in <b>ná je startuur</b>, dan staat die dag als "te laat".</div></div>
         <div class="rb-regel"><span class="rb-nr">16</span><div>Je <b>pauze</b> gaat er automatisch af, één keer per dag.</div></div>
         <div class="rb-regel"><span class="rb-nr">17</span><div>Meer dan <b>8 uur</b> op één dag zijn <b>overuren</b>. Zaterdag en zondag zijn altijd overuren.</div></div>
-        <div class="rb-regel"><span class="rb-nr">18</span><div>Vul je <b>kilometers</b> altijd in, heen en terug, ook voor een rit die niet betaald wordt. Kilometers en uren zijn twee aparte dingen.</div></div>
+        <div class="rb-regel"><span class="rb-nr">18</span><div>De app berekent je <b>kilometers</b> zelf, heen en terug. Je hoeft niets in te vullen. Kilometers en uren zijn twee aparte dingen.</div></div>
+        <div class="rb-regel"><span class="rb-nr">19</span><div>Ga je vanaf het bureau met je <b>eigen vervoer</b> naar huis? Klok daar uit, sluit daar laden en lossen af, of scan na het uitklokken op de werf de <b>woon-werkverkeer-tag</b> aan het bureau. Anders telt er die dag geen woon-werkverkeer.</div></div>
     </div>
 
-    <p class="rb-voet">Klopt een dag niet? Tik in Uren op die dag om een aanpassing aan te vragen.<br>Bijgewerkt op 24 september 2026.</p>
+    <p class="rb-voet">Klopt een dag niet? Tik in Uren op die dag om een aanpassing aan te vragen.<br>Bijgewerkt op 5 oktober 2026.</p>
 </div>
 
 <!-- ========== SCREEN: MAANDRECAP (Terugblik-lijst) v288 ========== -->

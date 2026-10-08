@@ -190,6 +190,7 @@ window.QEClock = {
             const config = await RobawsAPI.getNfcTagConfig();
             this._tagConfigLoadedAt = Date.now();
             this._tagConfig = config;
+            this._klokTagsNaarApk(config);   // v420
             // Persoonlijk startuur apart opslaan PER USER
             const currentUser = RobawsAPI.getLoggedInUser();
             const currentUserId = currentUser ? String(currentUser.robawsEmployeeId) : null;
@@ -215,6 +216,7 @@ window.QEClock = {
                 const cached = localStorage.getItem('qe_nfc_tags');
                 if (cached) {
                     this._tagConfig = JSON.parse(cached);
+                    this._klokTagsNaarApk(this._tagConfig);   // v420
                     return this._tagConfig;
                 }
             } catch(_) {
@@ -223,6 +225,22 @@ window.QEClock = {
             }
             return null;
         }
+    },
+
+    /** v420: de klok-tags naar de APK (1.247). Een klok-tag die het QE-klokmerkteken nog niet draagt, krijgt
+     *  het bij de volgende scan (met de app open); daarna opent de tag de app ook als ze dicht is. */
+    _klokTagsNaarApk(config) {
+        try {
+            if (typeof window === 'undefined' || !window.QENative || typeof QENative.nfcKlokTags !== 'function') return;
+            const c = config || this.getTagConfig() || {};
+            const uids = [];
+            const erbij = (v) => { const n = String(v || '').replace(/[^0-9a-f]/gi, '').toUpperCase(); if (n && uids.indexOf(n) < 0) uids.push(n); };
+            erbij(c.bureau && c.bureau.tagId);
+            erbij(c.ladenLossen && c.ladenLossen.tagId);
+            (c.camionetten || []).forEach(x => erbij(x && x.tagId));
+            try { erbij(RobawsAPI.wwvTag()); } catch (_) {}
+            QENative.nfcKlokTags({ mime: RobawsAPI.KLOK_NFC_MIME, uids });
+        } catch (_) {}
     },
 
     /** Haal gecachte tag config op */
@@ -247,13 +265,18 @@ window.QEClock = {
      */
     identifyTag(tagId) {
         const config = this.getTagConfig();
-        if (!config) return null;
 
         // BUG-fix: case-insensitive vergelijking. Android levert tag-id soms
         // in uppercase, Robaws cache kan in lowercase zitten — strict ===
         // gaf onterecht "Onbekende tag".
         const norm = (v) => String(v || '').trim().toLowerCase();
         const target = norm(tagId);
+        // v417: woon-werkverkeer-tag — het nummer staat in de Worker-kluis
+        // (RobawsAPI.wwvTag), niet op fiche 1.
+        let wwv = null;
+        try { wwv = (typeof RobawsAPI !== 'undefined' && RobawsAPI.wwvTag) ? RobawsAPI.wwvTag() : null; } catch (_) {}
+        const isWwv = !!wwv && norm(wwv) === target;
+        if (!config) return isWwv ? { type: 'woonwerk', name: 'Woon-werkverkeer' } : null;
 
         // Bureau tag
         if (config.bureau && norm(config.bureau.tagId) === target) {
@@ -264,6 +287,9 @@ window.QEClock = {
         if (config.ladenLossen && norm(config.ladenLossen.tagId) === target) {
             return { type: 'laden_lossen', name: 'Laden & Lossen' };
         }
+
+        // v417: Woon-werkverkeer tag
+        if (isWwv) return { type: 'woonwerk', name: 'Woon-werkverkeer' };
 
         // Camionet tags
         for (const cam of (config.camionetten || [])) {
@@ -474,12 +500,16 @@ window.QEClock = {
         return 'code ' + code;
     },
 
-    async onNfcScan(tagId) {
+    async onNfcScan(tagId, opties) {
         // BUG-fix: tagId normaliseren (lowercase + trim) zodat hex-casing
         // verschillen tussen Android en Robaws-cache geen mismatch geven.
         const normalizedTagId = String(tagId || '').trim().toLowerCase();
+        // v420: de app stond niet open (koude start of achtergrond) en werd door deze tag geopend (APK 1.247)
+        const vanBuiten = !!(opties && opties.vanBuiten);
         if (!normalizedTagId) return;
         console.log('[Clock] NFC scan:', normalizedTagId);
+        // v419: materieel-tags (machines, koffers) toont de app zelf, vanaf elk scherm
+        if (window.app && typeof app.matNfcVangen === 'function' && app.matNfcVangen(normalizedTagId)) return;
 
         // ── SCREEN-GUARD: scannen mag vanuit Planning / Klok / Uren tabs
         // (v126). Andere schermen (werkbon-invul, payment, etc.) blijven
@@ -495,7 +525,19 @@ window.QEClock = {
             && LOGISTIEK_SCREENS.includes(window.app.currentScreen);
         if (!onAllowedScreen && !opLogistiek && !this._pendingAssignment) {
             if (window.app) {
-                app.toast('Scannen kan vanaf Planning, Klok of Uren');
+                // v420: de app werd door een klok-tag geopend maar stond nog op een ander scherm (bv. een
+                // werkbon): niet zomaar wegspringen, wel duidelijk zeggen wat te doen
+                if (vanBuiten && this.identifyTag(normalizedTagId)) {
+                    if (typeof app.showScanResult === 'function') app.showScanResult(false, 'Nog niet geklokt\nDe app stond op een ander scherm. Ga naar Planning of Klok en houd je gsm nog eens tegen de tag.', null, 6000);
+                    else app.toast('Ga naar Planning of Klok en scan de tag opnieuw');
+                    return;
+                }
+                // v419: een tag met het QE-merkteken opent het materieel via het nfc-event (dat
+                // net na deze aanroep binnenkomt) — dan geen melding over het scherm
+                setTimeout(() => {
+                    if (typeof app.matNfcIsRecent === 'function' && app.matNfcIsRecent(normalizedTagId)) return;
+                    app.toast('Scannen kan vanaf Planning, Klok of Uren');
+                }, 700);
             }
             return;
         }
@@ -507,6 +549,14 @@ window.QEClock = {
         // geven de lock pas vrij na afronding (met max 8s safety-timeout).
         if (this._scanLock) {
             console.log('[Clock] Scan genegeerd (debounce)');
+            return;
+        }
+        // v417: zolang een vraagscherm open staat (werf kiezen, woon-werkverkeer) telt een nieuwe
+        // scan niet, ook niet als het vangnet van 60 s de lock al vrijgaf: anders kon een herlezing
+        // van de L&L-tag een nieuwe laden en lossen starten. Hoogstens 10 minuten: een scherm dat
+        // nooit sluit, mag het klokken niet blokkeren.
+        if (this._vraagOpen && Date.now() - this._vraagOpen < 10 * 60 * 1000) {
+            console.log('[Clock] Scan genegeerd (vraagscherm open)');
             return;
         }
         this._scanLock = true;
@@ -585,14 +635,19 @@ window.QEClock = {
             }
 
             if (!tag) {
-                if (window.app) app.toast('Onbekende NFC tag — wijs deze eerst toe via Tag beheer', true);
+                // v419: zelfde uitstel — een tag met het QE-merkteken toont het materieel zelf
+                if (window.app) setTimeout(() => {
+                    if (typeof app.matNfcIsRecent === 'function' && app.matNfcIsRecent(normalizedTagId)) return;
+                    app.toast('Onbekende NFC tag — wijs deze eerst toe via Tag beheer', true);
+                }, 700);
                 return;
             }
 
             // v358: klok-tags doen niets vanaf de Logistiek-schermen — anders
             // zou een camionet-tag daar per ongeluk in-/uitklokken.
             if (opLogistiek) {
-                if (window.app) app.toast('Klokken kan niet vanaf Logistiek — ga naar het Klok-scherm');
+                if (window.app && vanBuiten && typeof app.showScanResult === 'function') app.showScanResult(false, 'Nog niet geklokt\nDe app stond op Logistiek. Ga naar Planning of Klok en houd je gsm nog eens tegen de tag.', null, 6000);   // v420
+                else if (window.app) app.toast('Klokken kan niet vanaf Logistiek — ga naar het Klok-scherm');
                 return;
             }
 
@@ -743,6 +798,7 @@ window.QEClock = {
                     let llWerf = null;
                     if (session.llActive && window.app && typeof app.promptLnlWerf === 'function') {
                         hideLoad();
+                        this._vraagOpen = Date.now();   // v417: een nieuwe scan telt niet zolang het scherm open staat
                         try {
                             const nuLL = await this._getNow();
                             llWerf = await app.promptLnlWerf(session, {
@@ -753,6 +809,7 @@ window.QEClock = {
                             console.warn('[Clock] werf-keuze faalde:', e && e.message);
                             llWerf = null;
                         }
+                        this._vraagOpen = 0;
                         if (!llWerf) {
                             console.log('[Clock] L&L afsluiten geannuleerd — geen werf gekozen');
                             if (window.app && app.toast) app.toast('Laden & lossen blijft lopen — kies een werf om af te sluiten');
@@ -760,7 +817,13 @@ window.QEClock = {
                         }
                     }
                     showLoad();
-                    scanResult = await this._handleLadenLossen(session, tag, { werf: llWerf });
+                    scanResult = await this._handleLadenLossen(session, tag, { werf: llWerf, ui: { show: showLoad, hide: hideLoad } });
+                    return;
+                }
+
+                // ── v417: WOON-WERKVERKEER-TAG (terug op het bureau) ──
+                if (tag.type === 'woonwerk') {
+                    scanResult = await this._handleWoonWerk(session, tag, { show: showLoad, hide: hideLoad });
                     return;
                 }
 
@@ -835,13 +898,17 @@ window.QEClock = {
                     // v394: het formulier geeft ook de OPMERKING voor het bureel
                     // terug ({ bevestigd, opmerking }); annuleren blijft false.
                     let uitklokOpmerking = '';
+                    let uitklokRegels = [];   // v417: km-regel + woon-werk-regel (in dezelfde afsluit-PUT)
                     if (window.app && typeof app.promptKilometers === 'function') {
                         try {
                             let hint = null;
                             try { hint = this._uitklokHint(session); } catch (_) {}
-                            const kmRes = await app.promptKilometers(session.workOrderId, session.employeeId, { hint: hint });
+                            const kmRes = await app.promptKilometers(session.workOrderId, session.employeeId, { hint: hint, tag: tag, gps: gpsUit, session: session });
                             kmConfirmed = !!kmRes;
-                            if (kmRes && typeof kmRes === 'object') uitklokOpmerking = String(kmRes.opmerking || '');
+                            if (kmRes && typeof kmRes === 'object') {
+                                uitklokOpmerking = String(kmRes.opmerking || '');
+                                if (Array.isArray(kmRes.extraRegels)) uitklokRegels = kmRes.extraRegels;
+                            }
                         } catch (e) {
                             console.warn('[Clock] km-formulier faalde:', e && e.message);
                             kmConfirmed = false;
@@ -854,7 +921,7 @@ window.QEClock = {
                     }
 
                     showLoad();
-                    scanResult = await this._clockOut(session, tag, { gps: gpsUit, opmerking: uitklokOpmerking });
+                    scanResult = await this._clockOut(session, tag, { gps: gpsUit, opmerking: uitklokOpmerking, extraRegels: uitklokRegels });
                     // v394: uitklok gelukt = de opmerking staat in Robaws → klad weg.
                     // Mislukt? Dan blijft het klad staan en is het bij de volgende
                     // scan meteen weer ingevuld.
@@ -865,6 +932,20 @@ window.QEClock = {
                 }
 
                 // ── GEEN ACTIEVE SESSIE → INCLOCKEN ──
+                // v420: de app stond niet open en een CAMIONET-tag opende ze → eerst vragen. Een gsm die in de
+                // camionet op de tag blijft liggen, mag niet ongevraagd (opnieuw) inklokken. Uitklokken vraagt al
+                // de kilometers; de tags aan het bureau hangen aan de muur (geen vraag).
+                if (vanBuiten && tag.type === 'camionet') {
+                    hideLoad();
+                    this._vraagOpen = Date.now();
+                    let ja = false;
+                    try {
+                        const camNaam = (window.app && typeof app.escapeHtml === 'function') ? app.escapeHtml(tag.name || '') : String(tag.name || '').replace(/[<>&"]/g, '');
+                        ja = await this._showConfirmModal('Inklokken?', 'Je scande de tag van camionet <b>' + camNaam + '</b>.', 'Inklokken', 'Annuleren');
+                    } catch (_) { ja = false; }
+                    this._vraagOpen = 0;
+                    if (!ja) { if (window.app && app.toast) app.toast('Niet ingeklokt'); return; }
+                }
                 showLoad('Locatie zoeken…');   // v386: eerst de locatie, daarna Robaws
                 scanResult = await this._clockIn(session, tag);
             } finally {
@@ -1116,8 +1197,17 @@ window.QEClock = {
 
         const lateMsg = onTimeLabel === 'Te laat' ? ' (te laat!)' : '';
         const woRef = session.workOrderId ? ' (werkbon #' + session.workOrderId + ')' : '';
+        // v416: camionet aan het bureau vanaf 06:00 = bureau-regels → meteen zeggen
+        // dat de uren pas vanaf het startuur tellen (alleen als hij vroeger is)
+        let bureauMsg = '';
+        if (isFirstScan && tag.type === 'camionet' && this.telAlsBureauKlok(session)) {
+            const st = this.getExpectedStartTime();
+            const naarMin = (t) => { const x = String(t || '').match(/^(\d{1,2}):(\d{2})/); return x ? parseInt(x[1], 10) * 60 + parseInt(x[2], 10) : null; };
+            const sM = naarMin(st), iM = naarMin(time);
+            if (sM != null && iM != null && iM < sM) bureauMsg = '\nAan het bureau: je uren tellen vanaf je startuur (' + String(st).slice(0, 5) + ')';
+        }
         const message = isFirstScan
-            ? 'Ingeklokt om ' + time + ' - ' + tag.name + lateMsg + woRef
+            ? 'Ingeklokt om ' + time + ' - ' + tag.name + lateMsg + woRef + bureauMsg
             : 'Extra sessie gestart om ' + time + ' - ' + tag.name + woRef;
         return { ok: true, message, refresh: true };
     },
@@ -1166,7 +1256,7 @@ window.QEClock = {
         if (inMin > start - 15) return null;
         const inTxt = String(session.startTime).slice(0, 5);
         const startTxt = String(eigenStart).slice(0, 5);
-        const bureau = session.tagType === 'bureau';
+        const bureau = this.telAlsBureauKlok(session);   // v416: ook camionet aan het bureau vanaf 06:00
         return {
             soort: 'vroeg',
             tekst: bureau
@@ -1176,6 +1266,246 @@ window.QEClock = {
                 ? 'Was vroeger beginnen afgesproken? Zet het hieronder, dan kan het bureel het rechtzetten.'
                 : 'Afgesproken? Zet het hieronder, dan ziet het bureel het meteen bij het nakijken.',
         };
+    },
+
+    /** v416 (beleid Levi, 5 okt 2026): inklokken op een CAMIONET-tag aan het
+     *  bureau (locatie binnen 500 m) vanaf 06:00 telt als inklokken aan het
+     *  bureau — dezelfde regels als de bureau-klok: de uren tellen pas vanaf
+     *  het startuur. Vóór 06:00 is het bureau nog dicht (vroeger beginnen):
+     *  dan blijft het een camionet-inklok. Zonder locatie = camionet.
+     *  Zelfde bureaupunt en straal als de Worker (uren-maand, inklokUit). */
+    BUREAU_GPS: { lat: 51.2455339, lng: 4.4668473 },   // Deuzeldlaan 36, Schoten
+    BUREAU_STRAAL_KM: 0.5,
+    BUREAU_OPEN_MIN: 6 * 60,                           // 06:00
+    _bijBureau(lat, lng) {
+        if (lat == null || lng == null || lat === '' || lng === '') return null;
+        const la = Number(lat), lo = Number(lng);
+        if (!isFinite(la) || !isFinite(lo)) return null;
+        const r = Math.PI / 180, B = this.BUREAU_GPS;
+        const sLa = Math.sin((la - B.lat) * r / 2), sLo = Math.sin((lo - B.lng) * r / 2);
+        const h = sLa * sLa + Math.cos(la * r) * Math.cos(B.lat * r) * sLo * sLo;
+        return 2 * 6371 * Math.asin(Math.sqrt(h)) <= this.BUREAU_STRAAL_KM;
+    },
+    telAlsBureauKlok(session) {
+        if (!session) return false;
+        if (session.tagType === 'bureau') return true;
+        if (session.tagType !== 'camionet') return false;
+        if (this._bijBureau(session.gpsLat, session.gpsLng) !== true) return false;
+        const m = String(session.startTime || '').match(/^(\d{1,2}):(\d{2})/);
+        return !!m && (parseInt(m[1], 10) * 60 + parseInt(m[2], 10)) >= this.BUREAU_OPEN_MIN;
+    },
+
+    /** v417: de EERSTE klok-in-regel van de dag uit de opmerking — soort, plek
+     *  (blijft op het toestel: alleen voor de routeberekening) en tijd. */
+    _eersteInklok(remark) {
+        const S = String.fromCharCode(8212);
+        for (const regel of String(remark || '').split(/\r?\n/)) {
+            const m = regel.match(/^\s*klok-in\s*:\s*(.+?)\s*$/i);
+            if (!m) continue;
+            const delen = m[1].split(S).map(x => x.trim());
+            const tag = delen[0] || '';
+            const soort = /^\d-[A-Z]{3}-\d{3}/i.test(tag) ? 'camionet' : /^bureau/i.test(tag) ? 'bureau'
+                : /^manueel/i.test(tag) ? 'manueel' : /laden/i.test(tag) ? 'lnl' : 'ander';
+            let lat = null, lng = null, tijd = null;
+            for (const d of delen.slice(1)) {
+                const q = d.match(/[?&]q=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/);
+                if (q) { lat = parseFloat(q[1]); lng = parseFloat(q[2]); }
+                else if (/^\d{1,2}:\d{2}$/.test(d)) tijd = d;
+            }
+            return { soort, lat, lng, tijd };
+        }
+        return null;
+    },
+    /** v417: begon de dag op het bureau? (bureau-tag, of camionet binnen 500 m —
+     *  voor de kilometers en het woon-werkverkeer telt elk uur, niet enkel vanaf 06:00) */
+    _startOpBureau(ei) {
+        return !!ei && (ei.soort === 'bureau' || (ei.soort === 'camionet' && this._bijBureau(ei.lat, ei.lng) === true));
+    },
+
+    // =============================================
+    // v417 (beslissing Levi 5 okt 2026): WOON-WERKVERKEER-TAG
+    // De derde tag aan het bureau. Scannen na het uitklokken op de werf =
+    // "terug op het bureau, met eigen vervoer naar huis": de app herrekent de
+    // terugrit (laatste werf → bureau), vraagt hoe de werknemer naar het werk
+    // kwam (fiets / auto / openbaar vervoer) en schrijft dat in de klok-werkbon.
+    // Nog ingeklokt? Dan eerst uitklokken — de terugrit is geen werktijd.
+    // Locatie wordt meegeschreven maar is niet verplicht (de tag hangt vast).
+    // Laden en lossen afsluiten aan het bureau NA het uitklokken eindigt de dag
+    // ook op het bureau: die scan stelt dezelfde vraag (_lnlWoonWerk, regel
+    // "woon-werk: … — tag Laden en lossen — …"); de derde tag is dan niet nodig.
+    // =============================================
+    async _handleWoonWerk(session, tag, ui) {
+        const nu = await this._getNow();
+        const tijd = this._localTime(nu);
+        const vandaag = this._localDate(nu);
+        const vergrendeldTekst = 'Deze dag is al nagekeken door het bureel\n\nVraag het bureel om je woon-werkverkeer toe te voegen.';
+        // een lopende laden en lossen eerst afsluiten: die scan stelt de vraag dan zelf
+        if (session && session.llActive) {
+            return { ok: false, refresh: false,
+                message: 'Laden en lossen loopt nog\n\nScan eerst de tag Laden en lossen om het af te sluiten.' };
+        }
+        if (session && session.active) {
+            return { ok: false, refresh: false,
+                message: 'Je bent nog ingeklokt\n\nKlok eerst uit (op de werf of aan het bureau) en scan daarna de woon-werkverkeer-tag.' };
+        }
+        const user = RobawsAPI.getLoggedInUser();
+        const userId = user ? (user.robawsUserId || user.userId) : null;
+        const empId = user ? String(user.robawsEmployeeId) : null;
+        // de klok-werkbon van vandaag (ook als hij al afgesloten is), vers gelezen
+        let wo = null;
+        try {
+            let woId = (session && session.workOrderId && String(session.dateStr || session.date || '').slice(0, 10) === vandaag)
+                ? session.workOrderId : null;
+            if (!woId && userId) {
+                const w = await RobawsAPI.getTodaysOpenTimeRegistrationWorkOrder(userId);
+                if (w && w.id) woId = w.id;
+            }
+            if (woId) {
+                const r = await RobawsAPI.get('work-orders/' + woId, { bypassCache: true });
+                if (r.code === 200 && r.data) wo = r.data;
+            }
+        } catch (e) {
+            return { ok: false, refresh: false, message: 'Woon-werkverkeer niet geregistreerd\n\n' + this._netFout(e && e.message) + '\nScan opnieuw.' };
+        }
+        if (!wo || !wo.id) {
+            return { ok: false, refresh: false, message: 'Je bent vandaag niet ingeklokt\n\nDe woon-werkverkeer-tag telt alleen na een werkdag.' };
+        }
+        const al = RobawsAPI.leesWoonWerk(wo.remark);
+        if (al) {
+            return { ok: true, refresh: false,
+                message: 'Woon-werkverkeer stond al geregistreerd\n' + RobawsAPI.WOONWERK_VERVOER[al.vervoer] + (al.tijd ? ' · ' + al.tijd : '') };
+        }
+        if (wo.lockedAt) return { ok: false, refresh: false, message: vergrendeldTekst };
+
+        const r = await this._woonWerkVastleggen(wo, empId, { tijd: tijd, bron: 'tag Woon-werkverkeer', door: 'de woon-werkverkeer-tag', ui: ui });
+        if (r.status === 'nietnu') {
+            if (window.app && app.toast) app.toast('Niet geregistreerd — scan opnieuw als je met je eigen vervoer naar huis gaat');
+            return null;
+        }
+        if (r.status !== 'ok') {
+            return { ok: false, refresh: false, message: r.vergrendeld ? vergrendeldTekst
+                : r.nietBevestigd ? 'Woon-werkverkeer NIET bevestigd\n\nRobaws nam de regel niet over. Scan opnieuw.'
+                : 'Woon-werkverkeer niet opgeslagen\n\n' + r.reden + '\nScan opnieuw.' };
+        }
+        return { ok: true, refresh: true,
+            message: 'Woon-werkverkeer opgeslagen\n' + RobawsAPI.WOONWERK_VERVOER[r.vervoer] + (r.km && r.km.ok ? ' · terugrit ' + r.km.terug + ' km' : '') };
+    },
+
+    /** v417: de gedeelde kern van het woon-werkverkeer aan het bureau (de woon-werkverkeer-tag, en
+     *  laden en lossen afsluiten na het uitklokken). Herrekent de terugrit (laatste werf → bureau),
+     *  vraagt hoe de werknemer naar het werk kwam en schrijft km-regel + woon-werk-regel +
+     *  Fietsvergoeding in één PUT; daarna teruglezen.
+     *  o = { tijd: 'HH:MM', bron: tekst in de regel, door: 'de woon-werkverkeer-tag' | 'laden en lossen',
+     *        kop: titel van het vraagscherm (leeg = "Terug op het bureau"), ui: { show, hide } }
+     *  → { status: 'ok', vervoer, km } | { status: 'nietnu' } | { status: 'fout', vergrendeld, nietBevestigd, reden } */
+    async _woonWerkVastleggen(wo, empId, o) {
+        const ui = o.ui;
+        if (ui && ui.show) ui.show('Terugrit berekenen…');
+        // locatie (niet verplicht)
+        let gps = null;
+        try {
+            const p = await this._getGPS({ timeoutMs: 4000, maximumAge: 120000 });
+            if (p && p.latitude != null && p.longitude != null) {
+                gps = { lat: p.latitude, lng: p.longitude, tekst: 'https://maps.google.com/?q=' + p.latitude.toFixed(6) + ',' + p.longitude.toFixed(6) };
+            }
+        } catch (_) {}
+        // terugrit herrekenen: laatste werf → bureau (heen alleen als er nog geen kilometers staan)
+        const ei = this._eersteInklok(wo.remark);
+        const startBureau = this._startOpBureau(ei);
+        let km = null, ce = null;
+        try {
+            const lijst = await RobawsAPI.getCommuteEntries(wo.id);
+            ce = lijst.find(c => String(c.employeeId || '') === String(empId)) || null;
+        } catch (_) {}
+        if (window.app && typeof app._kmVandaag === 'function') {
+            try {
+                km = await app._kmVandaag(empId, {
+                    startBureau: startBureau,
+                    startGps: (!startBureau && ei && ei.lat != null) ? { lat: ei.lat, lng: ei.lng } : null,
+                    eindeBureau: true,
+                });
+            } catch (e) { km = { ok: false, fout: (e && e.message) || 'onbekend' }; }
+        }
+        if (ui && ui.hide) ui.hide();
+
+        // de vraag (ontwerp B)
+        const kmTekst = km && km.ok
+            ? 'Terugrit herrekend: ' + km.laatsteWerf + ' → bureau, ' + km.terug + ' km'
+            : (km && km.geenWerf ? 'Geen werf in je dagplanning vandaag' : 'Terugrit niet herrekend' + (km && km.fout ? ': ' + km.fout : ''));
+        let vervoer = null;
+        if (window.app && typeof app.promptWoonWerk === 'function') {
+            this._vraagOpen = Date.now();   // een nieuwe scan telt niet zolang dit scherm open staat
+            try { vervoer = await app.promptWoonWerk({ tijd: o.tijd, kmTekst: kmTekst, kop: o.kop }); } catch (_) { vervoer = null; }
+            this._vraagOpen = 0;
+        }
+        if (!vervoer || !RobawsAPI.WOONWERK_VERVOER[vervoer]) return { status: 'nietnu' };
+        if (ui && ui.show) ui.show('Woon-werkverkeer opslaan…');
+
+        // 1. kilometers bijwerken (best effort; de km-regel zegt wat er gebeurde)
+        let kmRegel;
+        if (km && km.ok) {
+            try {
+                if (ce) {
+                    await RobawsAPI.updateCommuteEntry(wo.id, ce.id, { returnDistance: km.terug });
+                    kmRegel = 'km: terug ' + km.terug + ' (' + RobawsAPI._wwSchoon(km.laatsteWerf).slice(0, 90) + ' → bureau) · herrekend door ' + o.door;
+                } else {
+                    const r = await RobawsAPI.addCommuteEntry({ workOrderId: wo.id, employeeId: empId, distance: km.heen, returnDistance: km.terug, mobilityTypeId: -3 });
+                    if (r.code !== 200 && r.code !== 201) throw new Error('Robaws (' + r.code + ')');
+                    kmRegel = RobawsAPI.kmRegel(km) + ' · door ' + o.door;
+                }
+            } catch (e) {
+                kmRegel = 'km: terugrit naar het bureau niet bijgewerkt (' + RobawsAPI._wwSchoon((e && e.message) || 'fout').slice(0, 80) + ')';
+            }
+        } else {
+            kmRegel = km && km.geenWerf ? 'km: geen werf in de dagplanning' : 'km: terugrit niet herrekend (' + RobawsAPI._wwSchoon((km && km.fout) || 'onbekend').slice(0, 100) + ')';
+        }
+        // 2. woon-werk-regel + km-regel + Fietsvergoeding in één PUT
+        const wwRegel = RobawsAPI.woonWerkRegel(vervoer, o.bron, gps ? gps.tekst : '', o.tijd);
+        try {
+            await RobawsAPI.woonWerkRegistreren(wo.id, { regels: [kmRegel, wwRegel], fiets: vervoer === 'fiets' });
+        } catch (e) {
+            return { status: 'fout', vergrendeld: !!(e && e.code === 423), reden: this._netFout(e && e.message) };
+        }
+        // 3. controle: staat het er écht? (een mislukte leescontrole maakt van de 2xx geen leugen)
+        try {
+            const r = await RobawsAPI.get('work-orders/' + wo.id, { bypassCache: true });
+            if (r.code === 200 && r.data) {
+                const ww = RobawsAPI.leesWoonWerk(r.data.remark);
+                if (!ww || ww.vervoer !== vervoer) return { status: 'fout', nietBevestigd: true, reden: 'Robaws nam de regel niet over.' };
+            }
+        } catch (_) {}
+        return { status: 'ok', vervoer: vervoer, km: km };
+    },
+
+    /** v417 (beslissing Levi 5 okt 2026): laden en lossen afgesloten aan het bureau terwijl de werkdag
+     *  al uitgeklokt is (op de werf) = de dag eindigt op het bureau: dezelfde vraag als de
+     *  woon-werkverkeer-tag (terugrit herrekend naar het bureau, fiets / auto / openbaar vervoer).
+     *  Nog ingeklokt (laden 's morgens), al geregistreerd, vergrendeld of een andere dag = niets vragen.
+     *  Geeft een extra regel voor het eindscherm ('' = niets te melden). */
+    async _lnlWoonWerk(session, tijd, ui) {
+        if (!window.app || typeof app.promptWoonWerk !== 'function') return '';
+        const woId = session && session.workOrderId;
+        const empId = String((session && session.employeeId) || '');
+        if (!woId || !empId) return '';
+        const vandaag = this._localDate(await this._getNow());
+        let wo = null;
+        try {
+            const r = await RobawsAPI.get('work-orders/' + woId, { bypassCache: true });
+            if (r.code === 200 && r.data) wo = r.data;
+        } catch (_) {}
+        if (!wo) return 'Ga je met je eigen vervoer naar huis? Scan dan nog de woon-werkverkeer-tag.';
+        if (String(wo.date || '').slice(0, 10) !== vandaag) return '';
+        const ef = wo.extraFields || {};
+        if (!(ef.Uitgeklokt && ef.Uitgeklokt.stringValue)) return '';   // nog ingeklokt: de dag eindigt later
+        if (RobawsAPI.leesWoonWerk(wo.remark)) return '';               // al geregistreerd (aan het bureau uitgeklokt of de tag)
+        if (wo.lockedAt) return '';
+        const r = await this._woonWerkVastleggen(wo, empId, { tijd: tijd, bron: 'tag Laden en lossen', door: 'laden en lossen', kop: 'Laden en lossen klaar', ui: ui });
+        if (r.status === 'ok') {
+            return 'Woon-werkverkeer opgeslagen: ' + RobawsAPI.WOONWERK_VERVOER[r.vervoer] + (r.km && r.km.ok ? ' · terugrit ' + r.km.terug + ' km' : '');
+        }
+        if (r.status === 'nietnu') return 'Woon-werkverkeer niet geregistreerd. Ga je met je eigen vervoer naar huis? Scan dan de woon-werkverkeer-tag.';
+        if (r.vergrendeld) return 'Woon-werkverkeer niet opgeslagen: deze dag is al nagekeken door het bureel. Vraag het bureel om het toe te voegen.';
+        return 'Woon-werkverkeer NIET opgeslagen (' + r.reden + '). Scan de woon-werkverkeer-tag om het opnieuw te proberen.';
     },
 
     /** v381: de tijdsblok-grenzen van een uitklok — ÉÉN berekening voor de
@@ -1207,7 +1537,8 @@ window.QEClock = {
         };
         const actualStartMin = toMinutes(session && session.startTime);
         const expectedStartMin = toMinutes(this.getExpectedStartTime());
-        const useStartuurCorrection = !!(session && session.tagType === 'bureau');
+        // v416: ook een camionet-inklok aan het bureau vanaf 06:00 (telAlsBureauKlok)
+        const useStartuurCorrection = this.telAlsBureauKlok(session);
         const entryStartMin = useStartuurCorrection
             ? Math.max(roundUp15(actualStartMin), expectedStartMin)
             : roundUp15(actualStartMin);
@@ -1463,14 +1794,24 @@ window.QEClock = {
         let exTimedStarts = null;   // Set van startminuten
         let exPrevHours = null;     // som uren van blokken vóór entryStartMin
         let exUntimed = null;       // [{id, hours, isOver}]
+        let exAfwUren = 0;          // v421: ziek/verlof voor de rest van de dag (door het bureel)
         try {
             // (v305 / 1.x v300) bypassCache → LIVE-pool, niet de replica: dit is
             // de idempotency-read; een verouderde kopie zou dubbel kunnen boeken.
             const exRes = await RobawsAPI.get(`work-orders/${session.workOrderId}/time-entries?limit=100`, { bypassCache: true });
             const exItems = (exRes.data && (exRes.data.items || exRes.data)) || [];
+            // v421: ziek of verlof (de rest van de dag, gezet in het uren-scherm) is nooit werk of aanvulling,
+            // maar de 8u-aanvulling vult wel alleen aan tot 8 u min die uren.
+            for (const te of exItems) {
+                if (!RobawsAPI.urenAfwSoort(te)) continue;
+                if (te.employeeId && String(te.employeeId) !== String(session.employeeId || '')) continue;
+                if (te.startTime == null && te.endTime == null) exAfwUren += (parseFloat(te.hours) || 0);
+            }
+            exAfwUren = Math.round(exAfwUren * 100) / 100;
             const mijn = exItems.filter(te => {
                 const aId = te.articleId || (te.article && te.article.id);
                 if (String(aId) !== String(ART_MONTEUR)) return false;
+                if (RobawsAPI.urenAfwSoort(te)) return false;   // v421
                 return String(te.employeeId || '') === String(session.employeeId || '');
             });
             exTimedStarts = new Set();
@@ -1598,10 +1939,16 @@ window.QEClock = {
             // 8u werkuren met gelijke overuren-aftrek; L&L telt niet mee;
             // geen aanvulling op weekend of bij < 1u dag-totaal.)
             {
-                let targetPhantom = Math.max(0, 8 - dayKlantHours);
+                // v421: ziek/verlof voor de rest van de dag telt mee om aan 8 u te komen
+                let targetPhantom = Math.max(0, 8 - dayKlantHours - exAfwUren);
                 let skipReason = '';
                 if (isWeekendOut) { targetPhantom = 0; skipReason = 'weekend'; }
                 else if (dayKlantHours < 1) { targetPhantom = 0; skipReason = 'korte dag (<1u)'; }
+                // v421: het bureel koos "niet aanvullen" voor deze dag (regel in de opmerking)
+                if (targetPhantom > 0 && (await this._restKeuzeVanBon(session.workOrderId)) === 'geen') {
+                    targetPhantom = 0; skipReason = 'niet aanvullen (keuze van het bureel)';
+                }
+                if (exAfwUren > 0) uitklokNote += '\n(rest van de dag: ' + exAfwUren.toFixed(2) + 'u ziek/verlof, gezet door het bureel)';
                 targetPhantom = Math.round(targetPhantom * 100) / 100;
                 const fouten = await this._reconcileAanvulling({
                     workOrderId: session.workOrderId,
@@ -1637,8 +1984,11 @@ window.QEClock = {
         // alleen het afsluiten opnieuw (de idempotency-check hierboven slaat
         // het dubbel posten van de uren dan over).
         try {
+            // v417: de km-regel en (op het bureau) de woon-werk-regel gaan mee in dezelfde PUT
+            const _regels = (opmRegel ? [opmRegel] : [])
+                .concat((opts2.extraRegels || []).map(r => String(r || '').trim()).filter(Boolean));
             await RobawsAPI.setTimeRegistrationUitgeklokt(session.workOrderId, endTimeRaw, klokUitLine,
-                opmRegel ? [opmRegel] : null);
+                _regels.length ? _regels : null);
         } catch(e) {
             console.warn('[Clock] Uitgeklokt update faalde:', e.message);
             return {
@@ -1728,6 +2078,16 @@ window.QEClock = {
     // bij fouten herstelt de eerstvolgende scan het vanzelf (Robaws is de
     // bron van waarheid, geen lokale tellers meer).
     // =============================================
+    // v421: de keuze van het bureel voor de rest van de dag (regel "rest van de dag: …" in de opmerking van
+    // de klok-werkbon). Alleen nodig om "niet aanvullen" te respecteren; bij een leesfout = gewoon aanvullen.
+    async _restKeuzeVanBon(workOrderId) {
+        try {
+            const r = await RobawsAPI.get(`work-orders/${workOrderId}`, { bypassCache: true });
+            if (r && r.code === 200 && r.data) return RobawsAPI.leesRestKeuze(r.data.remark);
+        } catch (_) {}
+        return null;
+    },
+
     async _reconcileAanvulling({ workOrderId, employeeId, target, date, untimed }) {
         const ART = String(RobawsAPI.WERKUUR_ARTICLE_IDS.monteurProject);
         const HT_W = RobawsAPI.HOUR_TYPE_IDS.werkuren;
@@ -1743,6 +2103,7 @@ window.QEClock = {
                 for (const te of items) {
                     const aId = te.articleId || (te.article && te.article.id);
                     if (String(aId) !== ART) continue;
+                    if (RobawsAPI.urenAfwSoort(te)) continue;   // v421: ziek/verlof is nooit aanvulling
                     if (String(te.employeeId || '') !== String(employeeId || '')) continue;
                     if (te.startTime != null || te.endTime != null) continue;
                     const h = parseFloat(te.hours) || 0;
@@ -1958,9 +2319,20 @@ window.QEClock = {
             session.llWerfKeuze = null;
             this._saveSession(session);
 
+            // v417 (beslissing Levi 5 okt 2026): laden en lossen afgesloten aan het bureau NA het
+            // uitklokken = de dag eindigt op het bureau: dezelfde vraag als de woon-werkverkeer-tag.
+            // Een fout hier raakt de laden en lossen niet meer (die staat al dicht).
+            let wwTekst = '';
+            try {
+                wwTekst = await this._lnlWoonWerk(session, time, opts && opts.ui);
+            } catch (e) {
+                console.warn('[Clock] woon-werkverkeer na L&L faalde:', e && e.message);
+                wwTekst = 'Woon-werkverkeer niet geregistreerd. Ga je met je eigen vervoer naar huis? Scan dan de woon-werkverkeer-tag.';
+            }
+
             return {
                 ok: true,
-                message: 'Laden & Lossen klaar\n' + llStartRounded + ' - ' + llEnd + (werfTekst ? '\n' + werfTekst : ''),
+                message: 'Laden & Lossen klaar\n' + llStartRounded + ' - ' + llEnd + (werfTekst ? '\n' + werfTekst : '') + (wwTekst ? '\n' + wwTekst : ''),
                 refresh: true,
             };
         }
@@ -2242,8 +2614,8 @@ window.QEClock = {
     _pendingAssignment: null,
 
     /** Start toewijzingsmodus: fullscreen scan-overlay */
-    startTagAssignment(fieldName, locationName, saveFn) {
-        this._pendingAssignment = { fieldName, locationName, saveFn };
+    startTagAssignment(fieldName, locationName, saveFn, soort) {
+        this._pendingAssignment = { fieldName, locationName, saveFn, soort: soort || null };
 
         // Maak fullscreen overlay
         const overlay = document.createElement('div');
@@ -2323,6 +2695,22 @@ window.QEClock = {
         }
 
         try {
+            // v417: de woon-werkverkeer-tag mag nooit ook een andere klok-tag zijn (en omgekeerd)
+            const _norm = (v) => String(v || '').trim().toLowerCase();
+            const _bekend = this.identifyTag(tagId);
+            if (assignment.soort === 'wwv' && _bekend && _bekend.type !== 'woonwerk') {
+                throw new Error('Deze tag is al de tag van ' + _bekend.name);
+            }
+            let _wwv = null;
+            try { _wwv = RobawsAPI.wwvTag(); } catch (_) {}
+            if (assignment.soort !== 'wwv' && _wwv && _norm(_wwv) === _norm(tagId)) {
+                throw new Error('Deze tag is de woon-werkverkeer-tag');
+            }
+            // v420: een tag die aan materieel hangt, kan geen klok-tag worden (en omgekeerd: zie gereedschapTagToewijzen)
+            if (assignment.soort !== 'materieel' && window.app && typeof app._matTagMap === 'function' && typeof app._matNfcNorm === 'function') {
+                const mid = app._matTagMap().m[app._matNfcNorm(tagId)];
+                if (mid) throw new Error('Deze tag hangt al aan materieel — neem een andere tag');
+            }
             if (assignment.saveFn) {
                 // v358: materieel-tag (of andere niet-klok-toewijzing)
                 await assignment.saveFn(tagId);
@@ -2597,6 +2985,12 @@ window.QEClock = {
             else if (tn.includes('laden')) session.tagType = 'laden_lossen';
             else session.tagType = 'camionet';
         }
+        // v416: ook de locatie van die inklok herstellen — de bureau-regel voor
+        // een camionet-inklok aan het bureau vanaf 06:00 heeft ze nodig
+        if (session.tagType === 'camionet' && (session.gpsLat == null || session.gpsLng == null)) {
+            const _q = _firstLine.match(/[?&]q=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/);
+            if (_q) { session.gpsLat = parseFloat(_q[1]); session.gpsLng = parseFloat(_q[2]); }
+        }
         if (uitgeklokt && !keepLocalStart) {
             session.endTime = uitgeklokt;
         }
@@ -2631,6 +3025,7 @@ window.QEClock = {
                 for (const te of _teItems) {
                     const aId = String(te.articleId || (te.article && te.article.id) || '');
                     if (aId !== ART) continue;
+                    if (RobawsAPI.urenAfwSoort(te)) continue;   // v421: ziek/verlof is geen werk of aanvulling
                     if (String(te.employeeId || '') !== String(session.employeeId || '')) continue;
                     if (te.startTime != null && te.endTime != null) {
                         const h = parseFloat(te.hours);
@@ -2721,6 +3116,11 @@ window.QEClock = {
         // L&L tag
         html += this._renderTagRow('📦', 'Laden & Lossen', config.ladenLossen, 'NFC Bureau Tag Laden & Lossen');
 
+        // v417: woon-werkverkeer-tag (nummer in de Worker-kluis)
+        let wwv = null;
+        try { wwv = RobawsAPI.wwvTag(); } catch (_) {}
+        html += this._renderTagRow('🏠', 'Woon-werkverkeer', { tagId: wwv }, '', 'wwv');
+
         // Camionetten
         for (const cam of (config.camionetten || [])) {
             html += this._renderTagRow('🚐', cam.name, cam, cam.fieldName);
@@ -2732,17 +3132,22 @@ window.QEClock = {
     /** Hulpje: uniek ID voor elke tag-rij zodat onclick via data-attributen werkt */
     _tagRowCounter: 0,
 
-    _renderTagRow(icon, name, tagData, fieldName) {
+    _renderTagRow(icon, name, tagData, fieldName, soort) {
         const tagId = tagData && tagData.tagId ? tagData.tagId : null;
         // v359: camionet-tags uit Materieel dragen materialId i.p.v. fieldName
         const materialId = tagData && tagData.materialId ? String(tagData.materialId) : '';
         const statusColor = tagId ? 'var(--qe-green)' : 'var(--qe-orange)';
-        const statusText = tagId ? tagId.substring(0, 16) + (tagId.length > 16 ? '...' : '') : 'Niet ingesteld';
+        let statusText = tagId ? tagId.substring(0, 16) + (tagId.length > 16 ? '...' : '') : 'Niet ingesteld';
+        // v420: weet dit toestel of de tag het klok-merkteken draagt (= opent de app vanzelf)?
+        let merk = null;
+        try { merk = (tagId && window.app && typeof app.klokMerkStand === 'function') ? app.klokMerkStand(tagId) : null; } catch (_) {}
+        if (merk && merk.ok) statusText += ' · opent de app ✓';
+        const schrijfBtn = tagId ? `<button data-action="write" data-tag="${this._htmlAttr(tagId)}" data-name="${this._htmlAttr(name)}" title="QE-klokmerkteken op de tag zetten: de app opent dan vanzelf" style="font-size:13px;background:none;border:1px solid var(--qe-purple);border-radius:6px;cursor:pointer;padding:3px 7px">✍️</button>` : '';
         const rowId = 'tagRow_' + (this._tagRowCounter++);
 
         // Sla fieldName en name op als data-attributen (veilig, geen escaping issues)
-        const clearBtn = tagId ? `<button data-action="clear" data-field="${this._htmlAttr(fieldName)}" data-material-id="${this._htmlAttr(materialId)}" style="font-size:11px;color:#E53935;background:none;border:none;cursor:pointer;padding:4px" title="Verwijder tag">✕</button>` : '';
-        const scanBtn = `<button data-action="assign" data-field="${this._htmlAttr(fieldName)}" data-material-id="${this._htmlAttr(materialId)}" data-name="${this._htmlAttr(name)}" style="font-size:11px;color:var(--qe-purple);background:none;border:1px solid var(--qe-purple);border-radius:6px;cursor:pointer;padding:4px 8px">📱 Scan</button>`;
+        const clearBtn = tagId ? `<button data-action="clear" data-field="${this._htmlAttr(fieldName)}" data-material-id="${this._htmlAttr(materialId)}" data-soort="${this._htmlAttr(soort || '')}" style="font-size:11px;color:#E53935;background:none;border:none;cursor:pointer;padding:4px" title="Verwijder tag">✕</button>` : '';
+        const scanBtn = `<button data-action="assign" data-field="${this._htmlAttr(fieldName)}" data-material-id="${this._htmlAttr(materialId)}" data-name="${this._htmlAttr(name)}" data-soort="${this._htmlAttr(soort || '')}" style="font-size:11px;color:var(--qe-purple);background:none;border:1px solid var(--qe-purple);border-radius:6px;cursor:pointer;padding:4px 8px">📱 Scan</button>`;
 
         return `<div id="${rowId}" style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid #f0f0f0">
             <div style="display:flex;align-items:center;gap:10px">
@@ -2752,7 +3157,7 @@ window.QEClock = {
                     <div style="font-size:11px;color:${statusColor};font-family:monospace">${statusText}</div>
                 </div>
             </div>
-            <div style="display:flex;align-items:center;gap:4px">${scanBtn}${clearBtn}</div>
+            <div style="display:flex;align-items:center;gap:4px">${scanBtn}${schrijfBtn}${clearBtn}</div>
         </div>`;
     },
 
@@ -2771,7 +3176,13 @@ window.QEClock = {
                 const fieldName = btn.getAttribute('data-field');
                 const materialId = btn.getAttribute('data-material-id');
                 const locName = btn.getAttribute('data-name');
-                if (!fieldName && materialId) {
+                if (btn.getAttribute('data-soort') === 'wwv') {
+                    // v417: woon-werkverkeer-tag → de Worker-kluis
+                    QEClock.startTagAssignment(null, locName, async (tagId) => {
+                        await RobawsAPI.wwvTagOpslaan(tagId);
+                        QEClock._klokTagsNaarApk();   // v420
+                    }, 'wwv');
+                } else if (!fieldName && materialId) {
                     // v359: tag hoort bij een voertuig-MATERIAAL → daar opslaan
                     QEClock.startTagAssignment(null, locName, async (tagId) => {
                         await RobawsAPI.setMaterialNfcTag(materialId, tagId);
@@ -2782,19 +3193,27 @@ window.QEClock = {
                 }
             });
         });
+        // v420: ✍️ = het QE-klokmerkteken op deze tag schrijven (alleen díe tag)
+        container.querySelectorAll('button[data-action="write"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (window.app && typeof app.klokTagBeschrijf === 'function') app.klokTagBeschrijf(btn.getAttribute('data-tag'), btn.getAttribute('data-name'));
+            });
+        });
         container.querySelectorAll('button[data-action="clear"]').forEach(btn => {
             btn.addEventListener('click', () => {
                 const fieldName = btn.getAttribute('data-field');
                 const materialId = btn.getAttribute('data-material-id');
-                QEClock._clearTag(fieldName, materialId);
+                QEClock._clearTag(fieldName, materialId, btn.getAttribute('data-soort'));
             });
         });
     },
 
-    async _clearTag(fieldName, materialId) {
+    async _clearTag(fieldName, materialId, soort) {
         if (!confirm('Weet je zeker dat je deze tag wilt verwijderen?')) return;
         try {
-            if (!fieldName && materialId) {
+            if (soort === 'wwv') {
+                await RobawsAPI.wwvTagOpslaan(null);   // v417
+            } else if (!fieldName && materialId) {
                 // v359: tag staat op het voertuig-materiaal
                 await RobawsAPI.setMaterialNfcTag(materialId, null);
             } else {
@@ -3065,6 +3484,7 @@ window.QEClock = {
         // Bestaande entries: eerder gepresteerde blokken + aanvulling-entries
         const ART = RobawsAPI.WERKUUR_ARTICLE_IDS.monteurProject;
         let prevHours = 0, lastEndMin = null;
+        let afwUren = 0;   // v421: ziek/verlof voor de rest van de dag (door het bureel)
         const untimed = [];
         const exStartSet = new Set();  // v324: per-blok-idempotency (zoals _clockOut)
         const HT_W = RobawsAPI.HOUR_TYPE_IDS.werkuren;
@@ -3073,6 +3493,12 @@ window.QEClock = {
             const teRes = await RobawsAPI.get(`work-orders/${wo.id}/time-entries?limit=100`, { bypassCache: true });
             const items = (teRes.data && (teRes.data.items || teRes.data)) || [];
             for (const te of items) {
+                if (RobawsAPI.urenAfwSoort(te)) {
+                    // v421: geen werk en geen aanvulling, maar wel mee om aan 8 u te komen
+                    if ((!te.employeeId || String(te.employeeId) === String(att.employeeId || ''))
+                        && te.startTime == null && te.endTime == null) afwUren += (parseFloat(te.hours) || 0);
+                    continue;
+                }
                 const aId = String(te.articleId || (te.article && te.article.id) || '');
                 if (aId !== String(ART)) continue;
                 if (String(te.employeeId || '') !== String(att.employeeId || '')) continue;
@@ -3202,8 +3628,10 @@ window.QEClock = {
 
             // v257: 8u-aanvulling HERREKENEN (zelfde helper als _clockOut) —
             // weekend/<1u dag-totaal = geen aanvulling.
-            let target = Math.max(0, 8 - dayKlant);
+            // v421: ziek/verlof voor de rest van de dag telt mee; "niet aanvullen" van het bureel = geen aanvulling
+            let target = Math.max(0, 8 - dayKlant - afwUren);
             if (isWeekend || dayKlant < 1) target = 0;
+            if (target > 0 && RobawsAPI.leesRestKeuze(wo.remark) === 'geen') target = 0;
             target = Math.round(target * 100) / 100;
             const fouten = await this._reconcileAanvulling({
                 workOrderId: wo.id,
