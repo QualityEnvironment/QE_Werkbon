@@ -859,15 +859,22 @@ window.QEClock = {
                     // Voor monteurs met 1 openstaande werkbon biedt het de uren-
                     // overname + auto-submit aan. Bij blokkade: niet uitklokken.
                     let canProceed = true;
+                    // v422: de overname zet in uitklokCtx.eindTijd de uitkloktijd waarmee de uren naar de
+                    // werkbon(nen) gingen; de klok boekt straks met dezelfde tijd (nooit meer of minder uren).
+                    // Zolang de vragen (verdelen, voor wie) open staan telt een nieuwe scan niet (_vraagOpen).
+                    const uitklokCtx = {};
+                    this._vraagOpen = Date.now();
                     try {
                         if (window.app && typeof app.checkAndHandleOpenWorkordersBeforeClockOut === 'function') {
-                            canProceed = await app.checkAndHandleOpenWorkordersBeforeClockOut(session);
+                            canProceed = await app.checkAndHandleOpenWorkordersBeforeClockOut(session, uitklokCtx);
                         }
                     } catch(e) {
                         console.warn('[Clock] openstaande-werkbon check faalde:', e && e.message);
                         // Bij onverwachte fout: laat uitklokken door zodat een
                         // bug in de check de werknemer niet vasthoudt.
                         canProceed = true;
+                    } finally {
+                        this._vraagOpen = 0;
                     }
                     if (!canProceed) {
                         console.log('[Clock] Uitklokken geblokkeerd — openstaande werkbon(s)');
@@ -921,7 +928,7 @@ window.QEClock = {
                     }
 
                     showLoad();
-                    scanResult = await this._clockOut(session, tag, { gps: gpsUit, opmerking: uitklokOpmerking, extraRegels: uitklokRegels });
+                    scanResult = await this._clockOut(session, tag, { gps: gpsUit, opmerking: uitklokOpmerking, extraRegels: uitklokRegels, eindTijd: uitklokCtx.eindTijd || null });
                     // v394: uitklok gelukt = de opmerking staat in Robaws → klad weg.
                     // Mislukt? Dan blijft het klad staan en is het bij de volgende
                     // scan meteen weer ingevuld.
@@ -1549,11 +1556,102 @@ window.QEClock = {
             useStartuurCorrection,
         };
     },
+
+    /** v422: de PAUZE van een uitklok — ÉÉN regel voor de klok (_clockOut) én de uren-overname naar de
+     *  werkbonnen (app.checkAndHandleOpenWorkordersBeforeClockOut). Persoonlijke pauze (fiche "Pauze", anders
+     *  de bewaarde, anders 60); een technieker in de monteur-rol 45 (v326); maar één keer per dag: een tweede
+     *  sessie krijgt 0 (v214). De Robaws-regel (eerder blok op de klok-werkbon = pauze al genomen, v327) zit
+     *  in _clockOut en in nettoVoorUitklok. */
+    pauzeVoorSessie(session) {
+        let minuten = this._personalPauze;
+        let bron = 'config';
+        if (!minuten && minuten !== 0) {
+            const user = RobawsAPI.getLoggedInUser();
+            const userId = user ? String(user.robawsEmployeeId) : null;
+            if (userId) {
+                const cached = localStorage.getItem(`qe_pauze_${userId}`);
+                if (cached) {
+                    minuten = parseInt(cached, 10);
+                    bron = 'localStorage';
+                }
+            }
+        }
+        if (!minuten && minuten !== 0) {
+            minuten = 60;
+            bron = 'fallback-60';
+        }
+        // v326: beleidsregel (Levi, 5 aug 2026) — een TECHNIEKER die in monteur-rol werkt volgt het
+        // monteur-regime: pauze 45 min i.p.v. zijn fiche-pauze.
+        try {
+            if (window.app && app.currentUser && app.currentUser.role === 'technieker'
+                    && typeof app._activeRole === 'function' && app._activeRole() === 'monteur') {
+                minuten = 45;
+                bron = 'monteur-rol (45)';
+            }
+        } catch (_) {}
+        // v214: pauze maar ÉÉN keer per dag aftrekken. Bij een tweede sessie (ochtend + namiddag op dezelfde
+        // werkbon) werd de volledige pauze voorheen bij ELKE uitklok opnieuw afgetrokken.
+        const isFirstSessionOfDay = !(((session && session.completedSessions) || []).length > 0);
+        if (!isFirstSessionOfDay && minuten > 0) {
+            console.log('[Clock] pauze al toegepast bij eerdere sessie vandaag — nu 0 (was ' + minuten + 'min)');
+            minuten = 0;
+            bron = 'reeds toegepast (sessie 2+)';
+        }
+        return { minuten, bron };
+    },
+
+    /** v422: som van de uren van de getimede blokken van deze werknemer die VÓÓR dit uitklok-blok begonnen
+     *  (artikel 185, geen ziek/verlof) = zelfde lezing als exPrevHours in _clockOut. */
+    _eerdereBlokUren(items, employeeId, entryStartMin) {
+        const ART = RobawsAPI.WERKUUR_ARTICLE_IDS.monteurProject;
+        let som = 0;
+        for (const te of (Array.isArray(items) ? items : [])) {
+            if (!te) continue;
+            const aId = te.articleId || (te.article && te.article.id);
+            if (String(aId) !== String(ART)) continue;
+            if (RobawsAPI.urenAfwSoort(te)) continue;
+            if (String(te.employeeId || '') !== String(employeeId || '')) continue;
+            if (te.startTime == null) continue;
+            const sMin = (te.startTime.hour || 0) * 60 + (te.startTime.minute || 0);
+            if (sMin < entryStartMin) som += (parseFloat(te.hours) || 0);
+        }
+        return Math.round(som * 100) / 100;
+    },
+
+    /** v422: de NETTO-uren van deze uitklok, precies zoals _clockOut ze zal boeken (dezelfde grenzen via
+     *  berekenEntryTijden, dezelfde pauze-regels). Voor de uren-overname naar de werkbonnen bij het
+     *  uitklokken: zo dragen de werkbonnen nooit meer of minder dan de klok (vraag Levi 12 okt 2026).
+     *  endTimeRaw = 'HH:MM' (exacte uitkloktijd; de klok krijgt daarna dezelfde via opts.eindTijd).
+     *  Geeft { entryStartMin, entryEndMin, entryStart, entryEnd, endTimeRaw, pauze, pauzeBron, netMin }. */
+    async nettoVoorUitklok(session, endTimeRaw) {
+        const et = this.berekenEntryTijden(session, endTimeRaw);
+        const pz = this.pauzeVoorSessie(session);
+        let pauze = pz.minuten || 0;
+        let bron = pz.bron;
+        // v327-regel: staat er vandaag al een eerder getimed blok van deze werknemer op de klok-werkbon, dan
+        // zat de pauze daar al in. Lezen mislukt = de lokale regel blijft (zoals _clockOut).
+        if (pauze > 0 && session && session.workOrderId) {
+            try {
+                const exRes = await RobawsAPI.get(`work-orders/${session.workOrderId}/time-entries?limit=100`, { bypassCache: true });
+                const items = (exRes && exRes.data && (exRes.data.items || exRes.data)) || [];
+                if (this._eerdereBlokUren(items, session.employeeId, et.entryStartMin) > 0) {
+                    pauze = 0;
+                    bron = 'reeds toegepast (Robaws-blok)';
+                }
+            } catch (_) { /* lokale regel blijft */ }
+        }
+        const netMin = Math.max(0, et.entryEndMin - et.entryStartMin - pauze);
+        return Object.assign({}, et, { endTimeRaw: endTimeRaw, pauze: pauze, pauzeBron: bron, netMin: netMin });
+    },
+
     async _clockOut(session, tag, opts) {
         const opts2 = opts || {};
         const now = await this._getNow();
         // v215: forcedEndTime → een gisteren-sessie afsluiten op 23:45
-        const endTimeRaw = opts2.forcedEndTime || this._localTime(now);
+        // v422: eindTijd = de uitkloktijd waarmee de uren al naar de werkbon(nen) gingen (overname bij het
+        // uitklokken): de klok boekt dan exact dezelfde uren, ook als het kilometerscherm even openstond.
+        const eindTijd = (opts2.eindTijd && /^\d{1,2}:\d{2}$/.test(String(opts2.eindTijd))) ? String(opts2.eindTijd) : null;
+        const endTimeRaw = opts2.forcedEndTime || eindTijd || this._localTime(now);
         // v215: de regels (weekend-check + weekend-uurtype-adjust) gelden
         // voor de dag VAN DE SESSIE, niet per se vandaag.
         const ruleDateStr = session.date || this._localDate();
@@ -1578,44 +1676,11 @@ window.QEClock = {
             openLLNote = '\n(Let op: Laden & Lossen staat nog open — scan de L&L-tag om dat blok af te sluiten)';
         }
 
-        // Pauze ophalen (v56 logica)
-        let pauseMinutes = this._personalPauze;
-        let pauseSource = 'config';
-        if (!pauseMinutes && pauseMinutes !== 0) {
-            const user = RobawsAPI.getLoggedInUser();
-            const userId = user ? String(user.robawsEmployeeId) : null;
-            if (userId) {
-                const cached = localStorage.getItem(`qe_pauze_${userId}`);
-                if (cached) {
-                    pauseMinutes = parseInt(cached, 10);
-                    pauseSource = 'localStorage';
-                }
-            }
-        }
-        if (!pauseMinutes && pauseMinutes !== 0) {
-            pauseMinutes = 60;
-            pauseSource = 'fallback-60';
-        }
-        // v326: beleidsregel (Levi, 5 aug 2026) — een TECHNIEKER die in
-        // monteur-rol werkt volgt het monteur-regime: pauze 45 min i.p.v.
-        // zijn fiche-pauze. Zelfde regel in app.js _fillKlokurenForMonteur
-        // zodat tijdsregistratie en werkbon-overname identiek boeken.
-        try {
-            if (window.app && app.currentUser && app.currentUser.role === 'technieker'
-                    && typeof app._activeRole === 'function' && app._activeRole() === 'monteur') {
-                pauseMinutes = 45;
-                pauseSource = 'monteur-rol (45)';
-            }
-        } catch (_) {}
-        // v214: pauze maar ÉÉN keer per dag aftrekken. Bij een tweede sessie
-        // (ochtend + namiddag op dezelfde werkbon) werd de volledige pauze
-        // voorheen bij ELKE uitklok opnieuw afgetrokken.
-        const isFirstSessionOfDay = !((session.completedSessions || []).length > 0);
-        if (!isFirstSessionOfDay && pauseMinutes > 0) {
-            console.log('[Clock] pauze al toegepast bij eerdere sessie vandaag — nu 0 (was ' + pauseMinutes + 'min)');
-            pauseMinutes = 0;
-            pauseSource = 'reeds toegepast (sessie 2+)';
-        }
+        // Pauze ophalen (v56 logica) — v422: de gedeelde regel (pauzeVoorSessie), zodat de uren-overname
+        // naar de werkbonnen exact dezelfde pauze aftrekt (persoonlijk / monteur-rol 45 / 1× per dag).
+        const _pz = this.pauzeVoorSessie(session);
+        let pauseMinutes = _pz.minuten;
+        let pauseSource = _pz.bron;
 
         // Bepaal start- en eindtijd voor time-entry
         // - Start = MAX(actual scan-tijd, startuur werknemer); rond af op 5min indien te laat
@@ -2661,6 +2726,7 @@ window.QEClock = {
             setTimeout(() => {
                 this._removeNfcOverlay();
                 if (window.app && app.currentScreen === 'screenClock') app.onNavigateToClock();
+                else if (window.app && app.currentScreen === 'screenNfcTags') app.loadNfcTags();   // v431
             }, 1500);
         }
     },
@@ -3104,7 +3170,10 @@ window.QEClock = {
     // =============================================
 
     /** Render tag beheer HTML voor het klokscherm */
-    renderTagAdmin() {
+    renderTagAdmin(opts) {
+        // v431: opts.zonderMateriaal = camionetten die op een voertuig in Materieel staan niet tonen (het scherm NFC tags
+        // in Logistiek toont die bij de voertuigen)
+        const o = opts || {};
         const config = this.getTagConfig();
         if (!config) return '<p class="text-grey text-sm">NFC configuratie niet geladen</p>';
 
@@ -3123,6 +3192,7 @@ window.QEClock = {
 
         // Camionetten
         for (const cam of (config.camionetten || [])) {
+            if (o.zonderMateriaal && cam.materialId) continue;
             html += this._renderTagRow('🚐', cam.name, cam, cam.fieldName);
         }
 
@@ -3168,8 +3238,8 @@ window.QEClock = {
     },
 
     /** Bind click events op tag admin knoppen (aanroepen na innerHTML) */
-    bindTagAdminEvents() {
-        const container = document.getElementById('clockTagList');
+    bindTagAdminEvents(containerId) {
+        const container = document.getElementById(containerId || 'clockTagList');   // v431: ook in Logistiek → NFC tags
         if (!container) return;
         container.querySelectorAll('button[data-action="assign"]').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -3223,6 +3293,7 @@ window.QEClock = {
             if (window.app) {
                 app.toast('Tag verwijderd ✓');
                 if (app.currentScreen === 'screenClock') app.onNavigateToClock();
+                else if (app.currentScreen === 'screenNfcTags') app.loadNfcTags();   // v431
             }
         } catch (e) {
             if (window.app) app.toast('Kon tag niet verwijderen: ' + e.message, true);

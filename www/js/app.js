@@ -169,6 +169,24 @@ const app = {
         // de app naar het vorige scherm te navigeren.
         if (!window._qeBackHandlerInstalled) {
             window.addEventListener('popstate', () => {
+                // 00. v424: de webshop in de app ligt bovenop alles: de terugknop gaat eerst naar de webshop (paneel dicht,
+                //     zoekvraag weg, of sluiten met een vraag als het mandje nog niet op de bon staat) + pop compenseren
+                if (this._gsm) {
+                    this._gsmTerug();
+                    try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
+                    return;
+                }
+                // 0f. v428: venster met een melding van het bureel of "Wat is er nieuw?" sluiten (telt als gelezen) + pop compenseren
+                if (document.getElementById('medVenster')) {
+                    this.medSluit();
+                    try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
+                    return;
+                }
+                if (document.getElementById('nieuwVenster')) {
+                    this.nieuwSluit();
+                    try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
+                    return;
+                }
                 // 0. Fullscreen PDF-overlay heeft voorrang: sluit hem + compenseer de pop
                 //    (v283 — anders navigeert de back-knop ONDER de overlay door).
                 const pdfOv = document.getElementById('pdfFullscreen');
@@ -199,9 +217,22 @@ const app = {
                     try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
                     return;
                 }
+                // 0g. v429: magazijn — het blad "koppelen" of "naar welke werf?" sluiten + pop compenseren
+                if (document.getElementById('magKoppelSheet') || document.getElementById('magWerfSheet')) {
+                    this.magKoppelSluit();
+                    this.magWerfSluit();
+                    try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
+                    return;
+                }
                 // 0c. v408: in de rekenmachine eerst een stap terug (berekening → module → start)
                 if (this.currentScreen === 'screenReken' && this._reken && this._reken.kanTerug()) {
                     this._reken.terug();
+                    try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
+                    return;
+                }
+                // 0e. v422: het verdeelscherm bij het uitklokken = annuleren (je blijft ingeklokt) + pop compenseren
+                if (document.getElementById('urenVerdelingModal') && typeof this._urenVerdelingResolve === 'function') {
+                    try { this._urenVerdelingResolve(null); } catch (_) {}
                     try { history.pushState({ qeApp: true }, '', location.pathname); } catch(_) {}
                     return;
                 }
@@ -270,6 +301,12 @@ const app = {
                 // dezelfde gebruiker na de update kan verderwerken.
                 try { localStorage.removeItem('qe_active_role_override'); } catch(_) {}
             }
+            // v428: de versie van vóór de update onthouden: "Wat is er nieuw?" toont wat er sindsdien veranderde aan wie
+            // op dit toestel nog niets zag (qe_nieuw_gezien_<fiche> bestaat dan nog niet)
+            if (currentVer && lastVer && lastVer !== currentVer) {
+                try { localStorage.setItem('qe_nieuw_vorige', lastVer); } catch(_) {}
+            }
+            this._wwwVersie = Number(currentVer) || 0;
             if (currentVer) {
                 try { localStorage.setItem('qe_last_seen_version', currentVer); } catch(_) {}
             }
@@ -534,6 +571,8 @@ const app = {
         try { if (RobawsAPI.wisselStand()) RobawsAPI._wisselHerstel(); } catch (_e) {}
         try { await fetch('api/auth.php?action=logout'); } catch(e) {}
         try { if (window.QEBridge && QEBridge.setApprovalUser) QEBridge.setApprovalUser('', '', '', '', '', ''); } catch(_e) {}
+        // v433: de gsm kijkt niet meer naar meldingen van het bureel voor deze werknemer (APK 1.248)
+        try { if (window.QENative && QENative.versie() >= 5) QENative.zetMededelingen({}); } catch (_e) {}
         // v315: persoonlijke API-key wissen (volgende gebruiker krijgt zijn eigen key bij login)
         try { RobawsAPI.clearActiveCredentials(true); } catch(_e) {}
         // v333: algemene API-account-key ook wissen (komt vers mee bij de volgende login)
@@ -711,6 +750,8 @@ const app = {
             const _ap = RobawsAPI._authPair ? RobawsAPI._authPair() : {};
             if (window.QEBridge && QEBridge.setApprovalUser) QEBridge.setApprovalUser(String(_emp), String((_apu && _apu.role) || ''), String((_ap && _ap.key) || ''), String((_ap && _ap.secret) || ''), String(RobawsAPI.TENANT || ''), String(this._myRobawsUserId() || ''));
         } catch (_e) {}
+        // v428: eerst de meldingen van het bureel, daarna (na een update) één keer wat er voor deze werknemer nieuw is
+        try { this._medStart(); } catch (_e) { try { this._nieuwPlan(); } catch (_e2) {} }
     },
 
     // ========================================
@@ -1405,7 +1446,10 @@ const app = {
     //  - Technieker + ≥1 openstaande → vraag bevestiging:
     //        Ja → laat uitklokken door (return true). Werkbon blijft open.
     //        Nee → blokkeer (return false). (v167)
-    //  - Monteur + >1 openstaande → blokkeer (return false).
+    //  - Monteur + >1 openstaande → v422: uren VERDELEN over de werkbonnen
+    //        (_klokOvernameVerdeling; samen exact de geklokte uren) → voor wie →
+    //        elke werkbon met uren versturen → return true. Annuleren = false.
+    //        (Vroeger: "Te veel openstaande werkbons" = niet uitklokken.)
     //  - Monteur + 1 openstaande → vraag overname:
     //        Ja → werknemer-aanvink-modal → vul uren in op die werkbon
     //             → auto-submit via executeMonteurSubmitFlow → return true.
@@ -1414,7 +1458,11 @@ const app = {
     //    wacht heeft; vroeger kon een technieker met de wacht die overdag als monteur
     //    meehielp niet uitklokken ("Te veel openstaande werkbons"), of boekte de
     //    klok-overname zijn dag op de wacht-dagplanning (dubbele uren).
-    async checkAndHandleOpenWorkordersBeforeClockOut(session) {
+    //  - v422: ctx (van clock.js) krijgt eindTijd = de uitkloktijd waarmee de uren naar de werkbon(nen)
+    //    gingen; de klok boekt daarna met dezelfde tijd (werkbonnen = klok, nooit meer of minder).
+    //  - v423: een dagplanning waarvoor een collega jouw uren al op zijn werkbon zette, is niet meer open (de werkbonnen
+    //    worden hier LIVE gelezen). Wie al uren op een werkbon van een dagplanning heeft, krijgt ze er niet nog eens.
+    async checkAndHandleOpenWorkordersBeforeClockOut(session, ctx) {
         if (!this.currentUser) return true; // safety: geen user → laat door
 
         // v259 (op vraag van Levi): BUREEL klokt altijd vrij uit — geen
@@ -1439,10 +1487,15 @@ const app = {
             const today = RobawsAPI._localDateStr();
             const empId = this.currentUser.robawsEmployeeId;
             const userId = this.currentUser.robawsUserId;
-            const planning = await RobawsAPI.getPlanning(empId, today, userId);
+            // v423: vers (live) — telt ook een werkbon die een collega net verstuurde met jouw uren (dan is die dagplanning
+            // voor jou niet meer open; anders vulde je jezelf nog eens in = dubbele uren)
+            const planning = await RobawsAPI.getPlanning(empId, today, userId, { vers: true });
             const items = (planning && planning.items) || [];
             // v418: de wacht-dagplanning is geen werkbon die ingevuld moet worden
-            openItems = items.filter(w => !w.hasWerkbon && !RobawsAPI.isWachtPlanning(w));
+            // v422: ook een werkbon die in deze app-sessie al verstuurd is (of in de wachtrij staat) is niet
+            // meer open — de planning kan dat nog niet weten (cache, wachtrij nog niet in Robaws).
+            const alVerstuurd = new Set((this.submittedWOs || []).map(String));
+            openItems = items.filter(w => !w.hasWerkbon && !RobawsAPI.isWachtPlanning(w) && !alVerstuurd.has(String(w.id)));
         } catch(e) {
             console.warn('[ClockOut-check] planning fetch faalde:', e && e.message);
             // Bij API-fout: laat uitklokken toch toe — we willen geen
@@ -1469,14 +1522,9 @@ const app = {
             return accepted;   // true = dag beëindigen, false = blijf ingeklokt
         }
 
-        // Monteur + >1 open → blokkeren
+        // Monteur + >1 open → v422: de uren verdelen over de werkbonnen (vroeger: blokkeren)
         if (openItems.length > 1) {
-            await this._showMessageModal(
-                'Te veel openstaande werkbons',
-                `Je hebt ${openItems.length} openstaande werkbons. Auto-overname werkt alleen bij ` +
-                '1 openstaande werkbon. Werk de extra eerst manueel af.'
-            );
-            return false;
+            return await this._klokOvernameVerdeling(openItems, session, ctx);
         }
 
         // Monteur + exact 1 open → vraag overname
@@ -1491,14 +1539,18 @@ const app = {
         }
 
         // Werknemer-aanvink
-        const employees = await this._showEmployeeCheckList(wo);
+        // v423: wie al uren op een werkbon van deze dagplanning heeft (een collega vulde hem al in), staat er met een
+        // opmerking en kan je niet aanvinken — anders staan zijn uren dubbel
+        // v430: vraagt deze dagplanning foto's en staan er nog geen? Dan nog niet uitklokken: eerst de foto's.
+        if (!(await this._fotoControle(wo, 'Je werkbon wordt bij het uitklokken verstuurd, maar het bureel vraagt foto\u2019s van je werk.'))) return false;
+        const employees = await this._showEmployeeCheckList(wo, this._alIngevuldOpties([wo]));
         if (!employees || employees.length === 0) {
             // Gebruiker heeft geannuleerd of geen werknemers → niet uitklokken
             return false;
         }
 
         // Vul uren in op de werkbon's woData
-        await this._fillKlokurenForMonteur(wo, employees, session);
+        await this._fillKlokurenForMonteur(wo, employees, session, ctx);
 
         // Set currentWO + automatische uurcode (monteurProject)
         this.currentWO = wo;
@@ -1529,8 +1581,10 @@ const app = {
     },
 
     /** Vul uren-blokken in op woData voor elke aangevinkte werknemer.
-     *  Eén blok per werknemer met dezelfde start/eind/duur/pauze. */
-    async _fillKlokurenForMonteur(wo, employees, session) {
+     *  Eén blok per werknemer met dezelfde start/eind/duur/pauze.
+     *  v422: grenzen + pauze via QEClock.nettoVoorUitklok (= exact wat de klok boekt, ook de pauze maar één
+     *  keer per dag) en ctx.eindTijd = de gebruikte uitkloktijd, zodat de klok met dezelfde tijd boekt. */
+    async _fillKlokurenForMonteur(wo, employees, session, ctx) {
         const woId = wo.id;
         if (!this.woData[woId]) {
             this.woData[woId] = { hours: [], materials: [], photos: [], notes: '' };
@@ -1577,32 +1631,40 @@ const app = {
         // bureau-startuurcorrectie (inklok 06:30 in de bureau → de klok boekt
         // 06:45 = startuur, maar de werkbon nam 06:30 over). Eén berekening
         // in clock.js voor beide; hieronder alleen een terugval.
-        let entryStartMin, entryEndMin;
-        if (window.QEClock && typeof QEClock.berekenEntryTijden === 'function') {
-            const et = QEClock.berekenEntryTijden(Object.assign({}, session || {}, { startTime }), endTimeRaw);
-            entryStartMin = et.entryStartMin;
-            entryEndMin = et.entryEndMin;
+        // v422: de klok rekent zelf de netto-uren uit (grenzen + pauze: persoonlijk / monteur-rol 45 / maar
+        // één keer per dag, ook als een eerder blok in Robaws staat). Hieronder alleen een terugval.
+        let entryStartMin, entryEndMin, pauze, netMin;
+        let netto = null;
+        if (window.QEClock && typeof QEClock.nettoVoorUitklok === 'function') {
+            try { netto = await QEClock.nettoVoorUitklok(Object.assign({}, session || {}, { startTime }), endTimeRaw); } catch (_) { netto = null; }
+        }
+        if (netto) {
+            entryStartMin = netto.entryStartMin;
+            entryEndMin = netto.entryEndMin;
+            pauze = netto.pauze;
+            netMin = netto.netMin;
         } else {
-            entryStartMin = roundUp15(toMin(startTime));
-            entryEndMin = roundDown15(toMin(endTimeRaw));
+            if (window.QEClock && typeof QEClock.berekenEntryTijden === 'function') {
+                const et = QEClock.berekenEntryTijden(Object.assign({}, session || {}, { startTime }), endTimeRaw);
+                entryStartMin = et.entryStartMin;
+                entryEndMin = et.entryEndMin;
+            } else {
+                entryStartMin = roundUp15(toMin(startTime));
+                entryEndMin = roundDown15(toMin(endTimeRaw));
+            }
+            // Pauze: persoonlijke pauze van de uitklokkende monteur
+            pauze = (window.QEClock && QEClock._personalPauze != null)
+                ? QEClock._personalPauze : 60;
+            // v326: een TECHNIEKER in monteur-rol volgt het monteur-regime: pauze 45 min.
+            if (this.currentUser && this.currentUser.role === 'technieker'
+                    && this._activeRole() === 'monteur') {
+                pauze = 45;
+            }
+            netMin = Math.max(0, Math.max(0, entryEndMin - entryStartMin) - pauze);
         }
         const entryStart = fromMin(entryStartMin);
         const entryEnd   = fromMin(entryEndMin);
-
-        // Pauze: persoonlijke pauze van de uitklokkende monteur
-        let pauze = (window.QEClock && QEClock._personalPauze != null)
-            ? QEClock._personalPauze : 60;
-        // v326: beleidsregel (Levi, 5 aug 2026) — een TECHNIEKER die in
-        // monteur-rol werkt volgt het monteur-regime: pauze 45 min. Zijn
-        // fiche-pauze (30) hoort bij technieker-dagen. Zelfde regel zit in
-        // clock.js _clockOut zodat klok en werkbon dezelfde pauze boeken.
-        if (this.currentUser && this.currentUser.role === 'technieker'
-                && this._activeRole() === 'monteur') {
-            pauze = 45;
-        }
-
-        const grossMin = Math.max(0, entryEndMin - entryStartMin);
-        const netMin = Math.max(0, grossMin - pauze);
+        if (ctx) ctx.eindTijd = endTimeRaw;   // v422: de klok boekt met dezelfde uitkloktijd
 
         // v251: geen dubbele uren — werknemers die al een uren-blok op deze
         // werkbon hebben (eerder manueel ingevuld, nog niet verstuurd) worden
@@ -1610,8 +1672,18 @@ const app = {
         const alreadyOnWo = new Set((this.woData[woId].hours || [])
             .filter(h => h && h.employeeId != null)
             .map(h => String(h.employeeId)));
-        const targets = employees.filter(emp => !alreadyOnWo.has(String(emp.id)));
-        const skipped = employees.length - targets.length;
+        // v423: wie intussen al uren op een werkbon van deze dagplanning heeft (vers nagekeken, bv. een collega die net
+        // verstuurde), krijgt ze hier niet nog eens
+        if (typeof this.showScanLoading === 'function') { try { this.showScanLoading('Werkbon nakijken…'); } catch (_) {} }
+        const inRobaws = (await this._robawsUrenOp([wo]))[String(woId)] || {};
+        if (typeof this.hideScanLoading === 'function') { try { this.hideScanLoading(); } catch (_) {} }
+        const alElders = employees.filter(emp => !alreadyOnWo.has(String(emp.id)) && inRobaws[String(emp.id)]);
+        const targets = employees.filter(emp => !alreadyOnWo.has(String(emp.id)) && !inRobaws[String(emp.id)]);
+        const skipped = employees.length - targets.length - alElders.length;
+        if (alElders.length) {
+            this.toast(alElders.map(e => e.name).join(', ') + (alElders.length === 1 ? ' stond' : ' stonden') + ' al op werkbon ' +
+                alElders.map(e => (inRobaws[String(e.id)].nrs || []).join(', ') || '?').join(', ') + ' van deze dagplanning — niet nog eens toegevoegd');
+        }
 
         const baseId = Date.now();
         targets.forEach((emp, idx) => {
@@ -1634,6 +1706,679 @@ const app = {
         if (skipped > 0) {
             this.toast(skipped + ' werknemer(s) had(den) al uren op deze werkbon — bestaande uren behouden');
         }
+    },
+
+    // ============================================================
+    // v422: UREN VERDELEN OVER MEERDERE WERKBONNEN BIJ HET UITKLOKKEN
+    // (vraag Levi 12 okt 2026: "als er meerdere zijn ze kunnen kiezen hoeveel
+    // van de gewerkte uren naar een bepaalde bon/dagplanning gaan ... 1u bij de
+    // eerste, 4u bij de 2e en 3u bij de 3e. Het mag enkel nooit meer of minder
+    // dan de gewerkte uren uitkomen.")
+    // ============================================================
+
+    /** v422: minuten als "3u15" (negatief: "-0u15"). */
+    _urenTekst(minuten) {
+        const m = Math.round(Number(minuten) || 0);
+        const a = Math.abs(m);
+        return (m < 0 ? '-' : '') + Math.floor(a / 60) + 'u' + String(a % 60).padStart(2, '0');
+    },
+
+    /** v422: hoeveel klant-minuten er al (nog niet verstuurd) op deze werkbon staan voor deze werknemer.
+     *  Een regel zonder werknemer telt als die van de verzender (zo verstuurt de werkbon hem ook). */
+    _eigenUrenOpWerkbon(woId, empId) {
+        const d = this.woData && this.woData[woId];
+        if (!d || !Array.isArray(d.hours)) return 0;
+        let min = 0;
+        d.hours.forEach((h) => {
+            if (!h || (h.type || 'klant') !== 'klant') return;
+            if (h.employeeId != null && String(h.employeeId) !== String(empId)) return;
+            min += Math.max(0, Math.round(Number(h.duration) || 0));
+        });
+        return min;
+    },
+
+    /** v422: aansluitende tijdsblokken voor de verdeelde uren, in de volgorde van de planning. Het eerste blok
+     *  begint op het (afgeronde) inkloktijdstip, het laatste eindigt op het (afgeronde) uitkloktijdstip. De
+     *  pauze komt in het blok dat over de middag (12:00) loopt (anders het laatste blok) — net zoals de klok
+     *  ze maar één keer aftrekt. minutenLijst = netto-minuten per dagplanning (0 = geen blok).
+     *  Geeft [{ i, minuten, startMin, endMin, pauze }] (alleen voor dagplanningen met minuten > 0). */
+    _urenSegmenten(netto, minutenLijst) {
+        const MIDDAG = 12 * 60;
+        const pauzeMin = Math.max(0, Math.round(Number(netto && netto.pauze) || 0));
+        const rijen = [];
+        (minutenLijst || []).forEach((x, i) => {
+            const mm = Math.max(0, Math.round(Number(x) || 0));
+            if (mm > 0) rijen.push({ i, minuten: mm });
+        });
+        let cursor = Math.round(Number(netto && netto.entryStartMin) || 0);
+        let pauzeRij = -1;
+        if (pauzeMin > 0 && rijen.length) {
+            let c = cursor;
+            for (let k = 0; k < rijen.length; k++) {
+                if (c + rijen[k].minuten > MIDDAG) { pauzeRij = k; break; }
+                c += rijen[k].minuten;
+            }
+            if (pauzeRij < 0) pauzeRij = rijen.length - 1;
+        }
+        return rijen.map((r, k) => {
+            const p = (k === pauzeRij) ? pauzeMin : 0;
+            const seg = { i: r.i, minuten: r.minuten, startMin: cursor, endMin: cursor + r.minuten + p, pauze: p };
+            cursor = seg.endMin;
+            return seg;
+        });
+    },
+
+    /** v422: de verdeelde uren op de werkbonnen zetten (woData), voor elke aangevinkte werknemer hetzelfde blok.
+     *  Wie op een werkbon al klant-uren heeft (zelf ingevuld, nog niet verstuurd) wordt daar overgeslagen: het
+     *  bestaande blok blijft leidend (v251-regel). De blokken dragen exact: true — de werkbon rondt ze niet
+     *  meer op naar een half uur, zodat de werkbonnen samen precies de geklokte uren dragen. */
+    _vulVerdeling(items, minutenLijst, employees, netto, inRobaws) {
+        const fromMin = (mins) => String(Math.floor(mins / 60) % 24).padStart(2, '0') + ':' + String(mins % 60).padStart(2, '0');
+        const myId = this.currentUser ? String(this.currentUser.robawsEmployeeId) : '';
+        const segs = this._urenSegmenten(netto, minutenLijst);
+        const baseId = Date.now();
+        let n = 0;
+        const perBon = [];
+        segs.forEach((seg) => {
+            const wo = items[seg.i];
+            const woId = wo.id;
+            if (!this.woData[woId]) this.woData[woId] = { hours: [], materials: [], photos: [], notes: '' };
+            if (!Array.isArray(this.woData[woId].hours)) this.woData[woId].hours = [];
+            const uren = this.woData[woId].hours;
+            const al = new Set();
+            uren.forEach((h) => {
+                if (!h || (h.type || 'klant') !== 'klant') return;
+                al.add(h.employeeId != null ? String(h.employeeId) : myId);
+            });
+            // v423: wie al uren op een werkbon van deze dagplanning in Robaws heeft, krijgt ze niet nog eens
+            const robaws = (inRobaws && inRobaws[String(woId)]) || {};
+            const alElders = employees.filter((e) => !al.has(String(e.id)) && robaws[String(e.id)]);
+            alElders.forEach((e) => al.add(String(e.id)));
+            const voor = employees.filter((e) => !al.has(String(e.id)));
+            voor.forEach((emp) => {
+                uren.push({
+                    id: baseId + (n++),
+                    type: 'klant',
+                    startTime: fromMin(seg.startMin),
+                    endTime: fromMin(seg.endMin),
+                    duration: seg.minuten,
+                    pauze: seg.pauze,
+                    employeeId: String(emp.id),
+                    employeeName: emp.name,
+                    exact: true,
+                });
+            });
+            perBon.push({
+                wo, minuten: seg.minuten, startMin: seg.startMin, endMin: seg.endMin, pauze: seg.pauze,
+                toegevoegd: voor.map((e) => String(e.id)),
+                overgeslagen: employees.filter((e) => al.has(String(e.id))).map((e) => String(e.id)),
+                alElders: alElders.map((e) => ({ id: String(e.id), naam: e.name, nrs: (robaws[String(e.id)].nrs || []) })),   // v423
+            });
+        });
+        this._saveWoData();
+        return perBon;
+    },
+
+    /** v422 (vraag Levi 12 okt 2026): MEER DAN ÉÉN openstaande dagplanning bij het uitklokken (monteur-rol,
+     *  ook een technieker die als monteur meehelpt). Vroeger: "Te veel openstaande werkbons" = niet
+     *  uitklokken. Nu verdeelt de werknemer zijn gewerkte uren over de werkbonnen; samen moet het EXACT zijn
+     *  geklokte netto-uren zijn, nooit meer of minder. Daarna: voor wie (zoals bij één werkbon: alleen
+     *  jijzelf aangevinkt), aansluitende tijdsblokken op elke werkbon (de pauze in het blok rond de middag)
+     *  en elke werkbon met uren automatisch versturen. De klok boekt met dezelfde uitkloktijd (ctx.eindTijd).
+     *  Een dagplanning met 0 u blijft open staan. Returns: true = uitklokken, false = ingeklokt blijven. */
+    async _klokOvernameVerdeling(openItems, session, ctx) {
+        const naamVan = (wo) => (wo.client && wo.client.name) || wo.summary || ('Dagplanning #' + wo.id);
+        const myId = this.currentUser ? String(this.currentUser.robawsEmployeeId) : '';
+
+        // 1. De netto-uren zoals de klok ze straks boekt (zelfde berekening, zelfde uitkloktijd).
+        let now = new Date();
+        try {
+            if (window.QEClock && typeof QEClock._getNow === 'function') now = await QEClock._getNow();
+        } catch (_) { /* terugval: toesteltijd */ }
+        const endTimeRaw = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+        let netto = null;
+        try {
+            if (window.QEClock && typeof QEClock.nettoVoorUitklok === 'function') {
+                netto = await QEClock.nettoVoorUitklok(Object.assign({}, session || {}), endTimeRaw);
+            }
+        } catch (e) {
+            console.warn('[ClockOut-check] netto-uren berekenen faalde:', e && e.message);
+            netto = null;
+        }
+        if (!netto) {
+            await this._showMessageModal(
+                'Te veel openstaande werkbons',
+                'Je hebt ' + openItems.length + ' openstaande werkbons en je gewerkte uren konden niet berekend worden. ' +
+                'Werk ze eerst manueel af.'
+            );
+            return false;
+        }
+        if (!(netto.netMin > 0)) {
+            await this._showMessageModal(
+                'Geen uren om te verdelen',
+                'Sinds je inklok (' + (netto.entryStart || '?') + ') zijn er nog geen uren om op een werkbon te zetten. ' +
+                'Je openstaande dagplanningen blijven open staan.'
+            );
+            return true;
+        }
+
+        // 2. Wat er al (nog niet verstuurd) op die werkbonnen staat voor jou, ligt vast en telt mee.
+        const vast = openItems.map((wo) => this._eigenUrenOpWerkbon(wo.id, myId));
+
+        // 3. Verdelen (volledig scherm).
+        const verdeling = await this._vraagUrenVerdeling(openItems, netto, vast);
+        if (!verdeling) {
+            this.toast('Niet uitgeklokt — je blijft ingeklokt');
+            return false;
+        }
+        const minuten = openItems.map((_, k) => Math.max(0, Math.round(Number(verdeling[k]) || 0)));
+        const som = minuten.reduce((s, x) => s + x, 0);
+        if (som !== netto.netMin || openItems.some((_, k) => vast[k] > 0 && minuten[k] !== vast[k])) {
+            // vangnet: het scherm laat dit niet toe
+            await this._showMessageModal(
+                'Uren niet verdeeld',
+                'Samen moet het precies ' + this._urenTekst(netto.netMin) + ' zijn (nu ' + this._urenTekst(som) + '). Je blijft ingeklokt.'
+            );
+            return false;
+        }
+
+        // 4. Voor wie? Dezelfde vraag als bij één werkbon (alleen jijzelf staat aangevinkt).
+        const ids = [];
+        openItems.forEach((wo, k) => {
+            if (!(minuten[k] > 0)) return;
+            (wo.employeeIds || []).forEach((id) => { const s = String(id); if (ids.indexOf(s) < 0) ids.push(s); });
+        });
+        // v423: eerst vers (live) nakijken wie er al uren op een werkbon van deze dagplanningen heeft (een collega die net
+        // verstuurde): die krijgt er geen uren meer — een opmerking bij zijn naam, en wie op álle dagplanningen al staat,
+        // kan je niet aanvinken.
+        const metUren = openItems.filter((_, k) => minuten[k] > 0);
+        // v430: een werkbon die uren krijgt en foto's vraagt, moet ze al hebben (anders wordt hij niet verstuurd)
+        const zonderFotos = metUren.filter((w) => this._fotosOntbreken(w));
+        if (zonderFotos.length) {
+            await this._fotoControle(zonderFotos[0], (zonderFotos.length > 1 ? zonderFotos.length + ' werkbonnen vragen' : 'Deze werkbon vraagt') +
+                ' foto\u2019s van je werk (' + zonderFotos.map((w) => naamVan(w)).join(', ') + ').');
+            return false;
+        }
+        if (typeof this.showScanLoading === 'function') { try { this.showScanLoading('Werkbonnen nakijken…'); } catch (_) {} }
+        const inRobaws = await this._robawsUrenOp(metUren);
+        if (typeof this.hideScanLoading === 'function') { try { this.hideScanLoading(); } catch (_) {} }
+        const employees = await this._showEmployeeCheckList({ employeeIds: ids }, Object.assign({
+            uitleg: 'Vink aan wie er vandaag mee op deze werkbonnen werkte — alleen jijzelf staat al aangevinkt. ' +
+                'Iedereen die je aanvinkt krijgt dezelfde verdeling.',
+        }, this._alIngevuldOpties(metUren)));
+        if (!employees || employees.length === 0) return false;
+
+        // 5. De uren op de werkbonnen zetten (aansluitende blokken, exact zoals verdeeld; niet voor wie er al op staat).
+        const perBon = this._vulVerdeling(openItems, minuten, employees, netto, inRobaws);
+        const vermeden = [];   // v423: wie niet dubbel gezet werd
+        perBon.forEach((p) => (p.alElders || []).forEach((x) => vermeden.push(x.naam + ' (' + naamVan(p.wo) +
+            (x.nrs.length ? ', ' + x.nrs.join(', ') : '') + ')')));
+        if (ctx) ctx.eindTijd = endTimeRaw;   // de klok boekt met dezelfde uitkloktijd
+        console.log('[ClockOut-check] uren verdeeld (' + this._urenTekst(netto.netMin) + ', ' + netto.entryStart + '-' + netto.entryEnd +
+            ', pauze ' + netto.pauze + 'min): ' + perBon.map((p) => naamVan(p.wo) + ' ' + this._urenTekst(p.minuten)).join(' · '));
+
+        // 6. Elke werkbon met uren versturen (zoals bij één werkbon); de planning één keer verversen.
+        const gelukt = [], deels = [], mislukt = [], wachtrij = [], redenen = [];
+        const leeg = [];   // v423: niets te versturen (iedereen stond al op een werkbon van die dagplanning)
+        for (let k = 0; k < perBon.length; k++) {
+            const wo = perBon[k].wo;
+            if (!this._werkbonHeeftInhoud(wo.id)) { leeg.push(wo); continue; }
+            if (typeof this.showScanLoading === 'function') {
+                try { this.showScanLoading('Werkbonnen versturen (' + (k + 1) + ' van ' + perBon.length + ')…'); } catch (_) {}
+            }
+            this.currentWO = wo;
+            this.selectedUurcode = {
+                id: RobawsAPI.WERKUUR_ARTICLE_IDS.monteurProject,
+                name: 'Werkuur monteur - Project',
+                salePrice: 65,
+            };
+            // v251: de werkbon-datum moet VANDAAG zijn (niet de gekozen dag in de planning)
+            this.currentDate = new Date();
+            let r = null;
+            try {
+                r = await this.executeMonteurSubmitFlow({ geenHerlaad: true, stil: true });
+            } catch (e) {
+                r = { ok: false, fout: (e && e.message) || String(e) };
+            }
+            if (r && r.ok) { gelukt.push(wo); if (r.wachtrij) wachtrij.push(wo); }
+            else if (r && r.inRobaws) deels.push(wo);
+            else { mislukt.push(wo); if (r && r.fout) redenen.push(String(r.fout).slice(0, 120)); }
+        }
+        if (typeof this.hideScanLoading === 'function') {
+            try { this.hideScanLoading(); } catch (_) {}
+        }
+        try {
+            this.navigate('screenPlanning', false);
+            this.screenHistory = [];
+            this.loadPlanning();
+        } catch (_) {}
+
+        // 7. Melden.
+        const nul = openItems.filter((_, k) => !(minuten[k] > 0));
+        const openTekst = nul.length
+            ? (nul.length === 1 ? '1 dagplanning met 0 u blijft open' : nul.length + ' dagplanningen met 0 u blijven open')
+            : '';
+        if (mislukt.length || deels.length) {
+            const regels = [];
+            if (gelukt.length) regels.push('Verstuurd: ' + gelukt.map(naamVan).join(', ') + '.');
+            if (deels.length) regels.push('In Robaws, maar de foto\'s of de bestelling gingen niet mee: ' +
+                deels.map(naamVan).join(', ') + '. NIET opnieuw versturen — meld het aan het bureel.');
+            if (mislukt.length) regels.push('NIET verstuurd: ' + mislukt.map(naamVan).join(', ') + '. De uren staan erin; verstuur ' +
+                (mislukt.length === 1 ? 'hem' : 'ze') + ' later zelf vanuit je planning.' + (redenen.length ? ' (Reden: ' + redenen[0] + ')' : ''));
+            if (wachtrij.length) regels.push('In de wachtrij (geen internet): ' + wachtrij.map(naamVan).join(', ') + ' — wordt vanzelf verstuurd.');
+            if (openTekst) regels.push(openTekst + '.');
+            if (vermeden.length) regels.push('Niet dubbel gezet (stond al op een werkbon van die dagplanning): ' + vermeden.join(', ') + '.');
+            if (leeg.length) regels.push('Niets meer te versturen voor ' + leeg.map(naamVan).join(', ') + '.');
+            await this._showMessageModal('Niet alle werkbonnen verstuurd', regels.join(' '));
+        } else if (vermeden.length) {
+            // v423: belangrijk genoeg voor een venster i.p.v. een toast
+            await this._showMessageModal('Werkbonnen verstuurd',
+                (gelukt.length ? gelukt.length + (gelukt.length === 1 ? ' werkbon' : ' werkbonnen') + ' verstuurd' : 'Geen werkbon verstuurd') +
+                (wachtrij.length ? ' (' + wachtrij.length + ' in de wachtrij: geen internet, gaat vanzelf)' : '') + '. ' +
+                'Niet dubbel gezet (stond al op een werkbon van die dagplanning): ' + vermeden.join(', ') + '.' +
+                (leeg.length ? ' Niets meer te versturen voor ' + leeg.map(naamVan).join(', ') + '.' : '') +
+                (openTekst ? ' ' + openTekst + '.' : ''));
+        } else {
+            this.toast(gelukt.length + (gelukt.length === 1 ? ' werkbon' : ' werkbonnen') + ' verstuurd'
+                + (wachtrij.length ? ' (' + wachtrij.length + ' in de wachtrij: geen internet, gaat vanzelf)' : '')
+                + (openTekst ? ' · ' + openTekst : ''));
+        }
+        return true;
+    },
+
+    /** v422: VOLLEDIG SCHERM (zoals het km-formulier): per openstaande dagplanning hoeveel uur ernaar gaat.
+     *  Samen moet het exact de gewerkte netto-uren zijn; pas dan kan de werknemer bevestigen. Uren die al
+     *  (nog niet verstuurd) in een werkbon staan liggen vast en tellen mee (vast[k] > 0).
+     *  @returns {Promise<number[]|null>} minuten per dagplanning (zelfde volgorde), of null = annuleren. */
+    async _vraagUrenVerdeling(items, netto, vast) {
+        const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+        const T = (min) => this._urenTekst(min);
+        const totaal = Math.max(0, Math.round(Number(netto && netto.netMin) || 0));
+        const vastLijst = items.map((_, k) => Math.max(0, Math.round(Number(vast && vast[k]) || 0)));
+        const vastSom = vastLijst.reduce((s, x) => s + x, 0);
+        const hhmm = (iso) => {
+            if (!iso) return '';
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return '';
+            return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        };
+        // een vorig, nog open verdeelscherm netjes afsluiten (dubbele scan)
+        if (typeof this._urenVerdelingResolve === 'function') { try { this._urenVerdelingResolve(null); } catch (_e) {} }
+        return new Promise((resolve) => {
+            let m = document.getElementById('urenVerdelingModal');
+            if (m) m.remove();
+            m = document.createElement('div');
+            m.id = 'urenVerdelingModal';
+            m.setAttribute('role', 'dialog');
+            m.setAttribute('aria-modal', 'true');
+            m.setAttribute('aria-labelledby', 'uvTitel');
+            m.style.cssText = 'position:fixed;inset:0;z-index:99998;background:var(--bg,var(--qe-white,#fff));display:flex;animation:mbSheet 0.35s cubic-bezier(0.22,1,0.36,1)';
+            const st = { min: vastLijst.slice() };
+            const veld = 'height:46px;box-sizing:border-box;padding:0 8px;font:600 18px var(--font,inherit);text-align:center;'
+                + 'border:1px solid var(--b2,#CAC7BE);border-radius:10px;background:var(--card,#FDFCFA);color:var(--ink,#26334B)';
+            const minOpties = [0, 15, 30, 45].map((v) => '<option value="' + v + '">' + String(v).padStart(2, '0') + '</option>').join('');
+            const rijHtml = (wo, k) => {
+                const klant = (wo.client && wo.client.name) || wo.summary || ('Dagplanning #' + wo.id);
+                const sub = (wo.summary && wo.summary !== klant) ? wo.summary : '';
+                const van = hhmm(wo.startDate), tot = hhmm(wo.endDate);
+                const tijd = van ? (van + (tot ? ' – ' + tot : '')) : '';
+                let h = '<div class="uv-rij" data-i="' + k + '" style="padding:12px 14px;margin-bottom:10px;border-radius:14px;'
+                    + 'background:var(--card,#FDFCFA);border:1px solid var(--cb,#E9E6DE)">'
+                    + '<div style="font-size:15px;font-weight:700;color:var(--ink,#26334B);line-height:1.3">' + esc(klant) + '</div>'
+                    + (sub ? '<div style="font-size:13px;color:var(--ink,#26334B);margin-top:2px;line-height:1.35">' + esc(sub) + '</div>' : '');
+                if (tijd || wo.address) {
+                    h += '<div style="font-size:12.5px;color:var(--g2,#5F5E56);margin-top:3px;line-height:1.4">'
+                        + (tijd ? this.icon('clock', { size: 13, style: 'vertical-align:-2px' }) + ' ' + esc(tijd) : '')
+                        + (tijd && wo.address ? ' &nbsp;·&nbsp; ' : '')
+                        + (wo.address ? this.icon('map-pin', { size: 13, style: 'vertical-align:-2px' }) + ' ' + esc(wo.address) : '')
+                        + '</div>';
+                }
+                if (vastLijst[k] > 0) {
+                    h += '<div style="display:inline-block;margin-top:10px;font-size:12.5px;font-weight:700;padding:5px 11px;border-radius:999px;'
+                        + 'color:var(--purple2,#6A2C91);background:var(--pwash,#F4EFF8)">🔒 ' + esc(T(vastLijst[k])) + ' staat al in deze werkbon</div>'
+                        + '<div style="font-size:12px;color:var(--g2,#5F5E56);margin-top:4px">Aanpassen kan in de werkbon zelf.</div>';
+                } else {
+                    h += '<div style="display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap">'
+                        + '<input id="uvU' + k + '" type="number" inputmode="numeric" min="0" max="24" step="1" placeholder="0" '
+                        + 'aria-label="Uren voor ' + esc(klant) + '" style="' + veld + ';width:64px">'
+                        + '<span style="font-size:14px;color:var(--g2,#5F5E56)">u</span>'
+                        + '<select id="uvM' + k + '" aria-label="Minuten voor ' + esc(klant) + '" style="' + veld + ';width:76px">' + minOpties + '</select>'
+                        + '<span style="font-size:14px;color:var(--g2,#5F5E56)">min</span>'
+                        + '<button id="uvR' + k + '" type="button" class="btn btn-outline" style="margin-left:auto;padding:10px 12px;font-size:13px">Rest hier</button>'
+                        + '</div>';
+                }
+                return h + '</div>';
+            };
+            const gewerkt = 'Gewerkt: ' + T(totaal) + ' · ' + esc(netto.entryStart || '') + ' – ' + esc(netto.entryEnd || '')
+                + (netto.pauze > 0 ? ' · ' + esc(netto.pauze) + ' min pauze' : '');
+            m.innerHTML = ''
+                + '<div style="display:flex;flex-direction:column;width:100%;height:100%;box-sizing:border-box">'
+                +   '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:18px 20px 4px">'
+                +     '<div style="flex:1;min-width:0">'
+                +       '<div id="uvTitel" style="font:400 22px var(--font,inherit);letter-spacing:-0.5px;color:var(--ink,var(--qe-darkblue,#001E45))">Uren verdelen</div>'
+                +       '<div style="font-size:13px;color:var(--g2,var(--qe-grey,#666));margin-top:3px;line-height:1.4">Je hebt vandaag ' + items.length
+                +         ' openstaande dagplanningen. Geef bij elke werkbon in hoeveel je eraan werkte. Samen moet het precies je gewerkte uren zijn.</div>'
+                +       '<div style="display:inline-block;margin-top:8px;font-size:12.5px;font-weight:700;padding:4px 10px;border-radius:999px;'
+                +         'color:var(--purple2,#6A2C91);background:var(--pwash,var(--wash,#EFEDE6))">🕐 ' + gewerkt + '</div>'
+                +     '</div>'
+                +     '<button id="uvClose" type="button" aria-label="Sluiten" style="width:36px;height:36px;border-radius:50%;border:1px solid var(--b1,#ddd);'
+                +       'background:none;color:var(--g2,var(--qe-grey,#666));font-size:15px;cursor:pointer;flex-shrink:0">✕</button>'
+                +   '</div>'
+                +   '<div id="uvLijst" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px 20px 16px">' + items.map(rijHtml).join('') + '</div>'
+                +   '<div style="padding:10px 20px 16px;border-top:1px solid var(--cb,var(--b1,#e5e2da));background:var(--bg,#fff)">'
+                +     '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px;flex-wrap:wrap">'
+                +       '<div style="font-size:13px;color:var(--g2,#5F5E56)">Verdeeld <b id="uvVerdeeld" style="color:var(--ink,#26334B)">0u00</b> van <b style="color:var(--ink,#26334B)">' + T(totaal) + '</b></div>'
+                +       '<div id="uvRest" aria-live="polite" style="font-weight:700;font-size:15px"></div>'
+                +     '</div>'
+                +     '<div id="uvNoot" style="font-size:12.5px;color:var(--g2,#5F5E56);margin:0 0 10px;line-height:1.4;display:none"></div>'
+                +     '<button id="uvOk" type="button" disabled style="width:100%;padding:16px;background:var(--btn);color:var(--btnfg);border:none;border-radius:2px;'
+                +       'font:600 14px var(--font);cursor:pointer;opacity:.45">Verdelen en werkbonnen versturen</button>'
+                +     '<button id="uvCancel" type="button" style="width:100%;margin-top:8px;padding:12px;border:none;background:none;color:var(--g1,var(--qe-grey,#888));'
+                +       'font-size:13px;font-weight:500;cursor:pointer">Annuleren — blijf ingeklokt</button>'
+                +   '</div>'
+                + '</div>';
+            document.body.appendChild(m);
+
+            const okBtn = m.querySelector('#uvOk');
+            const restEl = m.querySelector('#uvRest');
+            const verdeeldEl = m.querySelector('#uvVerdeeld');
+            const nootEl = m.querySelector('#uvNoot');
+            const zetStand = () => {
+                const verdeeld = st.min.reduce((s, x) => s + x, 0);
+                const rest = totaal - verdeeld;
+                verdeeldEl.textContent = T(verdeeld);
+                if (rest === 0) { restEl.textContent = '✓ Alles verdeeld'; restEl.style.color = 'var(--green2,#3E7A54)'; }
+                else if (rest > 0) { restEl.textContent = 'Nog te verdelen: ' + T(rest); restEl.style.color = 'var(--amber2,#A65E12)'; }
+                else { restEl.textContent = 'Te veel verdeeld: ' + T(-rest); restEl.style.color = 'var(--red2,#B4372F)'; }
+                const kan = rest === 0 && totaal > 0;
+                okBtn.disabled = !kan;
+                okBtn.style.opacity = kan ? '1' : '.45';
+                const nul = st.min.filter((x) => x === 0).length;
+                let noot = '';
+                if (vastSom > totaal) {
+                    noot = 'In je werkbonnen staat al ' + T(vastSom) + ', meer dan je gewerkte ' + T(totaal) + '. Pas de uren aan in de werkbon zelf.';
+                } else if (kan && nul > 0) {
+                    noot = nul === 1 ? '1 dagplanning met 0 u blijft open staan.' : nul + ' dagplanningen met 0 u blijven open staan.';
+                }
+                nootEl.textContent = noot;
+                nootEl.style.display = noot ? '' : 'none';
+                items.forEach((_, k) => {
+                    const b = m.querySelector('#uvR' + k);
+                    if (b) { b.disabled = rest === 0; b.style.opacity = rest === 0 ? '.45' : '1'; }
+                });
+            };
+            const leesRij = (k) => {
+                const u = m.querySelector('#uvU' + k), s = m.querySelector('#uvM' + k);
+                if (!u || !s) return;
+                let uren = parseInt(String(u.value || '').replace(/[^0-9]/g, ''), 10);
+                if (isNaN(uren)) uren = 0;
+                uren = Math.min(24, Math.max(0, uren));
+                const mm = Math.min(59, Math.max(0, parseInt(s.value, 10) || 0));
+                st.min[k] = uren * 60 + mm;
+                zetStand();
+            };
+            const zetRij = (k, minuten) => {
+                const u = m.querySelector('#uvU' + k), s = m.querySelector('#uvM' + k);
+                if (!u || !s) return;
+                const mm = minuten % 60;
+                u.value = minuten > 0 ? String(Math.floor(minuten / 60)) : '';
+                if (!s.querySelector('option[value="' + mm + '"]')) {
+                    // een rest die geen kwartier is (bv. door een pauze van 20 min): die waarde erbij zetten
+                    const o = document.createElement('option');
+                    o.value = String(mm);
+                    o.textContent = String(mm).padStart(2, '0');
+                    const na = Array.from(s.options).find((x) => Number(x.value) > mm);
+                    s.insertBefore(o, na || null);
+                }
+                s.value = String(mm);
+                st.min[k] = minuten;
+                zetStand();
+            };
+            const sluit = (uit) => {
+                this._urenVerdelingResolve = null;
+                try { m.remove(); } catch (_e) {}
+                resolve(uit);
+            };
+            this._urenVerdelingResolve = sluit;
+            items.forEach((_, k) => {
+                const u = m.querySelector('#uvU' + k), s = m.querySelector('#uvM' + k), b = m.querySelector('#uvR' + k);
+                if (u) {
+                    u.addEventListener('input', () => leesRij(k));
+                    u.addEventListener('change', () => {
+                        leesRij(k);
+                        const h = Math.floor(st.min[k] / 60);
+                        u.value = st.min[k] > 0 ? String(h) : '';
+                    });
+                    u.addEventListener('focus', () => { try { u.select(); } catch (_e) {} });
+                }
+                if (s) s.addEventListener('change', () => leesRij(k));
+                if (b) b.addEventListener('click', () => {
+                    const rest = totaal - st.min.reduce((x, y) => x + y, 0);
+                    if (rest === 0) return;
+                    zetRij(k, Math.max(0, st.min[k] + rest));
+                });
+            });
+            m.querySelector('#uvClose').onclick = () => sluit(null);
+            m.querySelector('#uvCancel').onclick = () => sluit(null);
+            okBtn.onclick = () => {
+                const rest = totaal - st.min.reduce((x, y) => x + y, 0);
+                if (rest !== 0 || !(totaal > 0)) return;
+                try { if (window.QEMarble && QEMarble.haptic) QEMarble.haptic('success'); } catch (_e) {}
+                sluit(st.min.slice());
+            };
+            zetStand();
+        });
+    },
+
+    // ============================================================
+    // v423: GEEN DUBBELE UREN MEER DOOR COLLEGA'S (vraag Levi 12 okt 2026: "als een werknemer uren van zijn collega
+    // invult dat de collega geen dagplanning meer te zien krijgt ... vanaf dat er een werkbon bestaat met de uren van
+    // een bepaalde werknemer mag deze dagplanning niet meer te zien zijn voor deze werknemer.")
+    // De planning zelf verbergt zo'n dagplanning (RobawsAPI._getPlanningIdsWithWorkOrders). Hier: wie al uren op een
+    // werkbon van een dagplanning heeft, krijgt ze bij de klok-overname niet nog eens, en vlak voor het versturen van
+    // een werkbon kijkt de app (live) na of de uren erin al op een andere werkbon van die dagplanning staan.
+    // ============================================================
+
+    /** v423: naam van een Robaws-gebruiker (de verantwoordelijke van een werkbon) uit de vaste lijst, anders "een collega". */
+    _naamVanGebruiker(userId) {
+        const lijst = RobawsAPI.EMPLOYEES || {};
+        for (const k of Object.keys(lijst)) {
+            if (lijst[k] && String(lijst[k].userId) === String(userId)) return lijst[k].name;
+        }
+        return 'een collega';
+    },
+
+    /** v423: voor de vraag "Voor wie zijn de uren?": wie heeft volgens de laatste werkbonnen-scan al uren op een werkbon
+     *  van deze dagplanningen? { alIngevuld: { employeeId: tekst }, uitgeschakeld: [wie op ÁLLE dagplanningen al staat] }. */
+    _alIngevuldOpties(items) {
+        const lijst = items || [];
+        const per = {};
+        lijst.forEach((wo) => {
+            const op = (typeof RobawsAPI.urenOpDagplanning === 'function') ? RobawsAPI.urenOpDagplanning(wo.id) : null;
+            if (!op) return;
+            Object.keys(op).forEach((e) => { (per[e] = per[e] || []).push({ wo, nrs: op[e].nrs || [] }); });
+        });
+        const alIngevuld = {}, uitgeschakeld = [];
+        Object.keys(per).forEach((e) => {
+            const op = per[e];
+            if (op.length === lijst.length) uitgeschakeld.push(e);
+            alIngevuld[e] = lijst.length === 1
+                ? 'staat al op werkbon ' + (op[0].nrs.join(', ') || '?') + ' van deze dagplanning'
+                : 'staat al op ' + op.map((x) => ((x.wo.client && x.wo.client.name) || x.wo.summary || 'een dagplanning')
+                    + (x.nrs.length ? ' (' + x.nrs.join(', ') + ')' : '')).join(', ') + ' — krijgt daar geen uren';
+        });
+        return { alIngevuld, uitgeschakeld };
+    },
+
+    /** v423: hoe lang het nakijken mag duren (ms). Trage verbinding op de werf = na deze tijd gewoon verder zoals vroeger. */
+    _DUBBEL_CONTROLE_MS: 8000,
+
+    /** v423: belofte die na _DUBBEL_CONTROLE_MS met null afloopt (een late uitslag telt dan niet meer mee). */
+    _binnenTijd(belofte) {
+        let wekker = null;
+        const klok = new Promise((klaar) => { wekker = setTimeout(() => klaar(null), this._DUBBEL_CONTROLE_MS); });
+        return Promise.race([Promise.resolve(belofte).catch(() => null), klok])
+            .then((x) => { clearTimeout(wekker); return x; });
+    },
+
+    /** v423: vlak vóór het op de werkbon(nen) zetten VERS (live) nakijken wie er intussen al uren op een werkbon van deze
+     *  dagplanningen heeft. Geeft { planningId: { employeeId: { uren, nrs, userIds } } | null } (null = niet na te kijken). */
+    async _robawsUrenOp(items) {
+        await this._binnenTijd(RobawsAPI._getPlanningIdsWithWorkOrders(null, null, { vers: true }));
+        const uit = {};
+        (items || []).forEach((wo) => { uit[String(wo.id)] = RobawsAPI.urenOpDagplanning(wo.id, 60000); });
+        return uit;
+    },
+
+    /** v423: heeft deze werkbon iets om te versturen (uren, materiaal, foto's of een notitie)? */
+    _werkbonHeeftInhoud(woId) {
+        const d = this.woData && this.woData[woId];
+        if (!d) return false;
+        const uren = (d.hours || []).some((h) => h && h.type !== 'pauze' && (Number(h.duration) || 0) > 0);
+        return uren || (d.materials || []).length > 0 || (d.photos || []).length > 0 || String(d.notes || '').trim().length > 0;
+    },
+
+    /** v423: vlak vóór het versturen van een werkbon (de knop in de werkbon): staan de uren van iemand in deze werkbon al
+     *  op een ANDERE werkbon van dezelfde dagplanning (een collega vulde hem mee in)? Dan niet nog eens versturen.
+     *  true = verder versturen, false = stoppen. Niet na te kijken (geen verbinding) = verder, zoals vroeger. */
+    async _dubbeleUrenControle(wo) {
+        const data = this.woData && this.woData[wo.id];
+        if (!data || !Array.isArray(data.hours)) return true;
+        const myId = this.currentUser ? String(this.currentUser.robawsEmployeeId) : '';
+        const per = {};
+        data.hours.forEach((h) => {
+            if (!h || (h.type || 'klant') !== 'klant' || !((Number(h.duration) || 0) > 0)) return;
+            const e = h.employeeId != null ? String(h.employeeId) : myId;
+            const x = per[e] || (per[e] = { naam: h.employeeName || (e === myId && this.currentUser ? this.currentUser.name : ''), min: 0 });
+            x.min += Number(h.duration) || 0;
+        });
+        if (!Object.keys(per).length) return true;
+        const op = await this._binnenTijd(RobawsAPI.werkbonUrenVoorDagplanning(wo.id));
+        if (!op) return true;
+        const dubbel = Object.keys(per).filter((e) => op[e]);
+        if (!dubbel.length) return true;
+        const rijen = dubbel.map((e) => ({
+            emp: e,
+            naam: per[e].naam || ('werknemer ' + e),
+            min: per[e].min,
+            nrs: op[e].nrs || [],
+            door: (op[e].userIds || []).map((u) => this._naamVanGebruiker(u)),
+            uren: op[e].uren || 0,
+        }));
+        const zonder = await this._vraagDubbeleUren(rijen);
+        if (!zonder) return false;
+        // die uren uit de werkbon halen (de rest — materiaal, foto's, andere werknemers — gaat gewoon mee)
+        data.hours = data.hours.filter((h) => !(h && (h.type || 'klant') === 'klant'
+            && dubbel.indexOf(h.employeeId != null ? String(h.employeeId) : myId) >= 0));
+        this._saveWoData();
+        try { if (this.currentWO && String(this.currentWO.id) === String(wo.id)) this.renderHoursList(); } catch (_) {}
+        if (!this._werkbonHeeftInhoud(wo.id)) {
+            this.toast('Niets meer te versturen: de uren staan al op werkbon ' + rijen.map((r) => r.nrs.join(', ')).join(', ') + '.');
+            try { this.navigate('screenPlanning', false); this.screenHistory = []; this.loadPlanning(); } catch (_) {}
+            return false;
+        }
+        return true;
+    },
+
+    /** v423: de melding bij dubbele uren. true = "Verstuur zonder die uren", false = annuleren (ook als het venster op
+     *  een andere manier dichtgaat: terugknop, ernaast tikken). */
+    async _vraagDubbeleUren(rijen) {
+        return new Promise((resolve) => {
+            const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+            const lijst = rijen.map((r) => '<div style="padding:9px 0;border-bottom:1px solid var(--cb,#e5e2da);font-size:14px;line-height:1.4">'
+                + '<b>' + esc(r.naam) + '</b> — ' + esc(this._urenTekst(r.min)) + ' in deze werkbon'
+                + '<div style="font-size:12.5px;color:var(--g2,#5F5E56);margin-top:2px">staat al op werkbon ' + esc(r.nrs.join(', ') || '?')
+                + (r.door.length ? ' van ' + esc(r.door.join(', ')) : '') + ' (' + esc(this._urenTekst(Math.round(r.uren * 60))) + ')</div></div>').join('');
+            document.getElementById('modalContent').innerHTML = `
+                <h3>${this.icon('alert', { size: 18, style: 'vertical-align:-3px' })} Deze uren staan al op een werkbon</h3>
+                <p style="font-size:14px;color:var(--qe-grey);margin:8px 0 10px;line-height:1.45">
+                    Ze staan al op een andere werkbon van deze dagplanning (zie hieronder). Nog eens versturen zou ze dubbel zetten.
+                </p>
+                <div id="dubbelLijst" style="margin-bottom:14px">${lijst}</div>
+                <button onclick="window._dubbelResp(true)" class="btn btn-primary btn-full" style="padding:14px;font-size:15px;margin-bottom:8px">
+                    Verstuur zonder die uren
+                </button>
+                <button onclick="window._dubbelResp(false)" class="btn btn-outline btn-full" style="padding:12px;font-size:14px">
+                    Annuleren
+                </button>
+            `;
+            this.openModal();
+            const ov = document.getElementById('modalOverlay');
+            let klaar = false;
+            let obs = null;
+            const af = (val) => {
+                if (klaar) return;
+                klaar = true;
+                try { if (obs) obs.disconnect(); } catch (_) {}
+                delete window._dubbelResp;
+                resolve(!!val);
+            };
+            if (ov && typeof MutationObserver !== 'undefined') {
+                obs = new MutationObserver(() => { if (!ov.classList.contains('show')) af(false); });
+                obs.observe(ov, { attributes: true, attributeFilter: ['class'] });
+            }
+            window._dubbelResp = (val) => { af(val); this.closeModal(); };
+        });
+    },
+
+    /** v430: vraagt de dagplanning foto's (vinkje "Foto's verplicht") en staat er nog geen enkele foto op deze werkbon? */
+    _fotosOntbreken(wo) {
+        if (!wo || !wo.fotosVerplicht) return false;
+        const d = this.woData && this.woData[wo.id];
+        return !(d && Array.isArray(d.photos) && d.photos.length > 0);
+    },
+
+    /** v430: de werkbon openen op het tabblad Foto's (na een melding "Foto's verplicht"). */
+    async _openFotosVan(wo) {
+        try {
+            if (!this.currentWO || String(this.currentWO.id) !== String(wo.id) || this.currentScreen !== 'screenDetail') {
+                await this.openWorkorder(wo.id);
+            }
+        } catch (_) {}
+        const knop = document.querySelector('#detailTabs .tab-btn[data-tab="tabFotos"]');
+        if (knop) this.switchTab(knop);
+    },
+
+    /** v430: controle vóór elk versturen of afsluiten van een werkbon. true = verder. Ontbreken de foto's, dan een
+     *  melding en de werkbon open op het tabblad Foto's; er wordt niets verstuurd. */
+    async _fotoControle(wo, uitleg) {
+        if (!this._fotosOntbreken(wo)) return true;
+        await this._showMessageModal('Foto\u2019s verplicht',
+            (uitleg || 'Voor deze opdracht vraagt het bureel foto\u2019s van je werk.') +
+            ' Voeg minstens één foto toe, daarna kan je de werkbon versturen.');
+        await this._openFotosVan(wo);
+        return false;
+    },
+
+    /** v423: de controle op dubbele uren vlak vóór het versturen vanuit de werkbon (knop van een monteur én van een
+     *  technieker). Eén controle tegelijk; de knop toont zolang "Nakijken…". true = verder versturen, false = stoppen
+     *  (ook als je intussen een andere werkbon opende). */
+    async _dubbelControleVoorVersturen() {
+        if (this._dubbelControleBezig) return false;
+        const wo = this.currentWO;
+        if (!wo) return false;
+        const knop = document.getElementById('btnSubmitWerkbon');
+        const tekst = knop ? knop.innerHTML : null;
+        let verder = true;
+        this._dubbelControleBezig = true;
+        try {
+            if (knop) { knop.disabled = true; knop.innerHTML = 'Nakijken…'; }
+            verder = await this._dubbeleUrenControle(wo);
+        } catch (_) {
+            verder = true;
+        } finally {
+            this._dubbelControleBezig = false;
+            if (knop && knop.innerHTML === 'Nakijken…') { knop.disabled = false; knop.innerHTML = tekst; }
+        }
+        return !!verder && this.currentWO === wo;
+    },
+
+    /** v423: de knop "Uren & materiaal versturen" van een monteur (ging vroeger rechtstreeks naar
+     *  executeMonteurSubmitFlow): eerst de controle op dubbele uren, dan versturen. */
+    async _monteurVersturen() {
+        if (!(await this._fotoControle(this.currentWO))) return;   // v430
+        if (!(await this._dubbelControleVoorVersturen())) return;
+        return this.executeMonteurSubmitFlow();
     },
 
     /** Modal die de monteur vraagt of hij de geklokte uren wil overnemen. */
@@ -1719,7 +2464,7 @@ const app = {
 
     /** Modal met checkbox-lijst van werknemers gelinkt aan de werkbon.
      *  Returns: array van { id, name } of null bij annuleren. */
-    async _showEmployeeCheckList(wo) {
+    async _showEmployeeCheckList(wo, opts) {
         const empIds = (wo.employeeIds || []).map(String);
         let employees = [];
         try {
@@ -1747,25 +2492,34 @@ const app = {
             // v325: alleen de uitklokker zelf staat standaard aangevinkt —
             // collega's moeten bewust BIJgevinkt worden (voorheen stond
             // iedereen aan en kregen niet-aanwezige collega's per ongeluk uren).
-            const checkboxes = employees.map(e => `
+            // v423: wie al uren op een werkbon van deze dagplanning heeft, krijgt een opmerking en kan (als hij op álle
+            // dagplanningen al staat) niet aangevinkt worden
+            const alIng = (opts && opts.alIngevuld) || {};
+            const uitgeschakeld = new Set(((opts && opts.uitgeschakeld) || []).map(String));
+            const checkboxes = employees.map(e => {
+                const id = String(e.id);
+                const uit = uitgeschakeld.has(id);
+                const noot = alIng[id] ? `<span class="emp-noot" style="display:block;font-size:12px;font-weight:400;color:var(--qe-grey);margin-top:2px">${this.escapeHtml(alIng[id])}</span>` : '';
+                return `
                 <label style="display:flex;align-items:center;gap:12px;padding:12px 14px;
-                    border:1px solid #ddd;border-radius:10px;margin-bottom:8px;cursor:pointer;
-                    background:#fff">
+                    border:1px solid #ddd;border-radius:10px;margin-bottom:8px;cursor:${uit ? 'default' : 'pointer'};
+                    background:#fff${uit ? ';opacity:.55' : ''}">
                     <input type="checkbox" class="emp-check"
-                        data-id="${this.escapeHtml(String(e.id))}"
+                        data-id="${this.escapeHtml(id)}"
                         data-name="${this.escapeHtml(e.name)}"
-                        ${String(e.id) === myId ? 'checked' : ''}
-                        style="width:22px;height:22px;cursor:pointer">
-                    <span style="font-size:15px;font-weight:500">${this.escapeHtml(e.name)}</span>
+                        ${uit ? 'disabled' : (id === myId ? 'checked' : '')}
+                        style="width:22px;height:22px;cursor:${uit ? 'default' : 'pointer'}">
+                    <span style="font-size:15px;font-weight:500">${this.escapeHtml(e.name)}${noot}</span>
                 </label>
-            `).join('');
+            `;
+            }).join('');
 
             document.getElementById('modalContent').innerHTML = `
                 <h3>${this.icon('user', { size: 18, style: 'vertical-align:-3px' })} Voor wie zijn de uren?</h3>
                 <p style="font-size:13px;color:var(--qe-grey);margin:8px 0 14px;line-height:1.4">
-                    Vink aan wie er vandaag op deze werkbon werkte —
+                    ${(opts && opts.uitleg) ? this.escapeHtml(opts.uitleg) : `Vink aan wie er vandaag op deze werkbon werkte —
                     alleen jijzelf staat al aangevinkt.
-                    Iedereen die je aanvinkt krijgt dezelfde uren.
+                    Iedereen die je aanvinkt krijgt dezelfde uren.`}
                 </p>
                 ${checkboxes}
                 <button onclick="window._klokEmpResp(true)" class="btn btn-primary btn-full"
@@ -1877,6 +2631,8 @@ const app = {
     // NAVIGATION
     // ========================================
     navigate(screenId, pushHistory = true) {
+        // v429: het magazijn verlaten = de camera uit (de reeks blijft bewaard)
+        if (this.currentScreen === 'screenMagazijn' && screenId !== 'screenMagazijn' && typeof this._magVerlaat === 'function') { try { this._magVerlaat(); } catch (_) {} }
         if (pushHistory && this.currentScreen !== screenId) {
             this.screenHistory.push(this.currentScreen);
             // Voeg ook een entry toe aan window.history zodat de Android
@@ -1918,6 +2674,8 @@ const app = {
             screenAanvragen: 'Aanvragen',  // v278
             screenOrganisatie: 'Organisatie',  // v391
             screenReken: 'Rekenmachine',  // v408
+            screenMeldingen: 'Meldingen',  // v428
+            screenMagazijn: 'Magazijn',  // v429
             screenProjecten: 'Projecten',  // v391
             screenProjectDetail: 'Project',  // v391
             screenDagplanningNieuw: 'Dagplanning maken',  // v391
@@ -1957,11 +2715,13 @@ const app = {
         // v391: Organisatie · Projecten · Toestel
         if (screenId === 'screenOrganisatie') this.loadOrganisatie();
         if (screenId === 'screenReken') this.loadReken();   // v408
+        if (screenId === 'screenMeldingen') this.loadMeldingen();   // v428
         if (screenId === 'screenProjecten') this.loadProjecten();
         if (screenId === 'screenProjectDetail') { this.renderProjectDetail(); this.loadProjectPlanning(); }
         if (screenId === 'screenDagplanningNieuw' && !this._dp) setTimeout(() => this.goBack(), 0);
         if (screenId === 'screenToestel') this.loadToestel();
         if (screenId === 'screenLogistiek') this._logHubRender();   // v395: kaarten per toegangsrecht
+        if (screenId === 'screenMagazijn') this.loadMagazijn();   // v429
 
         // v137: toon FAB enkel op planning-tab + niet voor monteurs
         this._updateNewWoFabVisibility();
@@ -1975,6 +2735,14 @@ const app = {
      */
     async refreshCurrentScreen() {
         const screen = this.currentScreen;
+        // v427: kwam er toch een "verversen" binnen terwijl er een venster openstaat of iets niet bovenaan staat (een veeg
+        // die begon vóór de www de schakelaar kon omzetten), dan niets herladen onder het venster: alleen het rondje stoppen.
+        const ptr = (typeof this._ptrBeoordeel === 'function') ? this._ptrBeoordeel() : { mag: true };
+        if (!ptr.mag) {
+            console.log('[Refresh] Overgeslagen (' + ptr.reden + '):', screen);
+            try { if (window.QEBridge && typeof QEBridge.refreshDone === 'function') QEBridge.refreshDone(); } catch (_) {}
+            return;
+        }
         console.log('[Refresh] Refresh huidig scherm:', screen);
         try {
             switch (screen) {
@@ -2216,8 +2984,12 @@ const app = {
             // anders blijven planningen voor altijd verborgen na een test-werkbon.
             const allItems = data.items || [];
             this.workorders = allItems.filter(wo => !wo.hasWerkbon);
+            this._mbPlanAlle = allItems;   // v425: de werven om materiaal voor te bestellen (ook met een werkbon)
             this._ciawBanner(allItems, dateStr);   // v404: Check in @ work-kaart (alleen vandaag)
             document.getElementById('woCount').textContent = this.workorders.length;
+            // v423: de 5-min-poll vergelijkt met wat er nu (vandaag) op het scherm staat: zo ververst hij alleen als er
+            // sindsdien een dagplanning wegviel (een collega zette jouw uren op zijn werkbon), niet na je eigen verzending
+            if (dateStr === this._localDateStr()) this._lastPlanningCount = this.workorders.length;
 
             if (this.workorders.length === 0) {
                 // v253: label klopt nu ook voor de 'vorige werkdag'-chip
@@ -2332,7 +3104,8 @@ const app = {
             'zoom-in': '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M11 8v6M8 11h6"/>',
             'zoom-out': '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M8 11h6"/>',
             'chevron-left': '<path d="m15 18-6-6 6-6"/>',
-            'chevron-right': '<path d="m9 18 6-6-6-6"/>'
+            'chevron-right': '<path d="m9 18 6-6-6-6"/>',
+            'megafoon': '<path d="M3 11v2a1 1 0 0 0 1 1h2l5 4V6L6 10H4a1 1 0 0 0-1 1z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/>'   // v428: meldingen
         };
         return `<svg${cls}${st} width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
     },
@@ -2402,6 +3175,14 @@ const app = {
         const regieChip = isRegie
             ? `<span class="wo-regie-tag">${this.icon('cash', { size: 13 })} Regie</span>`
             : '';
+        // v430: "Foto's verplicht" op de dagplanning (oranje zolang er geen foto is, groen zodra er een is)
+        let fotoChip = '';
+        if (wo.fotosVerplicht) {
+            const nFoto = (data && Array.isArray(data.photos)) ? data.photos.length : 0;
+            fotoChip = nFoto > 0
+                ? `<span class="wo-foto-tag ok" title="Foto's verplicht: ${nFoto} toegevoegd">${this.icon('camera', { size: 13 })} Foto's ✓</span>`
+                : `<span class="wo-foto-tag" title="Voeg minstens één foto toe voor je de werkbon verstuurt">${this.icon('camera', { size: 13 })} Foto's verplicht</span>`;
+        }
         // v409: laden-&-lossen-uren die op deze werkbon wachten tot hij verstuurd is
         let lnlChip = '';
         try {
@@ -2419,7 +3200,8 @@ const app = {
                         <h3>${this.escapeHtml(clientName)}</h3>
                         ${wo.summary ? `<div style="font-size:13px;color:var(--qe-darkblue);font-weight:500;margin:2px 0">${this.escapeHtml(wo.summary)}</div>` : ''}
                         ${address ? `<div class="wo-address">${this.icon('map-pin', { size: 14 })} ${this.escapeHtml(address)}</div>` : ''}
-                        <span class="wo-type ${type}">${typeLabel}</span>${regieChip}${lnlChip}
+                        ${wo.sleutelkluis ? `<div class="wo-kluis" title="Code van het sleutelkluisje op de werf">🔑 Sleutelkluis <b>${this.escapeHtml(wo.sleutelkluis)}</b></div>` : ''}
+                        <span class="wo-type ${type}">${typeLabel}</span>${regieChip}${fotoChip}${lnlChip}
                         ${orderNr ? `<span style="margin-left:6px;font-size:11px;color:var(--qe-purple);font-weight:500">${this.escapeHtml(orderNr)}</span>` : ''}
                         ${histBadge}
                         ${hasMaterials || hasHours ? `<span style="margin-left:6px;font-size:11px;color:var(--qe-green)">${this.icon('check', { size: 12, style: 'vertical-align:-2px' })} In bewerking</span>` : ''}
@@ -2589,6 +3371,13 @@ const app = {
         // v181: regie (tijd & materiaal) heel zichtbaar bovenaan tonen
         const _regieBanner = document.getElementById('detailRegieBanner');
         if (_regieBanner) _regieBanner.style.display = this.currentWO.timeAndMaterial ? 'block' : 'none';
+        // v432: code van het sleutelkluisje op de werf (extraveld "Sleutelkluis code" op het project)
+        const _kluis = document.getElementById('detailSleutelkluis');
+        if (_kluis) {
+            const code = this.currentWO.sleutelkluis || '';
+            _kluis.style.display = code ? 'flex' : 'none';
+            const v = document.getElementById('detailSleutelkluisCode'); if (v) v.textContent = code;
+        }
         // v400: werkpakket-kaart voor projectwerkbonnen (fire-and-forget)
         this._toonWerkpakket(this.currentWO).catch(() => {});
 
@@ -3919,8 +4708,8 @@ const app = {
         document.getElementById('materialSearchResults').style.display = 'none';
         this.renderMaterials();
         this.toast(`${article.name} toegevoegd`);
-        // Bijhouden voor veelgebruikte materialen (custom-artikels niet)
-        if (!article.isCustom) this._trackFavoriteMaterial(article);
+        // Bijhouden voor veelgebruikte materialen (custom-artikels en webshop-artikels niet: geen Robaws-id)
+        if (!article.isCustom && !article.isWebshop) this._trackFavoriteMaterial(article);
     },
 
     /**
@@ -4025,7 +4814,7 @@ const app = {
     _trackFavoriteMaterial(article) {
         try {
             // Eenmalige artikels hebben geen Robaws-id → geen favoriet
-            if (!article || article.isCustom || String(article.id).startsWith('__custom')) return;
+            if (!article || article.isCustom || article.isWebshop || String(article.id).startsWith('__custom') || String(article.id).startsWith('ws:')) return;
             const key = 'qe_fav_materials';
             const stored = JSON.parse(localStorage.getItem(key) || '[]');
             const existing = stored.find(a => String(a.id) === String(article.id));
@@ -4124,188 +4913,412 @@ const app = {
     },
 
     // =====================================================================
-    // v329: MATERIAAL BESTELLEN — vrije regels (naam + aantal), Marble-mail
-    // via Robaws (service@qe.be). Twee modi:
-    //   - Aanvragen-tab: werknemer kiest zelf de projectleider; mail vertrekt
-    //     direct bij "Aanvraag versturen".
-    //   - Werkbon ("Materiaal bestellen"-knop, ex-"Materiaal ontbreekt"): de
-    //     regels worden bij de werkbon bewaard en gaan pas mee bij het
-    //     VERSTUREN van de werkbon — automatisch naar de verantwoordelijke
-    //     van de order (of de werfleider van het project).
-    // Bewust GEEN artikel-picker: bureel kiest de leverancier.
+    // v425: MATERIAAL BESTELLEN MET EEN MANDJE (keuze Levi 12 okt 2026)
+    // Vervangt het tekstformulier van v329 (keuze Levi: "Ja, vervangen").
+    // De werknemer vult in de webshop op de gsm (webshop-gsm.html met de
+    // module webshop-gsm-bestel.js op hub.mijnqe.be, via openGsmWebshop) een
+    // mandje met brutoprijzen, voor een werf of voor de stock. Er wordt NIETS
+    // besteld: de bestelling komt binnen bij het bureel (webshop > Aanvragen),
+    // dat ze nakijkt, aanpast en in de winkelwagen zet; bij een werf krijgt de
+    // projectleider een mail (Worker, blok-aanvraag.js).
+    // De app geeft de werven (planning), de lopende projecten en de stock mee
+    // (ctx.bestel) en krijgt {type:'bestel-klaar', aanvraag} terug.
+    // Mijn bestellingen = Worker /bel-api/shop-app-bestellingen (kop
+    // X-App-Sessie) + een journaal op de gsm, want de lijst in de Worker
+    // (KV.list) loopt tot een minuut achter. Een tekstbestelling van vóór
+    // v425 die nog bij een werkorder staat, gaat zoals vroeger mee bij het
+    // versturen (_verstuurMateriaalBestelling).
     // =====================================================================
-
-    /** Regel-rij (naam + aantal + verwijderknop) toevoegen aan een container. */
-    addMateriaalRegel(containerId, naam, aantal) {
-        const c = document.getElementById(containerId || 'matAanvraagRegels');
-        if (!c) return;
-        const rij = document.createElement('div');
-        rij.className = 'mat-regel';
-        rij.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;align-items:center';
-        rij.innerHTML = `
-            <input type="text" class="form-input mat-regel-naam" placeholder="Naam van het materiaal..." value="${this.escapeHtml(naam || '')}" style="flex:1;min-width:0">
-            <input type="number" class="form-input mat-regel-aantal" value="${aantal || 1}" min="1" inputmode="numeric" style="width:74px;text-align:center;flex:none">
-            <button class="btn btn-outline btn-sm" style="flex:none;width:38px;padding:8px 0" onclick="this.parentElement.remove()" aria-label="Regel verwijderen">✕</button>`;
-        c.appendChild(rij);
+    MB_LEV_NAAM: { desco: 'Desco', vanoirschot: 'Van Oirschot', stg: 'STG', metalunion: 'Metalunion', carnoy: 'Carnoy', viessmann: 'Viessmann' },
+    MB_STATUS: {
+        nieuw: { label: 'Ingediend', toon: 'grijs' },
+        bekeken: { label: 'Wordt nagekeken', toon: 'amber' },
+        mandje: { label: 'Wordt besteld', toon: 'amber' },
+        leverancier: { label: 'Wordt besteld', toon: 'amber' },
+        besteld: { label: 'Besteld', toon: 'groen' },
+        afgewezen: { label: 'Afgewezen', toon: 'rood' },
+        ingetrokken: { label: 'Ingetrokken', toon: 'grijs' },
+    },
+    MB_TOON: {
+        grijs: 'color:var(--g2,#5F5E56);background:var(--wash,#EFEDE6);border:1px solid var(--l1,#E4E1D9)',
+        amber: 'color:var(--amber2,#A65E12);background:var(--awash2,#F7E9D8);border:1px solid var(--aborder2,#E9CBA6)',
+        groen: 'color:var(--green2,#3E7A54);background:var(--gwash,#EDF3EE);border:1px solid var(--gborder2,#CFE0D3)',
+        rood: 'color:var(--red2,#B4372F);background:var(--rwash,#F6E7E5);border:1px solid rgba(180,55,47,0.3)',
     },
 
-    /** Lees de ingevulde regels uit een container (lege namen genegeerd). */
-    _leesMateriaalRegels(containerId) {
-        const c = document.getElementById(containerId || 'matAanvraagRegels');
-        if (!c) return [];
-        return Array.from(c.querySelectorAll('.mat-regel')).map(r => ({
-            naam: (r.querySelector('.mat-regel-naam')?.value || '').trim(),
-            aantal: Math.max(1, parseInt(r.querySelector('.mat-regel-aantal')?.value, 10) || 1),
-        })).filter(r => r.naam);
-    },
-
-    /** Aanvragen-tab → Materiaal: dropdown, werf-suggesties, eerste regel. */
+    /** Aanvragen → Materiaal: Mijn bestellingen (+ de oude aanvragen per mail van deze gsm). */
     initMateriaalAanvraagTab() {
-        const sel = document.getElementById('matAanvraagPl');
-        if (sel && !sel.options.length) {
-            const bureel = Object.entries(RobawsAPI.EMPLOYEES)
-                .filter(([, e]) => e.role === 'bureel')
-                .sort((a, b) => a[1].name.localeCompare(b[1].name));
-            sel.innerHTML = '<option value="">Kies een projectleider...</option>' +
-                bureel.map(([em, e]) => `<option value="${this.escapeHtml(em)}">${this.escapeHtml(e.name)}</option>`).join('');
-        }
-        // werf-suggesties uit de geladen dagplanning
-        const dl = document.getElementById('matWerfSuggesties');
-        if (dl) {
-            const namen = [...new Set((this.workorders || []).map(w =>
-                ((w.client && w.client.name) || w.summary || '').trim()).filter(Boolean))];
-            dl.innerHTML = namen.slice(0, 15).map(n => `<option value="${this.escapeHtml(n)}">`).join('');
-        }
-        const c = document.getElementById('matAanvraagRegels');
-        if (c && !c.children.length) this.addMateriaalRegel('matAanvraagRegels');
         this._renderMatAanvraagHistoriek();
+        this._mbLijstLaden();
     },
 
-    /** v331: historiek-sleutel PER GEBRUIKER — op een gedeeld toestel zag je
-     *  anders elkaars aanvragen (zelfde patroon als qe_pauze_<empId>). */
+    /** v331: sleutel PER GEBRUIKER van de oude aanvragen per mail (v329-v424). */
     _matAanvraagKey() {
         const empId = (this.currentUser && this.currentUser.robawsEmployeeId) || 'x';
         return 'qe_mat_aanvragen_' + empId;
     },
 
+    /** De oude aanvragen per mail van deze gsm: alleen tonen zolang er zijn. */
     _renderMatAanvraagHistoriek() {
         const box = document.getElementById('matAanvraagList');
+        const sectie = document.getElementById('matAanvraagOud');
         if (!box) return;
         try { localStorage.removeItem('qe_mat_aanvragen'); } catch (_) {}  // v331: oude gedeelde lijst opruimen
         let lijst = [];
         try { lijst = JSON.parse(localStorage.getItem(this._matAanvraagKey()) || '[]'); } catch (_) {}
-        if (!lijst.length) {
-            box.innerHTML = '<p class="text-grey text-sm text-center">Nog geen aanvragen verstuurd vanaf dit toestel.</p>';
-            return;
-        }
+        if (!Array.isArray(lijst)) lijst = [];
+        if (sectie) sectie.style.display = lijst.length ? 'block' : 'none';
         box.innerHTML = lijst.slice(0, 15).map(a => `
             <div class="card" style="margin-bottom:10px;padding:13px 16px">
                 <div style="display:flex;justify-content:space-between;gap:8px">
                     <div style="font-size:14px;font-weight:600">${this.escapeHtml(a.werf || 'Algemeen')}${a.dringend ? ' <span style="font-size:10.5px;font-weight:700;color:var(--amber2,#A65E12);letter-spacing:0.5px">DRINGEND</span>' : ''}</div>
                     <div style="font-size:12px;color:var(--qe-grey);flex:none">${this.escapeHtml(new Date(a.ts).toLocaleDateString('nl-BE'))}</div>
                 </div>
-                <div style="font-size:12.5px;color:var(--qe-grey);margin-top:3px">Naar ${this.escapeHtml(a.plNaam || a.pl || '?')} · ${a.regels.map(r => this.escapeHtml(r.naam) + ' (' + r.aantal + ')').join(', ')}</div>
+                <div style="font-size:12.5px;color:var(--qe-grey);margin-top:3px">Naar ${this.escapeHtml(a.plNaam || a.pl || '?')} · ${(a.regels || []).map(r => this.escapeHtml(r.naam) + ' (' + r.aantal + ')').join(', ')}</div>
             </div>`).join('');
     },
 
-    /** Aanvragen-tab: direct versturen naar de gekozen projectleider. */
-    async submitMateriaalAanvraag() {
-        const err = document.getElementById('matAanvraagError');
-        const toon = (m) => { if (err) { err.textContent = m; err.style.display = 'block'; } };
-        if (err) err.style.display = 'none';
-        const plEmail = (document.getElementById('matAanvraagPl')?.value || '').trim();
-        const werf = (document.getElementById('matAanvraagWerf')?.value || '').trim();
-        const regels = this._leesMateriaalRegels('matAanvraagRegels');
-        const opm = (document.getElementById('matAanvraagOpm')?.value || '').trim();
-        const dringend = !!document.getElementById('matAanvraagDringend')?.checked;
-        if (!plEmail) { toon('Kies eerst een projectleider.'); return; }
-        if (!regels.length) { toon('Vul minstens één materiaalregel in.'); return; }
-        const btn = document.getElementById('btnMatAanvraag');
-        if (this._matAanvraagBusy) return;
-        this._matAanvraagBusy = true;
-        if (btn) { btn.disabled = true; btn.textContent = 'Versturen…'; }
+    // ---- het journaal op de gsm (per werknemer) ----
+    _mbSleutel() { return 'qe_mb_' + ((this.currentUser && this.currentUser.robawsEmployeeId) || 'x'); },
+    _mbJournaal() {
         try {
-            const plNaam = (RobawsAPI.EMPLOYEES[plEmail] && RobawsAPI.EMPLOYEES[plEmail].name) || plEmail;
-            const empId = this.currentUser && this.currentUser.robawsEmployeeId;
-            await RobawsAPI.sendMailViaRobaws('employees/' + empId, {
-                subject: (dringend ? '⚠ DRINGEND — ' : '') + 'Materiaal bestellen' + (werf ? ' — ' + werf : ''),
-                html: this._materiaalMailHtml({ regels, opm, dringend, werf, plNaam }),
-                to: plEmail,
-            });
-            try {
-                const k = this._matAanvraagKey();  // v331: per gebruiker
-                const lijst = JSON.parse(localStorage.getItem(k) || '[]');
-                lijst.unshift({ ts: Date.now(), pl: plEmail, plNaam, werf, regels, dringend });
-                localStorage.setItem(k, JSON.stringify(lijst.slice(0, 20)));
-            } catch (_) {}
-            const c = document.getElementById('matAanvraagRegels');
-            if (c) { c.innerHTML = ''; this.addMateriaalRegel('matAanvraagRegels'); }
-            const opmEl = document.getElementById('matAanvraagOpm');
-            if (opmEl) opmEl.value = '';
-            const drEl = document.getElementById('matAanvraagDringend');
-            if (drEl) drEl.checked = false;
-            this._renderMatAanvraagHistoriek();
-            this.toast('✓ Aanvraag gemaild naar ' + plNaam);
-        } catch (e) {
-            toon('Versturen mislukt: ' + (e && e.message || '?') + ' — controleer je verbinding en probeer opnieuw.');
-        } finally {
-            this._matAanvraagBusy = false;
-            if (btn) { btn.disabled = false; btn.textContent = 'Aanvraag versturen'; }
-        }
+            const l = JSON.parse(localStorage.getItem(this._mbSleutel()) || '[]');
+            return Array.isArray(l) ? l.filter(x => x && x.id) : [];
+        } catch (_) { return []; }
     },
-
-    /** Werkbon-modus: regels bewaren bij de werkbon (mail gaat pas mee bij
-     *  het versturen van de werkbon, naar de order-verantwoordelijke). */
-    openMateriaalBestelling() {
-        if (!this.currentWO) return;
-        const data = this.woData[this.currentWO.id] || {};
-        const best = data.bestelling || { regels: [], opm: '', dringend: false };
-        document.getElementById('modalContent').innerHTML = `
-            <h3 style="font-size:16px;margin-bottom:6px">${this.icon('package', { size: 18, style: 'vertical-align:-3px' })} Materiaal bestellen</h3>
-            <p style="font-size:13px;color:var(--qe-grey);margin-bottom:12px">Wordt bij het versturen van de werkbon automatisch gemaild naar de verantwoordelijke van de order/werf.</p>
-            <div class="form-group">
-                <label>Materiaal</label>
-                <div id="wbBestelRegels"></div>
-                <button class="btn btn-outline btn-sm btn-full" onclick="app.addMateriaalRegel('wbBestelRegels')">+ Nog materiaal toevoegen</button>
-            </div>
-            <div class="form-group">
-                <label>Opmerking (optioneel)</label>
-                <textarea class="form-input" id="wbBestelOpm" rows="2" placeholder="Bijv. specifiek merk, afmetingen...">${this.escapeHtml(best.opm || '')}</textarea>
-            </div>
-            <label style="display:flex;align-items:center;gap:10px;margin-bottom:14px;cursor:pointer">
-                <input type="checkbox" id="wbBestelDringend" style="width:20px;height:20px" ${best.dringend ? 'checked' : ''}>
-                <span style="font-size:14px">Dringend</span>
-            </label>
-            <button class="btn btn-primary btn-full" onclick="app._saveMateriaalBestelling()">Bewaren bij deze werkbon</button>
-            ${best.regels && best.regels.length ? '<button class="btn btn-outline btn-full" style="margin-top:8px;color:var(--qe-red);border-color:var(--qe-red)" onclick="app._wisMateriaalBestelling()">Bestelling verwijderen</button>' : ''}
-        `;
-        this.openModal();
-        const rijen = (best.regels && best.regels.length) ? best.regels : [null];
-        rijen.forEach(r => this.addMateriaalRegel('wbBestelRegels', r && r.naam, r && r.aantal));
+    _mbJournaalZet(lijst) {
+        try { localStorage.setItem(this._mbSleutel(), JSON.stringify((lijst || []).slice(0, 30))); } catch (_) {}
     },
-
-    _saveMateriaalBestelling() {
-        if (!this.currentWO) return;
-        const regels = this._leesMateriaalRegels('wbBestelRegels');
-        if (!regels.length) { this.toast('Vul minstens één materiaalregel in', true); return; }
-        const data = this.woData[this.currentWO.id];
-        data.bestelling = {
-            regels,
-            opm: (document.getElementById('wbBestelOpm')?.value || '').trim(),
-            dringend: !!document.getElementById('wbBestelDringend')?.checked,
+    /** Wat de gsm van een bestelling bewaart (zonder foto's en sleutels). */
+    _mbKort(a) {
+        const regel = (x) => (x && x.vrij)
+            ? { vrij: String(x.vrij).slice(0, 160), a: Number(x.a) || 1 }
+            : { n: String((x && x.n) || '').slice(0, 160), a: Number(x && x.a) || 1, eh: String((x && x.eh) || '').slice(0, 10), b: Number(x && x.b) || 0, m: String((x && x.m) || '').slice(0, 40) };
+        return {
+            id: String(a.id), t: a.t || new Date().toISOString(), u: a.u || a.t || '', status: a.status || 'nieuw',
+            doel: (a.doel && typeof a.doel === 'object') ? a.doel : null, wanneer: a.wanneer || null,
+            opm: String(a.opm || '').slice(0, 600), dringend: !!a.dringend,
+            regels: (Array.isArray(a.regels) ? a.regels : []).map(regel),
+            aangepast: Array.isArray(a.aangepast) ? a.aangepast.map(regel) : null,
+            bruto: Number(a.bruto) || 0, noot: String(a.noot || '').slice(0, 600), reden: String(a.reden || '').slice(0, 300),
+            lev: (a.lev && typeof a.lev === 'object') ? a.lev : null, mail: a.mail || null, werkbon: a.werkbon || null,
         };
-        this._saveWoData();
-        this.closeModal();
-        this.toast('📦 Bestelling bewaard — gaat mee bij het versturen van de werkbon');
+    },
+    _mbDoelTekst(d) {
+        if (!d) return '';
+        if (d.soort === 'stock') return 'Stock · ' + (d.naam || 'Magazijn') + (d.sub ? ' (' + d.sub + ')' : '');
+        const nr = d.projectNr || d.orderNr;
+        return (nr ? nr + ' · ' : '') + (d.naam || '');
+    },
+    /** Zelfde tekst als HTML: een nummerplaat of een nummer breekt nooit middenin af. */
+    _mbDoelHtml(d) {
+        const esc = (s) => this.escapeHtml(String(s == null ? '' : s));
+        const heel = (s) => '<span style="white-space:nowrap">' + esc(s) + '</span>';
+        if (!d) return '';
+        if (d.soort === 'stock') return 'Stock · ' + esc(d.naam || 'Magazijn') + (d.sub ? ' ' + heel('(' + d.sub + ')') : '');
+        const nr = d.projectNr || d.orderNr;
+        return (nr ? heel(nr) + ' · ' : '') + esc(d.naam || '');
+    },
+    _mbEuro(n) {
+        const v = Math.round((Number(n) || 0) * 100) / 100;
+        return '€' + String.fromCharCode(160) + v.toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    },
+    _mbDatum(iso) {
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return '';
+        const uur = d.toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit' });
+        const dag = RobawsAPI._localDateStr(d);
+        if (dag === RobawsAPI._localDateStr()) return 'vandaag ' + uur;
+        if (dag === RobawsAPI._localDateStr(null, -1)) return 'gisteren ' + uur;
+        return d.toLocaleDateString('nl-BE', { weekday: 'short', day: 'numeric', month: 'short' });
+    },
+    _mbWanneerTekst(a) {
+        const w = a && a.wanneer;
+        if (!w || !w.soort || w.soort === 'asap') return 'zo snel mogelijk';
+        const dag = (d) => { try { return d.toLocaleDateString('nl-BE', { weekday: 'long', day: 'numeric', month: 'long' }); } catch (_) { return ''; } };
+        if (w.soort === 'datum' && /^\d{4}-\d{2}-\d{2}$/.test(String(w.datum || ''))) return dag(new Date(w.datum + 'T12:00:00'));
+        const t = new Date(a.t || Date.now());
+        if (w.soort === 'morgen') return dag(new Date(t.getTime() + 86400000));
+        if (w.soort === 'week') { try { return 'de week van ' + t.toLocaleDateString('nl-BE', { day: 'numeric', month: 'long' }); } catch (_) { return 'deze week'; } }
+        return '';
     },
 
-    _wisMateriaalBestelling() {
-        if (!this.currentWO) return;
-        const data = this.woData[this.currentWO.id];
-        delete data.bestelling;
-        this._saveWoData();
-        this.closeModal();
-        this.toast('Bestelling verwijderd');
+    // ---- de webshop openen ----
+    /** "+ Nieuwe bestelling" (Aanvragen) of "Materiaal bestellen" in een werkorder (dan staat de werf al ingevuld). */
+    async openMateriaalBestellen(vanWerkbon) {
+        if (typeof this.openGsmWebshop !== 'function') { this.toast('Bestellen kan nog niet in deze versie van de app', true); return; }
+        if (this._mbOpenen) return;
+        this._mbOpenen = true;
+        const wacht = setTimeout(() => this.toast('Webshop openen…'), 600);
+        let ctx = null;
+        try { ctx = await this._mbCtx(vanWerkbon ? this.currentWO : null); }
+        catch (e) { console.warn('[Bestellen] gegevens voor de webshop:', e && e.message); }
+        finally { clearTimeout(wacht); this._mbOpenen = false; }
+        if (!ctx) ctx = { naam: String((this.currentUser && this.currentUser.name) || ''), doel: null, werven: [], projecten: [], stock: [{ key: 's-mag', soort: 'stock', wat: 'magazijn', naam: 'Magazijn' }], werkbon: null };
+        const mislukt = (e) => { console.warn('[Bestellen] webshop openen:', e && e.message); this.toast('De webshop openen lukte niet', true); };
+        try {
+            // sleutel: de webshop bewaart een half gevuld mandje (3 dagen) per werknemer en per werkorder (of los)
+            const sleutel = 'bestel:' + String((this.currentUser && this.currentUser.robawsEmployeeId) || 'x') + ':' + (ctx.werkbon ? 'wb' + ctx.werkbon.planningId : 'vrij');
+            const r = this.openGsmWebshop('bestel', { bestel: ctx, sleutel }, { opBericht: (m) => this._mbBericht(m) });
+            if (r && typeof r.catch === 'function') r.catch(mislukt);
+        } catch (e) { mislukt(e); }
+    },
+    /** Werkorder → tabblad Materiaal → "Materiaal bestellen" (index.html roept deze naam aan). */
+    openMateriaalBestelling() { return this.openMateriaalBestellen(true); },
+
+    /** Wat de bestelmodule nodig heeft: wie, de werven (planning), de lopende projecten en de stock. */
+    async _mbCtx(wo) {
+        const u = this.currentUser || {};
+        const binnen = (p, ms) => new Promise((ok) => {
+            let klaar = false;
+            const t = setTimeout(() => { if (!klaar) { klaar = true; ok(null); } }, ms);
+            Promise.resolve(p).then((v) => { if (!klaar) { klaar = true; clearTimeout(t); ok(v); } },
+                () => { if (!klaar) { klaar = true; clearTimeout(t); ok(null); } });
+        });
+        const [proj, mats, locs] = await Promise.all([
+            binnen(RobawsAPI.getProjectenOverzicht(), 6000),
+            binnen(RobawsAPI.getMaterials(), 6000),
+            binnen(RobawsAPI.getStockLocations(), 6000),
+        ]);
+        const projecten = Array.isArray(proj) ? proj : [];
+        const pVan = {};
+        projecten.forEach((p) => { pVan[String(p.id)] = p; });
+        // klantnamen dragen de klantcode (" - 31584") achteraan
+        const kort = (n) => String(n || '').replace(/\s+-\s+\d+\s*$/, '').replace(/\s+/g, ' ').trim();
+        const plaatsUit = (adres) => {
+            const delen = String(adres || '').split(',').map((s) => s.trim()).filter(Boolean);
+            const m = (delen[delen.length - 1] || '').match(/^(?:[A-Z]{1,2}-?)?\d{4,5}\s+(.+)$/);
+            return m ? m[1] : '';
+        };
+        const vandaag = RobawsAPI._localDateStr(), morgen = RobawsAPI._localDateStr(null, 1);
+        const wanneerVan = (iso) => {
+            if (!iso) return '';
+            const dt = new Date(iso);
+            if (isNaN(dt.getTime())) return '';
+            const d = RobawsAPI._localDateStr(dt);
+            if (d === vandaag) return 'vandaag';
+            if (d === morgen) return 'morgen';
+            try { return dt.toLocaleDateString('nl-BE', { weekday: 'short', day: 'numeric', month: 'short' }); } catch (_) { return d; }
+        };
+        const werfVan = (w) => {
+            if (!w || RobawsAPI.isWachtPlanning(w)) return null;
+            const p = w.projectId ? pVan[String(w.projectId)] : null;
+            const naam = kort(p ? p.naam : ((w.client && w.client.name) || w.summary)).slice(0, 120);
+            if (!naam) return null;
+            const adres = String(w.address || (p && p.adresTekst) || (w.client && w.client.address) || '').slice(0, 160);
+            const x = { key: 'pl' + w.id, soort: 'werf', naam, planningId: String(w.id) };
+            const plaats = (p && p.adres && p.adres.city) || plaatsUit(adres);
+            if (plaats) x.plaats = plaats;
+            if (adres) x.adres = adres;
+            if (w.projectId) x.projectId = String(w.projectId);
+            if (p && /^P\d{6}$/i.test(String(p.logicId || ''))) x.projectNr = String(p.logicId).toUpperCase();
+            if (w.salesOrderId) x.orderId = String(w.salesOrderId);
+            if (/^R\d{6}$/i.test(String(w.orderLogicId || ''))) x.orderNr = String(w.orderLogicId).toUpperCase();
+            const wn = wanneerVan(w.startDate);
+            if (wn) x.wanneer = wn;
+            return x;
+        };
+        // de werven: de werkorder waar je in staat, dan de planning van de dag op het scherm (één per project of order)
+        const werven = [];
+        const gezien = new Set();
+        const voeg = (w, badge) => {
+            const x = werfVan(w);
+            if (!x) return null;
+            const sl = x.projectId ? 'p' + x.projectId : (x.orderId ? 'o' + x.orderId : x.key);
+            if (gezien.has(sl)) return null;
+            gezien.add(sl);
+            if (badge) x.badge = badge;
+            werven.push(x);
+            return x;
+        };
+        const doel = wo ? voeg(wo, 'DEZE WERKBON') : null;
+        const plan = (Array.isArray(this._mbPlanAlle) && this._mbPlanAlle.length) ? this._mbPlanAlle : (this.workorders || []);
+        plan.forEach((w) => voeg(w));
+        // de lopende projecten (zoeken in de webshop)
+        const lopend = projecten.filter((p) => !p.afgesloten).map((p) => {
+            const x = { key: 'p' + p.id, soort: 'werf', naam: kort(p.naam).slice(0, 120), projectId: String(p.id) };
+            if (/^P\d{6}$/i.test(String(p.logicId || ''))) x.projectNr = String(p.logicId).toUpperCase();
+            if (p.adres && p.adres.city) x.plaats = p.adres.city;
+            if (p.adresTekst) x.adres = String(p.adresTekst).slice(0, 160);
+            return x;
+        }).filter((x) => x.naam).sort((a, b) => a.naam.localeCompare(b.naam, 'nl'));
+        // de stock: het groot magazijn en je eigen camionet(ten)
+        const lijstLoc = Array.isArray(locs) ? locs : [];
+        const netjes = (s) => { s = String(s || '').replace(/\s+/g, ' ').trim(); return (s && s === s.toUpperCase()) ? s.charAt(0) + s.slice(1).toLowerCase() : s; };
+        const mag = RobawsAPI.gasMagazijnLocatie(lijstLoc);
+        const stock = [];
+        const m0 = { key: 's-mag', soort: 'stock', wat: 'magazijn', naam: mag ? (netjes(mag.naam) || 'Magazijn') : 'Magazijn' };
+        if (mag && /^\d+$/.test(String(mag.id))) m0.locId = String(mag.id);
+        stock.push(m0);
+        const voornaam = String(u.name || '').trim().split(/\s+/)[0] || '';
+        const mijn = Array.isArray(mats) ? this._mijnVoertuigen(mats) : [];
+        mijn.forEach((v) => {
+            const plaat = (String(v.name || '').toUpperCase().match(/\d-[A-Z]{2,3}-\d{2,3}/) || [''])[0];
+            const ids = this._voertuigLocatieIds(v, lijstLoc);
+            const x = { key: 's-cam-' + v.id, soort: 'stock', wat: 'camionet', naam: (mijn.length === 1 && voornaam) ? 'Camionet ' + voornaam : 'Camionet ' + (plaat || String(v.name || '').trim()) };
+            if (plaat && mijn.length === 1) x.sub = plaat;
+            if (ids[0]) x.locId = ids[0];
+            stock.push(x);
+        });
+        const werkbon = (wo && /^\d+$/.test(String(wo.id))) ? { planningId: String(wo.id), titel: ((doel && doel.naam) || kort((wo.client && wo.client.name) || wo.summary)).slice(0, 120) } : null;
+        return { naam: String(u.name || '').trim().slice(0, 60), doel, werven, projecten: lopend, stock, werkbon };
+    },
+
+    /** Berichten van de webshop: alleen 'bestel-klaar' is voor ons ('stand', 'terug-…' zijn van de webshop zelf). */
+    _mbBericht(m) {
+        if (!m || m.type !== 'bestel-klaar' || !m.aanvraag || !m.aanvraag.id) return;
+        const a = this._mbKort(m.aanvraag);
+        this._mbJournaalZet([a].concat(this._mbJournaal().filter((x) => String(x.id) !== a.id)));
+        this._mbRender();
+    },
+    /** Bestellingen via de webshop vanuit deze werkorder (journaal van de gsm). */
+    _mbVoorWerkbon(woId) {
+        const id = String(woId || '');
+        return this._mbJournaal().filter((x) => x.werkbon && String(x.werkbon.planningId) === id && x.status !== 'ingetrokken');
+    },
+
+    // ---- Mijn bestellingen ----
+    async _mbLijstLaden() {
+        if (!document.getElementById('matBestelLijst')) return;
+        const emp = String((this.currentUser && this.currentUser.robawsEmployeeId) || '');
+        if (this._mbServer && this._mbServer.emp !== emp) this._mbServer = null;
+        if (this._mbLaadt) return;
+        this._mbLaadt = true;
+        this._mbRender();
+        const s = RobawsAPI.sessieLees();
+        let fout = null;
+        if (!s) fout = 'sessie';
+        else {
+            try {
+                const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/shop-app-bestellingen', { headers: { 'X-App-Sessie': s.token } }, 12000);
+                let j = null;
+                try { j = await r.json(); } catch (_) {}
+                if (r.status === 401 && j && j.sessie === false) fout = 'sessie';
+                else if (r.status === 401 || r.status === 404) fout = 'oud';   // een Worker zonder de routes van v497
+                else if (!r.ok || !j || !Array.isArray(j.items)) fout = 'fout';
+                else {
+                    this._mbServer = { emp, at: Date.now(), items: j.items };
+                    const op = {};
+                    j.items.forEach((x) => { if (x && x.id) op[String(x.id)] = x; });
+                    this._mbJournaalZet(this._mbJournaal().map((x) => op[String(x.id)] ? this._mbKort(op[String(x.id)]) : x));
+                }
+            } catch (e) { fout = 'net'; }
+        }
+        this._mbLaadt = false;
+        this._mbFout = fout;
+        this._mbRender();
+    },
+    _mbRender() {
+        const box = document.getElementById('matBestelLijst');
+        if (!box) return;
+        const esc = (s) => this.escapeHtml(String(s == null ? '' : s));
+        const emp = String((this.currentUser && this.currentUser.robawsEmployeeId) || '');
+        const srv = (this._mbServer && this._mbServer.emp === emp) ? this._mbServer.items : null;
+        const jr = this._mbJournaal();
+        let items;
+        if (srv) {
+            const ids = new Set(srv.map((x) => String(x && x.id)));
+            const nu = Date.now();
+            // net verstuurd en nog niet in de lijst van de Worker: uit het journaal (tot 10 minuten)
+            items = srv.filter((x) => x && x.id).map((x) => this._mbKort(x))
+                .concat(jr.filter((x) => !ids.has(String(x.id)) && (nu - (Date.parse(x.t) || 0)) < 10 * 60e3));
+        } else items = jr.slice();
+        items.sort((a, b) => String(b.t || '').localeCompare(String(a.t || '')));
+        this._mbAlle = items;
+        const melding = {
+            sessie: 'Meld je opnieuw aan in de app om te zien hoe ver je bestellingen staan.',
+            oud: 'Bestellen via de webshop staat nog niet aan. Vraag het aan het bureel.',
+            fout: 'Hoe ver je bestellingen staan, laden lukte niet. Probeer straks opnieuw.',
+            net: 'Geen verbinding. Je ziet wat er op deze gsm bewaard is.',
+        }[this._mbFout] || '';
+        const h = melding ? '<p style="font-size:12.5px;color:var(--g1,#85847C);margin:0 2px 10px;line-height:1.45">' + esc(melding) + '</p>' : '';
+        if (!items.length) {
+            box.innerHTML = h + (this._mbLaadt ? '<div class="spinner"></div>' : '<p class="text-grey text-sm text-center" style="padding:10px 0">Nog geen bestellingen.</p>');
+            return;
+        }
+        box.innerHTML = h + '<div class="card" style="padding:0 16px">' + items.map((a) => this._mbRij(a)).join('') + '</div>';
+    },
+    _mbRij(a) {
+        const esc = (s) => this.escapeHtml(String(s == null ? '' : s));
+        const NB = String.fromCharCode(160);
+        const st = this.MB_STATUS[a.status] || this.MB_STATUS.nieuw;
+        const regels = (a.aangepast && a.aangepast.length) ? a.aangepast : (a.regels || []);
+        const n = regels.length;
+        const bruto = regels.reduce((s, r) => s + (r.vrij ? 0 : (Number(r.b) || 0) * (Number(r.a) || 0)), 0);
+        const open = this._mbOpen === a.id;
+        const onder = this._mbDatum(a.t) + ' · ' + n + NB + (n === 1 ? 'artikel' : 'artikels') + (bruto ? ' · ' + this._mbEuro(bruto) + ' bruto' : '');
+        let h = '<div class="mb-best" style="padding:13px 0;border-bottom:1px solid var(--l2,#EBE8E0)">' +
+            '<button type="button" onclick="app.mbToon(\'' + this._escapeJsArg(a.id) + '\')" aria-expanded="' + (open ? 'true' : 'false') + '" style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;width:100%;text-align:left;background:none;border:0;padding:0;font:inherit;color:inherit;cursor:pointer">' +
+            '<span style="min-width:0;display:block">' +
+            '<span style="display:block;font-size:14px;font-weight:600;line-height:1.3">' + this._mbDoelHtml(a.doel) + (a.dringend ? ' <span style="font-size:10.5px;font-weight:700;letter-spacing:0.5px;color:var(--amber2,#A65E12)">DRINGEND</span>' : '') + '</span>' +
+            '<span style="display:block;font-size:12px;color:var(--g1,#85847C);margin-top:2px">' + esc(onder) + '</span>' +
+            '</span>' +
+            '<span style="font-size:11.5px;font-weight:600;border-radius:12px;padding:3px 10px;white-space:nowrap;flex:none;' + this.MB_TOON[st.toon] + '">' + esc(st.label) + '</span>' +
+            '</button>';
+        // wat het bureel deed: altijd zichtbaar, ook dichtgeklapt
+        const info = [];
+        if (a.status === 'afgewezen' && a.reden) info.push('<b>Reden:</b> ' + esc(a.reden));
+        if (a.status === 'leverancier' && a.lev) {
+            const l = Object.keys(a.lev).map((k) => this.MB_LEV_NAAM[k] || k);
+            if (l.length) info.push('Klaargezet bij ' + esc(l.join(', ')));
+        }
+        if (a.aangepast) info.push('Aangepast door het bureel');
+        if (a.noot) info.push('<b>Het bureel:</b> ' + esc(a.noot));
+        if (info.length) h += '<div style="font-size:12.5px;color:var(--txt2,#3A4356);margin-top:6px;line-height:1.45">' + info.join('<br>') + '</div>';
+        if (open) h += this._mbDetail(a, regels);
+        return h + '</div>';
+    },
+    _mbDetail(a, regels) {
+        const esc = (s) => this.escapeHtml(String(s == null ? '' : s));
+        const NB = String.fromCharCode(160);
+        const lijn = (r) => '<div style="display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px solid var(--l2,#EBE8E0);font-size:13px">' +
+            '<span style="min-width:0' + (r.vrij ? ';font-style:italic' : '') + '">' + esc(r.vrij || r.n) + (r.m && !r.vrij ? ' <span style="color:var(--g1,#85847C)">· ' + esc(r.m) + '</span>' : '') + '</span>' +
+            '<b style="flex:none;font-variant-numeric:tabular-nums">' + esc(String(r.a).replace('.', ',')) + (r.eh ? NB + esc(r.eh) : '') + '</b></div>';
+        let h = '<div style="margin-top:10px;background:var(--wash,#EFEDE6);border-radius:12px;padding:6px 12px 10px">';
+        h += regels.map(lijn).join('');
+        if (a.aangepast && a.regels && a.regels.length) h += '<details style="margin-top:8px"><summary style="font-size:12.5px;color:var(--g1,#85847C);cursor:pointer">Wat je vroeg</summary>' + a.regels.map(lijn).join('') + '</details>';
+        const regel = [];
+        const w = this._mbWanneerTekst(a);
+        if (w) regel.push('Tegen: ' + esc(w));
+        if (a.opm) regel.push('Jouw opmerking: ' + esc(a.opm));
+        if (a.mail && a.mail.ok && a.mail.naar) regel.push('Mail naar ' + esc(a.mail.naar));
+        if (regel.length) h += '<div style="font-size:12.5px;color:var(--g2,#5F5E56);margin-top:8px;line-height:1.5">' + regel.join('<br>') + '</div>';
+        if (a.status === 'nieuw') h += '<button type="button" class="btn btn-outline btn-sm btn-full" style="margin-top:10px" onclick="app.mbIntrekken(\'' + this._escapeJsArg(a.id) + '\')">Intrekken</button>';
+        return h + '</div>';
+    },
+    mbToon(id) {
+        this._mbOpen = (this._mbOpen === id) ? null : id;
+        this._mbRender();
+    },
+    async mbIntrekken(id) {
+        const a = (this._mbAlle || []).find((x) => x.id === id);
+        if (!a || a.status !== 'nieuw' || this._mbIntrekBezig) return;
+        const ok = await QEClock._showConfirmModal('Bestelling intrekken?',
+            'Je bestelling voor <b>' + this.escapeHtml(this._mbDoelTekst(a.doel)) + '</b> gaat niet meer naar het bureel.', 'Intrekken', 'Annuleren');
+        if (!ok) return;
+        const s = RobawsAPI.sessieLees();
+        if (!s) { this.toast('Meld je opnieuw aan in de app', true); return; }
+        this._mbIntrekBezig = true;
+        try {
+            const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/shop-app-bestel-intrekken', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Sessie': s.token }, body: JSON.stringify({ id }),
+            }, 12000);
+            let j = null;
+            try { j = await r.json(); } catch (_) {}
+            if (j && j.aanvraag && j.aanvraag.id) this._mbZetStand(j.aanvraag);
+            // 409 = het bureel kijkt ze al na: geen fout, gewoon de uitleg (de nieuwe stand staat er al)
+            if (r.status === 409) { this.toast((j && j.error) || 'Het bureel kijkt deze bestelling al na.'); return; }
+            if (!r.ok) { this.toast((j && j.error) || 'Intrekken lukte niet', true); return; }
+            this.toast('Bestelling ingetrokken');
+        } catch (e) {
+            this.toast('Geen verbinding. Probeer opnieuw.', true);
+        } finally { this._mbIntrekBezig = false; }
+    },
+    _mbZetStand(a) {
+        const k = this._mbKort(a);
+        this._mbJournaalZet(this._mbJournaal().map((x) => String(x.id) === k.id ? k : x));
+        if (this._mbServer && Array.isArray(this._mbServer.items)) this._mbServer.items = this._mbServer.items.map((x) => (x && String(x.id) === k.id) ? a : x);
+        this._mbRender();
     },
 
     /** Bij het versturen van de werkbon: bestelling mailen naar de
@@ -4519,11 +5532,13 @@ const app = {
 
         container.innerHTML = data.materials.map(mat => {
             const price = mat.salePrice || mat.unitPrice || 0;
+            // v424: materiaal uit de webshop = eigen lijn op de bon (brutoprijs van waar we kopen); een klein label toont dat
+            const ws = mat.isWebshop && mat.ws ? `<div class="mat-ws" style="font-size:11.5px;color:var(--qe-grey);margin-top:1px">Webshop · ${this.escapeHtml(this._gsmLevNaam(mat.ws.lev))} ${this.escapeHtml(mat.ws.code || '')}</div>` : '';
             return `
                 <div class="material-item">
                     <div class="mat-info">
-                        <div class="mat-name">${this.escapeHtml(mat.name)}</div>
-                        <div class="mat-price">${this.formatPrice(price)} / ${mat.unit || 'stuk'} = ${this.formatPrice(price * mat.quantity)}</div>
+                        <div class="mat-name">${this.escapeHtml(mat.name)}</div>${ws}
+                        <div class="mat-price">${this.formatPrice(price)} / ${this.escapeHtml(mat.unit || 'stuk')} = ${this.formatPrice(price * mat.quantity)}</div>
                     </div>
                     <div class="mat-qty">
                         <button class="qty-btn" onclick="app.updateMaterialQty('${String(mat.id).replace(/'/g,'&#39;')}', -1)">−</button>
@@ -4535,6 +5550,158 @@ const app = {
             `;
         }).join('');
         this._saveWoData();
+    },
+
+    // ========================================
+    // v424: MATERIAAL UIT DE WEBSHOP (in de app zelf, zonder de app te verlaten)
+    // ========================================
+    // Vraag Levi 12 okt 2026: monteurs en techniekers kiezen materiaal uit de webshop i.p.v. het artikelzoeken van Robaws, met hun
+    // login van de app, alleen brutoprijzen; het mandje komt op de bon. De webshop (hub.mijnqe.be/webshop-gsm.html) opent in een
+    // iframe in een volledig scherm (de app blijft open: MainActivity stuurt alleen hoofdnavigaties naar buiten). De app geeft de
+    // ondertekende sessie (qe_sessie) via postMessage, alleen aan die herkomst. Elk artikel wordt een EIGEN lijn op de bon met de
+    // brutoprijs van de leverancier waar we kopen (keuze Levi). Staat naast het zoeken in Robaws: een overgang met foutmarge.
+    // De chat "bestellen monteurs" gebruikt dezelfde webshop met doel 'bestel' (openGsmWebshop('bestel', {bestel}, {opBericht})).
+    GSM_URL: 'https://hub.mijnqe.be/webshop-gsm.html',
+    _gsm: null,
+    _gsmLevNaam(lev) {
+        return ({ desco: 'Desco', vanoirschot: 'Van Oirschot', stg: 'STG', metalunion: 'Metalunion', carnoy: 'Carnoy', viessmann: 'Viessmann' })[lev] || String(lev || '');
+    },
+    openGsmBon() {
+        if (!this.currentWO) { this.toast('Geen werkbon actief'); return; }
+        const wo = this.currentWO;
+        const klant = (wo.client && wo.client.name) || '';
+        this.openGsmWebshop('bon', { sleutel: 'bon:' + wo.id, titel: klant ? 'Bon voor ' + klant : 'Materiaal voor deze bon' }, {
+            opMandje: (regels) => this._gsmBonMandje(wo.id, regels),
+        });
+    },
+    openGsmWebshop(doel, ctx, h) {
+        if (this._gsm) return;
+        const s = RobawsAPI.sessieLees && RobawsAPI.sessieLees();
+        if (!s || !s.token) { this.toast('Meld je af en opnieuw aan in de app om de webshop te gebruiken.', true); return; }
+        let url;
+        try { url = new URL(this.GSM_URL); } catch (_) { this.toast('Het adres van de webshop klopt niet', true); return; }
+        url.searchParams.set('doel', doel === 'bestel' ? 'bestel' : 'bon');
+        const ov = document.createElement('div');
+        ov.id = 'gsmOverlay';
+        ov.setAttribute('role', 'dialog');
+        ov.setAttribute('aria-modal', 'true');
+        ov.setAttribute('aria-label', 'Webshop');
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99996;background:var(--bg,#F4F2ED);display:flex;flex-direction:column';
+        ov.innerHTML = '<div id="gsmLaad" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--qe-grey);padding:24px;text-align:center">'
+            + '<div class="spinner"></div><div style="font-size:14px">Webshop openen…</div></div>'
+            + '<iframe id="gsmFrame" title="Webshop" style="flex:1 1 auto;width:100%;height:100%;border:0;background:transparent;opacity:0;transition:opacity .15s"></iframe>';
+        document.body.appendChild(ov);
+        const frame = ov.querySelector('#gsmFrame');
+        const thema = document.body.classList.contains('dark-mode') ? 'donker' : 'licht';
+        const g = this._gsm = {
+            doel: doel === 'bestel' ? 'bestel' : 'bon', ctx: Object.assign({ thema }, ctx || {}), h: h || {}, frame, ov,
+            origin: url.origin, n: 0, klaar: false, timer: null, terugTimer: null, luister: null,
+        };
+        g.luister = (ev) => this._gsmBericht(ev);
+        window.addEventListener('message', g.luister);
+        g.timer = setTimeout(() => { if (this._gsm === g && !g.klaar) this._gsmFout(); }, 20000);
+        frame.src = url.href;
+    },
+    _gsmBericht(ev) {
+        const g = this._gsm;
+        if (!g || !g.frame || ev.source !== g.frame.contentWindow || ev.origin !== g.origin) return;   // alleen de webshop zelf
+        const d = ev.data;
+        if (!d || d.bron !== 'qe-gsm' || typeof d.type !== 'string') return;
+        if (d.type === 'klaar') {
+            const s = RobawsAPI.sessieLees && RobawsAPI.sessieLees();
+            if (!s || !s.token) { this._gsmSluit(); this.toast('Meld je opnieuw aan in de app om de webshop te gebruiken.', true); return; }
+            g.klaar = true;
+            clearTimeout(g.timer);
+            g.frame.style.opacity = '1';
+            const laad = g.ov.querySelector('#gsmLaad');
+            if (laad) laad.remove();
+            // v426: kan = wat de app nog voor de webshop doet ('open' = een document zoals de technische fiche in de browser openen)
+            try { g.frame.contentWindow.postMessage({ bron: 'qe-app', type: 'start', v: 1, kan: ['open'], sessie: s.token, doel: g.doel, ctx: g.ctx }, g.origin); } catch (_) {}
+            return;
+        }
+        // v426: een document van een artikel (technische fiche) openen in de browser van het toestel; de webshop blijft open
+        if (d.type === 'open') {
+            const u = String(d.url || '');
+            if (/^https:\/\/[^\s"'<>]{4,600}$/.test(u)) this._ciawOpen(u);
+            return;
+        }
+        if (d.type === 'stand') g.n = Number(d.n) || 0;
+        if (d.type === 'terug-ok') clearTimeout(g.terugTimer);
+        if (d.type === 'sluit') { this._gsmSluit(); return; }
+        if (d.type === 'mandje') {
+            clearTimeout(g.terugTimer);
+            if (typeof g.h.opMandje === 'function') { try { g.h.opMandje(Array.isArray(d.regels) ? d.regels : [], d); } catch (e) { console.warn('[Webshop] opMandje:', e && e.message); } }
+            if (g.doel === 'bon') this._gsmSluit();
+            return;
+        }
+        if (typeof g.h.opBericht === 'function') { try { g.h.opBericht(d); } catch (e) { console.warn('[Webshop] opBericht:', e && e.message); } }
+    },
+    _gsmFout() {
+        const g = this._gsm;
+        if (!g) return;
+        const laad = g.ov.querySelector('#gsmLaad');
+        if (!laad) return;
+        laad.innerHTML = '<div style="font-size:15px;font-weight:600;color:var(--qe-darkblue)">De webshop laadt niet</div>'
+            + '<div style="font-size:13.5px;max-width:300px">Controleer je verbinding (wifi of mobiele data) en probeer opnieuw.</div>'
+            + '<div style="display:flex;gap:10px;margin-top:6px"><button class="btn btn-outline" type="button" id="gsmSluitKnop">Sluiten</button><button class="btn btn-primary" type="button" id="gsmOpnieuwKnop">Opnieuw</button></div>';
+        laad.querySelector('#gsmSluitKnop').addEventListener('click', () => this._gsmSluit());
+        laad.querySelector('#gsmOpnieuwKnop').addEventListener('click', () => {
+            const doel = g.doel, ctx = g.ctx, h = g.h;
+            this._gsmSluit();
+            this.openGsmWebshop(doel, ctx, h);
+        });
+    },
+    // Android-terug: de webshop beslist (paneel dicht, zoekvraag weg of sluiten met een vraag als het mandje niet leeg is)
+    _gsmTerug() {
+        const g = this._gsm;
+        if (!g) return;
+        if (!g.klaar) { this._gsmSluit(); return; }
+        try { g.frame.contentWindow.postMessage({ bron: 'qe-app', type: 'terug' }, g.origin); } catch (_) { this._gsmSluit(); return; }
+        clearTimeout(g.terugTimer);
+        g.terugTimer = setTimeout(() => { if (this._gsm === g) this._gsmSluit(); }, 2500);
+    },
+    _gsmSluit() {
+        const g = this._gsm;
+        if (!g) return;
+        this._gsm = null;
+        clearTimeout(g.timer);
+        clearTimeout(g.terugTimer);
+        window.removeEventListener('message', g.luister);
+        try { g.ov.remove(); } catch (_) {}
+        if (typeof g.h.opSluit === 'function') { try { g.h.opSluit(); } catch (_) {} }
+    },
+    // het mandje uit de webshop op de bon: één lijn per artikel (zelfde artikel nog eens = aantal erbij, met de nieuwste prijs)
+    _gsmBonMandje(woId, regels) {
+        const data = this.woData && this.woData[woId];
+        if (!data) { this.toast('Deze bon is niet meer open: het materiaal is niet toegevoegd', true); return; }
+        let n = 0;
+        for (const r of regels || []) {
+            const lev = String((r && r.lev) || ''), code = String((r && r.code) || '');
+            const aantal = Number(r && r.aantal), bruto = Number(r && r.bruto);
+            if (!lev || !code || !(aantal > 0) || !(bruto >= 0) || !r.naam) continue;
+            const id = 'ws:' + lev + ':' + code;
+            const eh = !r.eh || r.eh === 'st' ? 'stuk' : String(r.eh).slice(0, 10);
+            const ws = { lev, code, merk: String(r.merk || '').slice(0, 40), img: String(r.img || '').slice(0, 400), pt: String(r.pt || '').slice(0, 10) };
+            const bestaand = data.materials.find(m => String(m.id) === id);
+            if (bestaand) {
+                bestaand.quantity = Math.round((Number(bestaand.quantity) + aantal) * 1000) / 1000;
+                bestaand.salePrice = bruto;
+                bestaand.unitPrice = bruto;
+                bestaand.ws = ws;
+            } else {
+                data.materials.push({ id, name: String(r.naam).slice(0, 200), salePrice: bruto, unitPrice: bruto, quantity: aantal, unit: eh, isWebshop: true, ws });
+            }
+            n++;
+        }
+        if (this.currentWO && String(this.currentWO.id) === String(woId)) this.renderMaterials();
+        else this._saveWoData();
+        if (n) this.toast(n === 1 ? '1 artikel uit de webshop op de bon gezet' : n + ' artikels uit de webshop op de bon gezet');
+    },
+    // de omschrijving van een vrije lijn (eenmalig artikel of artikel uit de webshop); een andere eenheid dan stuk staat erbij
+    _vrijeLijnNaam(m) {
+        const n = String((m && m.name) || (m && m.isWebshop ? 'Artikel uit de webshop' : 'Eenmalig artikel'));
+        const eh = String((m && m.unit) || '');
+        return m && m.isWebshop && eh && eh !== 'st' && eh !== 'stuk' && !/\bper\b/i.test(n) ? n + ' (per ' + eh + ')' : n;
     },
 
     // ========================================
@@ -6472,6 +7639,18 @@ const app = {
         const count = data.photos.length;
         const countEl = document.getElementById('photoCount');
         countEl.textContent = count > 0 ? `${count} foto('s) toegevoegd` : '';
+        // v430: "Foto's verplicht" op de dagplanning
+        const verplicht = !!this.currentWO.fotosVerplicht;
+        const meld = document.getElementById('photoVerplicht');
+        if (meld) {
+            meld.style.display = verplicht ? '' : 'none';
+            meld.classList.toggle('ok', count > 0);
+            meld.textContent = count > 0
+                ? 'Foto\u2019s verplicht voor deze opdracht: in orde.'
+                : 'Foto\u2019s verplicht voor deze opdracht. Voeg minstens één foto van je werk toe, anders kan je de werkbon niet versturen.';
+        }
+        const tabKnop = document.querySelector('#detailTabs .tab-btn[data-tab="tabFotos"]');
+        if (tabKnop) tabKnop.classList.toggle('tab-verplicht', verplicht && count === 0);
 
         document.getElementById('photoGrid').innerHTML = data.photos.map(p => `
             <div class="photo-thumb">
@@ -6518,7 +7697,8 @@ const app = {
             warnings.push({ level: 'info', msg: 'Geen materialen toegevoegd' });
         }
         if (data.photos.length === 0) {
-            warnings.push({ level: 'info', msg: 'Geen foto\u2019s genomen' });
+            if (this.currentWO.fotosVerplicht) warnings.push({ level: 'error', msg: 'Foto\u2019s verplicht: voeg minstens één foto toe' });   // v430
+            else warnings.push({ level: 'info', msg: 'Geen foto\u2019s genomen' });
         }
 
         // Checklist controle
@@ -6596,20 +7776,33 @@ const app = {
         document.getElementById('wbClientName').textContent = client.name || 'Onbekend';
         document.getElementById('wbDate').textContent = this.currentDate.toLocaleDateString('nl-BE');
 
-        // v329: te bestellen materiaal tonen (gaat mee bij het versturen)
+        // v329/v425: materiaal voor deze werkorder. Een tekstbestelling van vóór v425 gaat nog mee bij het versturen
+        // (naar de projectleider); een bestelling via de webshop staat al bij het bureel.
         const bestCard = document.getElementById('wbBestellingCard');
         const bestRows = document.getElementById('wbBestellingRows');
+        const bestTitel = document.getElementById('wbBestellingTitel');
         const best = data.bestelling;
+        const wsBest = this._mbVoorWerkbon(this.currentWO.id);
         if (bestCard && bestRows) {
+            let h = '', titel = '';
             if (best && best.regels && best.regels.length) {
-                bestRows.innerHTML =
-                    (best.dringend ? '<div style="font-size:10.5px;font-weight:700;letter-spacing:0.5px;color:var(--amber2,#A65E12);margin-bottom:6px">DRINGEND</div>' : '') +
+                titel = 'Te bestellen materiaal <span style="font-size:11px">(wordt gemaild naar de projectleider bij versturen)</span>';
+                h += (best.dringend ? '<div style="font-size:10.5px;font-weight:700;letter-spacing:0.5px;color:var(--amber2,#A65E12);margin-bottom:6px">DRINGEND</div>' : '') +
                     best.regels.map(r => `<div style="display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid var(--qe-hairline,#ECEEF2)"><span>${this.escapeHtml(r.naam)}</span><span style="font-weight:600;flex:none">${r.aantal}×</span></div>`).join('') +
                     (best.opm ? `<div style="font-size:12.5px;color:var(--qe-grey);margin-top:6px">${this.escapeHtml(best.opm)}</div>` : '');
-                bestCard.style.display = 'block';
-            } else {
-                bestCard.style.display = 'none';
             }
+            if (wsBest.length) {
+                if (titel) h += '<div style="font-size:13px;color:var(--qe-grey);margin:12px 0 6px">Besteld via de webshop</div>';
+                else titel = 'Materiaal besteld <span style="font-size:11px">(het bureel kijkt het na en bestelt)</span>';
+                h += wsBest.map(a => {
+                    const st = this.MB_STATUS[a.status] || this.MB_STATUS.nieuw;
+                    const n = ((a.aangepast && a.aangepast.length) ? a.aangepast : (a.regels || [])).length;
+                    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--qe-hairline,#ECEEF2)"><span>${this.escapeHtml(this._mbDatum(a.t))} · ${n} ${n === 1 ? 'artikel' : 'artikels'}${a.doel && a.doel.soort === 'stock' ? ' · voor de stock' : ''}</span><span style="font-size:11px;font-weight:600;border-radius:10px;padding:2px 8px;white-space:nowrap;flex:none;${this.MB_TOON[st.toon]}">${this.escapeHtml(st.label)}</span></div>`;
+                }).join('');
+            }
+            if (bestTitel) bestTitel.innerHTML = titel;
+            bestRows.innerHTML = h;
+            bestCard.style.display = h ? 'block' : 'none';
         }
 
         // BTW badge op het overzicht
@@ -6692,7 +7885,8 @@ const app = {
                 const price = mat.salePrice ?? mat.unitPrice ?? 0;  // v252: ?? zoals de payloads (salePrice 0 = bewust gratis)
                 const total = price * mat.quantity;
                 subtotal += total;
-                rows += `<tr><td>${this.escapeHtml(mat.name)}</td><td class="text-right">${mat.quantity}</td><td class="text-right">${this.formatPrice(price)}</td><td class="text-right" style="font-weight:500">${this.formatPrice(total)}</td></tr>`;
+                // v424: een artikel uit de webshop draagt hier dezelfde naam als op de bon en de factuur (met de eenheid)
+                rows += `<tr><td>${this.escapeHtml(mat.isWebshop ? this._vrijeLijnNaam(mat) : mat.name)}</td><td class="text-right">${mat.quantity}</td><td class="text-right">${this.formatPrice(price)}</td><td class="text-right" style="font-weight:500">${this.formatPrice(total)}</td></tr>`;
             });
         }
 
@@ -6862,7 +8056,7 @@ const app = {
             if (pmEmailSection) pmEmailSection.style.display = 'none';
             if (btn) {
                 btn.innerHTML = 'Uren & materiaal versturen';
-                btn.onclick = () => this.executeMonteurSubmitFlow();
+                btn.onclick = () => this._monteurVersturen();   // v423: eerst de controle op dubbele uren
                 btn.disabled = false;
             }
         } else {
@@ -6940,9 +8134,10 @@ const app = {
                     clientName: (this.currentWO.client && this.currentWO.client.name) || '',
                     summary: this.currentWO.summary || 'Werkbon via QE App',
                     date: this._localDateStr(this.currentDate),
+                    // v424: eenmalige artikels en artikels uit de webshop hebben geen Robaws-artikel: vrije lijn met de omschrijving
                     materials: data.materials.map(m => ({
-                        articleId: m.id,
-                        name: m.name,
+                        articleId: (m.isCustom || m.isWebshop) ? null : m.id,
+                        name: (m.isCustom || m.isWebshop) ? this._vrijeLijnNaam(m) : m.name,
                         quantity: m.quantity,
                         unitPrice: m.salePrice ?? m.unitPrice ?? 0,
                     })),
@@ -7005,10 +8200,11 @@ const app = {
             const payload = this._buildWerkbonPayload(data, _qWo);
             // Eenmalige artikels apart meegeven — de queue-verwerking zet ze
             // als line-item op de werkbon (zelfde v93-afhandeling als online).
+            // v424: artikels uit de webshop gaan ook als vrije lijn mee (ws: true = geen Felicity-taak)
             payload.customArticles = (data.materials || [])
-                .filter(m => m.isCustom)
-                .map(m => ({ name: m.name, quantity: m.quantity,
-                             salePrice: m.salePrice ?? m.unitPrice ?? 0 }));
+                .filter(m => m.isCustom || m.isWebshop)
+                .map(m => Object.assign({ name: this._vrijeLijnNaam(m), quantity: m.quantity,
+                             salePrice: m.salePrice ?? m.unitPrice ?? 0 }, m.isWebshop ? { ws: true } : {}));
             payload.photos = (data.photos || []).map(p => ({ data: p.data, name: p.name }));
             if (extra && extra.signatureData) {
                 payload.signatureData = extra.signatureData;
@@ -7240,7 +8436,7 @@ const app = {
     // ========================================
     // UNIFIED SUBMIT FLOW
     // ========================================
-    startSubmitFlow() {
+    async startSubmitFlow() {
         if (!this.currentWO) return;
 
         // v324: versturen met een nog lopende/gepauzeerde timer op DEZE werkbon
@@ -7266,6 +8462,11 @@ const app = {
                 }
             }
         } catch (_) {}
+
+        // v423: staan de uren van iemand in deze werkbon al op een andere werkbon van deze dagplanning (een collega vulde
+        // hem mee in)? Dan eerst vragen — nog eens versturen gaf de dubbele uren.
+        if (!(await this._fotoControle(this.currentWO))) return;   // v430: "Foto's verplicht" op de dagplanning
+        if (!(await this._dubbelControleVoorVersturen())) return;
 
         if (this.isMonteur()) {
             return this.executeMonteurSubmitFlow();
@@ -7313,7 +8514,8 @@ const app = {
             timeAndMaterial: wo.timeAndMaterial ?? false,
             // v93: filter eenmalige artikels uit — die hebben geen Robaws articleId.
             // Felicity krijgt taakje om die zelf toe te voegen.
-            materials: data.materials.filter(m => !m.isCustom).map(m => ({
+            // v424: ook de artikels uit de webshop (geen Robaws-artikel): die gaan als vrije lijn mee (zonder Felicity-taak).
+            materials: data.materials.filter(m => !m.isCustom && !m.isWebshop).map(m => ({
                 articleId: m.id,
                 name: m.name,
                 quantity: m.quantity,
@@ -7552,13 +8754,14 @@ const app = {
 
             // v93/v94: Eenmalige artikels → toevoegen als line-item op WERKBON (zonder articleId)
             // + taak voor Felicity (userId 6) zodat zij het echte artikel in Robaws aanmaakt.
-            const customArticles = (data.materials || []).filter(m => m.isCustom);
+            // v424: artikels uit de webshop ook als vrije lijn (elk artikel een eigen lijn, brutoprijs), zonder Felicity-taak
+            const customArticles = (data.materials || []).filter(m => m.isCustom || m.isWebshop);
             if (customArticles.length > 0 && workOrderId) {
                 for (const m of customArticles) {
                     try {
                         const li = {
                             type: 'LINE',
-                            description: m.name || 'Eenmalig artikel',
+                            description: this._vrijeLijnNaam(m),
                             quantity: parseFloat(m.quantity || 1),
                             price: parseFloat(m.salePrice || m.unitPrice || 0),
                         };
@@ -7572,9 +8775,10 @@ const app = {
                         console.warn('[App] custom article werkbon line-item exception:', e && e.message);
                     }
                 }
-                // Felicity-taak
-                try {
-                    const lines = customArticles.map(m => {
+                // Felicity-taak (alleen voor echte eenmalige artikels; een artikel uit de webshop hoeft niet in Robaws, v424)
+                const eenmalig = customArticles.filter(m => m.isCustom && !m.isWebshop);
+                if (eenmalig.length) try {
+                    const lines = eenmalig.map(m => {
                         const price = parseFloat(m.salePrice || m.unitPrice || 0).toFixed(2);
                         const qty = parseFloat(m.quantity || 1);
                         return `• ${m.name} — ${qty}× à €${price}`;
@@ -7587,7 +8791,7 @@ const app = {
                         description: desc,
                         assignedUserId: RobawsAPI.TASK_USERS.ARTIKELS,  // v222b: Felicity
                     });
-                    console.log('[App] Felicity-taak aangemaakt voor', customArticles.length, 'eenmalige artikels');
+                    console.log('[App] Felicity-taak aangemaakt voor', eenmalig.length, 'eenmalige artikels');
                 } catch (e) {
                     console.warn('[App] Felicity-taak aanmaken mislukt (niet kritiek):', e && e.message);
                 }
@@ -7632,7 +8836,8 @@ const app = {
                 installationIds: wo.installationIds || [],
                 // Materialen direct meesturen (WO material-entries ≠ line-items in Robaws)
                 // v93: filter custom-artikels uit — Felicity-taak handelt die af.
-                materials: data.materials.filter(m => !m.isCustom).map(m => ({
+                // v424: artikels uit de webshop ook (vrije factuurlijn hieronder)
+                materials: data.materials.filter(m => !m.isCustom && !m.isWebshop).map(m => ({
                     articleId: m.id,
                     name: m.name,
                     quantity: m.quantity || 1,
@@ -7717,7 +8922,8 @@ const app = {
 
             // v94: Eenmalige artikels ook toevoegen als line-item op de FACTUUR
             // (zonder articleId — Felicity corrigeert later naar het echte artikel).
-            const customArticlesForInvoice = (data.materials || []).filter(m => m.isCustom);
+            // v424: ook de artikels uit de webshop (elk een eigen factuurlijn met de brutoprijs)
+            const customArticlesForInvoice = (data.materials || []).filter(m => m.isCustom || m.isWebshop);
             const invoiceId = (invoiceResult && invoiceResult.invoice && invoiceResult.invoice.id) || null;
 
             // v211: refetch-helper — ververst het lokale invoiceResult met de
@@ -7794,7 +9000,7 @@ const app = {
                     try {
                         const li = {
                             type: 'LINE',
-                            description: m.name || 'Eenmalig artikel',
+                            description: this._vrijeLijnNaam(m),
                             quantity: parseFloat(m.quantity || 1),
                             price: parseFloat(m.salePrice || m.unitPrice || 0),
                             vatTariffId: String(vatTariffId),
@@ -7815,11 +9021,11 @@ const app = {
                 // v211: ontbrekende eenmalige artikels = te lage factuur —
                 // zelfde behandeling als lijn-fouten: betaling blokkeren.
                 if (customLineErrors.length > 0) {
-                    this.toast('Eenmalige artikel(s) niet op de factuur geraakt: ' + customLineErrors.join(', ') + ' — betaling geblokkeerd, bureel-taak aangemaakt. Reken NIET af met de klant.', true);
+                    this.toast('Artikel(s) niet op de factuur geraakt: ' + customLineErrors.join(', ') + ' — betaling geblokkeerd, bureel-taak aangemaakt. Reken NIET af met de klant.', true);
                     try {
                         await RobawsAPI.createTaskForWorkOrder(workOrderId, {
-                            title: 'Factuur onvolledig - eenmalige artikels ontbreken',
-                            description: 'Deze eenmalige artikels konden niet als factuurlijn toegevoegd worden: ' +
+                            title: 'Factuur onvolledig - artikels ontbreken',
+                            description: 'Deze artikels (eenmalig of uit de webshop) konden niet als factuurlijn toegevoegd worden: ' +
                                 customLineErrors.join(', ') + '. Factuur: ' +
                                 ((invoiceResult.invoice && (invoiceResult.invoice.logicId || invoiceResult.invoice.id)) || '?') +
                                 '. Gelieve aan te vullen en de betaling met de klant te regelen.',
@@ -7985,8 +9191,13 @@ const app = {
     // ========================================
     // MONTEUR FLOW — enkel uren + materiaal, geen handtekening/factuur/betaling
     // ========================================
-    async executeMonteurSubmitFlow() {
-        if (!this.currentWO) return;
+    async executeMonteurSubmitFlow(opts) {
+        // v422: geeft een uitslag terug ({ ok, wachtrij, inRobaws, fout }) en kan de planning laten staan
+        // (opts.geenHerlaad) — de uren-verdeling bij het uitklokken verstuurt zo meerdere werkbonnen na elkaar.
+        const o = opts || {};
+        // v422: opts.stil = geen losse meldingen (de uren-verdeling toont achteraf één overzicht)
+        const melding = (t, f) => { if (!o.stil) this.toast(t, f); };
+        if (!this.currentWO) return { ok: false, fout: 'geen werkbon' };
 
         // v252: zelfde werkbon-snapshot als executeSubmitFlow — woId werd
         // hier pas ná de awaits gelezen.
@@ -7995,12 +9206,17 @@ const app = {
         // === GUARD: voorkom dubbele werkbon ===
         const woId = String(wo.id);
         if (this.submittedWOs.includes(woId)) {
-            this.toast('Deze werkbon is al verstuurd');
-            return;
+            melding('Deze werkbon is al verstuurd');
+            return { ok: false, alVerstuurd: true };
         }
         if (this._submitInProgress) {
-            this.toast('Bezig met versturen...');
-            return;
+            melding('Bezig met versturen...');
+            return { ok: false, bezig: true };
+        }
+        // v430: "Foto's verplicht" op de dagplanning en nog geen foto = niet versturen
+        if (this._fotosOntbreken(wo)) {
+            melding('Foto\u2019s verplicht: voeg eerst een foto toe');
+            return { ok: false, fotos: true, fout: 'Foto\u2019s verplicht: nog geen foto op de werkbon' };
         }
 
         // v205: validatie VÓÓR het zetten van de vlag (zelfde leak-fix als
@@ -8008,16 +9224,18 @@ const app = {
         const data = this.woData[wo.id];
         const hasWorkHours = data.hours.some(h => h.type === 'klant');
         if (hasWorkHours && !this.selectedUurcode) {
-            this.toast('Kies eerst een uurcode in het Uren tabblad', true);
-            return;
+            melding('Kies eerst een uurcode in het Uren tabblad', true);
+            return { ok: false, fout: 'geen uurcode' };
         }
 
-        const btn = document.getElementById('btnSubmitWerkbon');
+        // v422: de knop bestaat altijd in de app; zonder knop (ander scherm, test) loopt de flow gewoon door
+        const btn = document.getElementById('btnSubmitWerkbon') || { disabled: false, innerHTML: '', onclick: null };
         btn.disabled = true;
         btn.innerHTML = '<div class="spinner" style="width:20px;height:20px;margin:0 auto"></div> Versturen...';
 
         // v206: zelfde requeue-beveiliging als executeSubmitFlow.
         let createdWorkOrderId = null;
+        let uitslag = null;   // v422
 
         // v205: vlag als állerlaatste vóór de try — finally reset hem altijd.
         this._submitInProgress = true;
@@ -8031,7 +9249,7 @@ const app = {
             } catch(e) { /* server-side fallback */ }
 
             // Werkbon versturen — zelfde endpoint, geen handtekening/factuur/betaling
-            this.toast('Werkbon versturen...');
+            melding('Werkbon versturen...');
             const werkbonRes = await fetch('api/werkbon.php', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -8046,9 +9264,10 @@ const app = {
                     summary: wo.summary || 'Werkbon via QE App',
                     date: this._localDateStr(this.currentDate),
                     timeAndMaterial: wo.timeAndMaterial ?? false,
+                    // v424: eenmalige artikels en artikels uit de webshop hebben geen Robaws-artikel: vrije lijn met de omschrijving
                     materials: data.materials.map(m => ({
-                        articleId: m.id,
-                        name: m.name,
+                        articleId: (m.isCustom || m.isWebshop) ? null : m.id,
+                        name: (m.isCustom || m.isWebshop) ? this._vrijeLijnNaam(m) : m.name,
                         quantity: m.quantity,
                         unitPrice: m.salePrice ?? m.unitPrice ?? 0,
                     })),
@@ -8082,7 +9301,7 @@ const app = {
                 } catch (e) { /* foto's niet kritisch */ }
             }
 
-            this.toast('Werkbon verstuurd');
+            melding('Werkbon verstuurd');
 
             // v329: eventuele materiaal-bestelling mee mailen (ook monteurs).
             await this._verstuurMateriaalBestelling(wo, workOrderId, data);
@@ -8094,10 +9313,13 @@ const app = {
             // die gemarkeerd en zijn data gewist terwijl deze bon opnieuw
             // verstuurd kon worden).
             this._markWOSubmitted(data, wo.id);
+            uitslag = { ok: true, workOrderId };
 
-            this.navigate('screenPlanning', false);
-            this.screenHistory = [];
-            this.loadPlanning();
+            if (!o.geenHerlaad) {
+                this.navigate('screenPlanning', false);
+                this.screenHistory = [];
+                this.loadPlanning();
+            }
         } catch (err) {
             // v207: zelfde netwerkfout-detectie als executeSubmitFlow
             // (navigator.onLine is onbetrouwbaar in de WebView).
@@ -8108,18 +9330,22 @@ const app = {
                 // v206: monteur heeft geen handtekening/factuur; betaalmethode
                 // expliciet op null zodat geen oude selectie meelekt.
                 // v208: noInvoice-vlag → bureel-taak zegt niet "factuur aanmaken".
-                await this.queueWerkbonOffline(data, { paymentMethod: null, noInvoice: true, wo });  // v407: snapshot van deze bon
+                const _inRij = await this.queueWerkbonOffline(data, { paymentMethod: null, noInvoice: true, wo });  // v407: snapshot van deze bon
+                uitslag = _inRij ? { ok: true, wachtrij: true } : { ok: false, fout: msg };
             } else if (isNetworkError) {
-                this.toast('Werkbon staat al in Robaws, maar foto\'s konden niet verstuurd worden (verbinding weg). NIET opnieuw versturen.', true);
+                melding('Werkbon staat al in Robaws, maar foto\'s konden niet verstuurd worden (verbinding weg). NIET opnieuw versturen.', true);
+                uitslag = { ok: false, inRobaws: true, fout: msg };
             } else {
-                this.toast('Fout: ' + msg, true);
+                melding('Fout: ' + msg, true);
+                uitslag = createdWorkOrderId ? { ok: false, inRobaws: true, fout: msg } : { ok: false, fout: msg };
             }
         } finally {
             this._submitInProgress = false;
             btn.disabled = false;
             btn.innerHTML = 'Uren & materiaal versturen';
-            btn.onclick = () => this.executeMonteurSubmitFlow();
+            btn.onclick = () => this._monteurVersturen();   // v423: eerst de controle op dubbele uren
         }
+        return uitslag || { ok: false, fout: 'onbekend' };
     },
 
     // ========================================
@@ -9784,7 +11010,7 @@ const app = {
             const delen = RobawsAPI.mijnLogistiekDelen();
             const nl = document.getElementById('navLogistiek');
             if (nl) nl.style.display = delen.length ? '' : 'none';
-            const LOG = { screenVoertuigen: ['voertuigen', 'mijnvoertuig'], screenGereedschap: ['gereedschap'], screenGasflessen: ['gasflessen'], screenBudget: ['budget'] };
+            const LOG = { screenVoertuigen: ['voertuigen', 'mijnvoertuig'], screenGereedschap: ['gereedschap'], screenNfcTags: ['voertuigen', 'gereedschap'], screenGasflessen: ['gasflessen'], screenBudget: ['budget'], screenMagazijn: ['magazijn'], screenToestellen: ['toestellen', 'mijntoestel'] };
             if (this.currentScreen === 'screenLogistiek') {
                 if (!delen.length) this.navigate('screenPlanning', false);
                 else this._logHubRender();
@@ -9803,6 +11029,346 @@ const app = {
         this.navigate('screenLogistiek');
     },
 
+    // ========== v431: NFC TAGS — alle tags op één plaats (Logistiek, alleen het bureel) ==========
+    // Klokken (bureau, laden en lossen, woon-werkverkeer, oude camionet-velden op fiche 1) via de bestaande tag-rijen van
+    // QEClock; voertuigen en gereedschap uit Materieel (extraveld "NFC Tag") met dezelfde acties als op hun fiche.
+    _nfcKlokMag() { return this._logBeheer() && RobawsAPI.magAppTool('klok'); },
+
+    openNfcTags() {
+        if (!this._logBeheer()) { this.toast('Alleen het bureel beheert de NFC tags', true); return; }
+        this._nfcState = this._nfcState || { zoek: '', filter: 'alles' };
+        this.navigate('screenNfcTags', true);
+        const z = document.getElementById('nfcZoek'); if (z) z.value = this._nfcState.zoek || '';
+        this.loadNfcTags();
+    },
+
+    async loadNfcTags() {
+        const kl = document.getElementById('nfcKlokLijst');
+        const ml = document.getElementById('nfcMatLijst');
+        this._nfcState = this._nfcState || { zoek: '', filter: 'alles' };
+        if (kl) {
+            if (this._nfcKlokMag()) {
+                if (!kl.innerHTML.trim()) kl.innerHTML = '<div class="spinner"></div>';
+                try { await QEClock.loadTagConfig(true); } catch (_e) {}
+                kl.innerHTML = QEClock.renderTagAdmin({ zonderMateriaal: true });
+                QEClock.bindTagAdminEvents('nfcKlokLijst');
+            } else {
+                kl.innerHTML = '<p style="font-size:13px;color:var(--qe-grey);margin:4px 0">De klok-tags beheren vraagt het recht "Klok-beheer (anderen klokken)".</p>';
+            }
+        }
+        if (!ml) return;
+        if (!this._nfcMats) ml.innerHTML = '<div class="spinner"></div>';
+        try {
+            const mats = await RobawsAPI.getMaterials({ bypassCache: true });
+            this._matTagMapZet(mats);
+            this._nfcMats = mats.filter(m => !RobawsAPI.isGasfles(m) && (String(m.status || '') !== 'inactief' || this._gsNfcTag(m)));
+            // de acties (koppelen, beschrijven, wissen) zoeken het materiaal in deze lijsten
+            this._voertuigen = this._voertuigen || {};
+            this._gsAlles = this._gsAlles || {};
+            this._nfcMats.forEach(m => { if (this._isVoertuig(m)) this._voertuigen[m.id] = m; else this._gsAlles[m.id] = m; });
+            this._nfcRender();
+        } catch (e) {
+            ml.innerHTML = '<p style="font-size:13px;color:var(--qe-red)">Kon het materieel niet laden: ' + this.escapeHtml((e && e.message) || '?') + '</p>';
+        }
+    },
+
+    nfcZet(sleutel, waarde) {
+        this._nfcState = this._nfcState || { zoek: '', filter: 'alles' };
+        this._nfcState[sleutel] = waarde;
+        this._nfcRender();
+    },
+
+    _nfcRender() {
+        const ml = document.getElementById('nfcMatLijst');
+        if (!ml || !this._nfcMats) return;
+        const st = this._nfcState || { zoek: '', filter: 'alles' };
+        document.querySelectorAll('#nfcFilter [data-f]').forEach(b => b.classList.toggle('aan', b.getAttribute('data-f') === st.filter));
+        const norm = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
+        const woorden = norm(st.zoek).split(/\s+/).filter(Boolean);
+        const alle = this._nfcMats;
+        const metTag = alle.filter(m => this._gsNfcTag(m)).length;
+        const lijst = alle.filter(m => {
+            const tag = this._gsNfcTag(m);
+            if (st.filter === 'met' && !tag) return false;
+            if (st.filter === 'zonder' && tag) return false;
+            if (!woorden.length) return true;
+            const tekst = norm([m.name, m.brand, m.serialNumber, tag, this._isVoertuig(m) ? 'voertuig camionet' : this._gsSoort(m)].join(' '));
+            return woorden.every(w => tekst.indexOf(w) >= 0);
+        });
+        const tel = document.getElementById('nfcMatTel');
+        if (tel) tel.textContent = metTag + ' van ' + alle.length + ' met een tag';
+        const groepen = [
+            ['Voertuigen', lijst.filter(m => this._isVoertuig(m))],
+            ['Gereedschap en machines', lijst.filter(m => !this._isVoertuig(m))],
+        ];
+        const html = groepen.filter(g => g[1].length).map(([kop, items]) => {
+            items.sort((a, b) => (this._gsNfcTag(a) ? 0 : 1) - (this._gsNfcTag(b) ? 0 : 1) || this._natSort(String(a.name || ''), String(b.name || '')));
+            return '<div class="nfc-kop">' + this.escapeHtml(kop) + ' <span>' + items.length + '</span></div>' + items.map(m => this._nfcRij(m)).join('');
+        }).join('');
+        ml.innerHTML = html || '<p style="font-size:13px;color:var(--qe-grey);text-align:center;margin:14px 0">Niets gevonden</p>';
+    },
+
+    _nfcRij(m) {
+        const id = String(m.id);
+        const tag = this._gsNfcTag(m);
+        const voertuig = this._isVoertuig(m);
+        let klokNaam = null;
+        try { const k = tag && QEClock.identifyTag(tag); klokNaam = k ? k.name : null; } catch (_e) {}
+        let merk = null;
+        try { merk = tag ? (voertuig ? this.klokMerkStand(tag) : null) : null; } catch (_e) {}
+        const sub = tag
+            ? '<span class="nfc-id">' + this.escapeHtml(tag.length > 16 ? tag.slice(0, 16) + '…' : tag) + '</span>' +
+              (voertuig && klokNaam ? ' · klokt' : '') + (merk && merk.ok ? ' · opent de app ✓' : '')
+            : '<span class="nfc-geen">Geen tag</span>';
+        const soort = voertuig ? (m.brand || 'Voertuig') : (this._gsSoort(m) || '');
+        const open = voertuig ? 'app.openVoertuig(\'' + id + '\')' : 'app.openGereedschapItem(\'' + id + '\')';
+        const knoppen = tag
+            ? (voertuig
+                ? '<button class="btn btn-outline btn-sm" title="QE-klokmerkteken op de tag zetten" onclick="event.stopPropagation(); app.klokTagBeschrijf(\'' + this._escapeJsArg(tag) + '\', \'' + this._escapeJsArg(m.name || '') + '\')">✍️</button>'
+                : '<button class="btn btn-outline btn-sm" title="Tag opnieuw beschrijven" onclick="event.stopPropagation(); app.matTagKoppel(\'' + id + '\', true)">✍️</button>') +
+              '<button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); app.nfcWis(\'' + id + '\')">Wissen</button>'
+            : '<button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); app.nfcKoppel(\'' + id + '\')">📶 Koppelen</button>';
+        return '<div class="nfc-rij" onclick="' + open + '">' +
+            '<div class="nfc-tekst"><div class="nfc-naam">' + this.escapeHtml(m.name || ('#' + id)) +
+            (soort ? ' <span class="nfc-soort">' + this.escapeHtml(soort) + '</span>' : '') + '</div>' +
+            '<div class="nfc-sub">' + sub + '</div></div>' +
+            '<div class="nfc-knoppen">' + knoppen + '</div></div>';
+    },
+
+    /** v431: tag koppelen vanuit het NFC-scherm: gereedschap = koppelen en beschrijven (merkteken, zoals op de fiche),
+     *  een voertuig = alleen koppelen (dat is een klok-tag van de camionet). */
+    nfcKoppel(id) {
+        if ((this._voertuigen || {})[id] && !(this._gsAlles || {})[id]) return this.gereedschapTagToewijzen(id);
+        return this.matTagKoppel(id);
+    },
+
+    async nfcWis(id) {
+        const m = (this._gsAlles || {})[id] || (this._voertuigen || {})[id];
+        const naam = (m && m.name) || ('#' + id);
+        const klok = this._isVoertuig(m || {}) ? ' Met deze tag kan er dan niet meer geklokt worden in dit voertuig.' : '';
+        if (!confirm('De NFC-tag van "' + naam + '" wissen?' + klok)) return;
+        await this.gereedschapTagWissen(id);
+        if (this.currentScreen === 'screenNfcTags') this.loadNfcTags();
+    },
+
+    // ========== v434: GSM'S & TABLETS (Logistiek; Worker v564, zelfde lijst als de hub-Logistiek) ==========
+    // Lezen en bewaren via de Worker (app-toestellen / app-toestel, kop X-App-Sessie). De Worker beslist: bureel = alles zien en
+    // beheren; iemand anders krijgt alleen zijn eigen toestellen en kan niets wijzigen. Nooit PIN- of PUK-codes.
+    openToestellen() {
+        if (!RobawsAPI.magLogistiekDeel('toestellen') && !RobawsAPI.magLogistiekDeel('mijntoestel')) { this.toast('Geen toegang', true); return; }
+        this._tst = this._tst || { lijst: null, beheer: false, zoek: '', soort: 'alle' };
+        this.navigate('screenToestellen', true);
+        const z = document.getElementById('tstZoek'); if (z) z.value = this._tst.zoek || '';
+        this.loadToestellen();
+    },
+
+    async _toestelFetch(pad, body) {
+        const s = RobawsAPI.sessieLees();
+        if (!s) throw new Error('Meld je opnieuw aan in de app om de toestellen te zien.');
+        const init = { headers: { 'X-App-Sessie': s.token } };
+        if (body) { init.method = 'POST'; init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
+        const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/' + pad, init, 12000);
+        let j = null; try { j = await r.json(); } catch (_e) {}
+        if (r.status === 404 && !(j && j.error && j.ok === false)) throw new Error('Nog niet beschikbaar (de server wordt bijgewerkt). Probeer later opnieuw.');
+        if (!j) throw new Error('Geen antwoord van de server (' + r.status + ')');
+        if (!r.ok || j.ok === false) throw new Error(j.error || ('Fout ' + r.status));
+        return j;
+    },
+
+    async loadToestellen() {
+        const el = document.getElementById('tstLijst');
+        this._tst = this._tst || { lijst: null, beheer: false, zoek: '', soort: 'alle' };
+        if (el && !this._tst.lijst) el.innerHTML = '<div class="spinner"></div>';
+        try {
+            const j = await this._toestelFetch('app-toestellen');
+            this._tst.lijst = Array.isArray(j.toestellen) ? j.toestellen : [];
+            this._tst.beheer = !!j.beheer;
+            this._toestelRender();
+        } catch (e) {
+            if (el) el.innerHTML = '<p style="font-size:13px;color:var(--qe-red);margin:10px 0">' + this.escapeHtml((e && e.message) || 'Kon de toestellen niet laden') + '</p>';
+        }
+    },
+
+    toestelZet(sleutel, waarde) {
+        this._tst = this._tst || { lijst: null, beheer: false, zoek: '', soort: 'alle' };
+        this._tst[sleutel] = waarde;
+        this._toestelRender();
+    },
+
+    _toestelImeiOk(s) {
+        s = String(s || '');
+        if (!/^\d{15}$/.test(s)) return false;
+        let som = 0;
+        for (let i = 0; i < 15; i++) { let d = +s.charAt(14 - i); if (i % 2) { d *= 2; if (d > 9) d -= 9; } som += d; }
+        return som % 10 === 0;
+    },
+    _toestelEur(n) { return '€ ' + (Math.round((Number(n) || 0) * 100) / 100).toFixed(2).replace('.', ','); },
+    _toestelDatum(iso) {
+        if (!iso) return '';
+        try { return new Date(String(iso).slice(0, 10) + 'T12:00:00').toLocaleDateString('nl-BE', { day: 'numeric', month: 'long', year: 'numeric' }); } catch (_e) { return String(iso); }
+    },
+    _TST_KLEUR: { 'in gebruik': 'var(--green2, #3E7A4E)', 'reserve': '#3D6EA8', 'defect': 'var(--qe-red)', 'ingeleverd': 'var(--qe-grey)' },
+
+    _toestelRender() {
+        const st = this._tst;
+        const el = document.getElementById('tstLijst');
+        if (!el || !st || !st.lijst) return;
+        const beheer = st.beheer;
+        const bh = document.getElementById('tstBeheer'); if (bh) bh.style.display = beheer ? '' : 'none';
+        const titel = document.getElementById('tstTitel'); if (titel) titel.textContent = beheer ? 'Gsm’s & tablets' : 'Mijn gsm of tablet';
+        if (!beheer) { el.innerHTML = this._toestelEigenHtml(st.lijst); return; }
+        document.querySelectorAll('#tstFilter [data-f]').forEach(b => b.classList.toggle('aan', b.getAttribute('data-f') === st.soort));
+        const actief = st.lijst.filter(t => t.status !== 'ingeleverd');
+        const mnd = actief.reduce((s, t) => s + (Number(t.prijs) || 0), 0);
+        const kop = document.getElementById('tstKop');
+        if (kop) kop.textContent = actief.filter(t => t.soort === 'gsm').length + ' gsm’s en ' + actief.filter(t => t.soort === 'tablet').length +
+            ' tablets in gebruik of reserve' + (mnd ? ' · abonnementen samen ' + this._toestelEur(mnd) + ' per maand' : '');
+        const norm = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
+        const woorden = norm(st.zoek).split(/\s+/).filter(Boolean);
+        const lijst = st.lijst.filter(t => {
+            if (st.soort !== 'alle' && t.soort !== st.soort) return false;
+            if (!woorden.length) return true;
+            const tekst = norm([t.empNaam, t.toestel, t.imei, t.imei2, t.nummer, String(t.nummer || '').replace(/\D/g, ''), t.abonnement, t.status].join(' '));
+            return woorden.every(w => tekst.indexOf(w) >= 0);
+        });
+        if (!st.lijst.length) { el.innerHTML = '<p style="font-size:13px;color:var(--qe-grey);text-align:center;margin:14px 0">Nog geen gsm’s of tablets. Voeg er een toe met + Gsm of + Tablet.</p>'; return; }
+        const volg = { 'in gebruik': 0, 'reserve': 1, 'defect': 2, 'ingeleverd': 3 };
+        const html = [['gsm', 'Werkgsm’s'], ['tablet', 'Tablets']].map(([soort, kopTekst]) => {
+            const deel = lijst.filter(t => t.soort === soort).sort((a, b) => (volg[a.status] || 0) - (volg[b.status] || 0) ||
+                String(a.empNaam || '~').localeCompare(String(b.empNaam || '~')) || String(a.toestel || '').localeCompare(String(b.toestel || '')));
+            if (!deel.length) return '';
+            return '<div class="nfc-kop">' + kopTekst + ' <span>' + deel.length + '</span></div>' + deel.map(t => {
+                const sub = [t.toestel, t.nummer, t.abonnement].filter(Boolean).join(' · ') || '(geen toestel ingevuld)';
+                const rechts = t.status === 'in gebruik' ? (t.gekregenOp ? 'sinds ' + this._toestelDatum(t.gekregenOp) : '') : t.status;
+                return '<div class="nfc-rij" data-tst="' + this.escapeHtml(t.id) + '" style="' + (t.status === 'ingeleverd' ? 'opacity:.55' : '') + '" onclick="app.toestelOpen(\'' + this._escapeJsArg(t.id) + '\')">' +
+                    '<span style="width:9px;height:9px;border-radius:50%;flex-shrink:0;background:' + (this._TST_KLEUR[t.status] || 'var(--qe-grey)') + '"></span>' +
+                    '<div class="nfc-tekst"><div class="nfc-naam">' + this.escapeHtml(t.empNaam || 'Niet toegewezen') + '</div>' +
+                    '<div class="nfc-sub">' + this.escapeHtml(sub) + '</div></div>' +
+                    '<div style="font-size:11px;color:var(--qe-grey);text-align:right;flex-shrink:0;max-width:34%">' + this.escapeHtml(rechts) + '</div></div>';
+            }).join('');
+        }).join('');
+        el.innerHTML = html || '<p style="font-size:13px;color:var(--qe-grey);text-align:center;margin:14px 0">Niets gevonden</p>';
+    },
+
+    /** Monteur/technieker: alleen het eigen toestel, alles in één oogopslag (geen bewerken). */
+    _toestelEigenHtml(lijst) {
+        if (!lijst.length) return '<p style="font-size:13px;color:var(--qe-grey);text-align:center;margin:14px 0">Er staat nog geen gsm of tablet op jouw naam. Vraag het aan het bureel als dat niet klopt.</p>';
+        const rij = (l, w) => w ? '<div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line, rgba(0,0,0,.08));font-size:13.5px">' +
+            '<span style="color:var(--qe-grey)">' + l + '</span><span style="text-align:right;color:var(--ink);font-variant-numeric:tabular-nums">' + this.escapeHtml(w) + '</span></div>' : '';
+        return lijst.map(t => '<div style="padding:10px 0 6px">' +
+            '<div style="font-size:15px;font-weight:600;color:var(--ink);margin-bottom:4px">' + (t.soort === 'tablet' ? 'Tablet' : 'Gsm') + (t.toestel ? ': ' + this.escapeHtml(t.toestel) : '') + '</div>' +
+            rij('Nummer', t.nummer) + rij('IMEI', t.imei) + rij('IMEI 2', t.imei2) + rij('Abonnement', t.abonnement) +
+            rij('Gekregen op', this._toestelDatum(t.gekregenOp)) + rij('Stand', t.status !== 'in gebruik' ? t.status : '') + rij('Opmerking', t.opmerking) +
+            '</div>').join('') +
+            '<p style="font-size:11.5px;color:var(--qe-grey);margin:8px 0 6px">Klopt er iets niet? Laat het het bureel weten.</p>';
+    },
+
+    async toestelOpen(id, soort) {
+        const st = this._tst;
+        if (!st || !st.beheer) return;
+        const t = id ? (st.lijst || []).find(x => x.id === id) : { soort: soort || 'gsm', status: 'in gebruik', gekregenOp: new Date().toISOString().slice(0, 10) };
+        if (!t) return;
+        this._tstOpen = t;
+        let emps = [];
+        try { emps = await RobawsAPI.getActiveEmployees(); } catch (_e) {}
+        if (t.empId && !emps.some(e => String(e.employeeId) === String(t.empId))) emps = emps.concat([{ employeeId: t.empId, name: t.empNaam || ('#' + t.empId) }]);
+        const v = (k) => this.escapeHtml(t[k] == null ? '' : t[k]);
+        const abos = Array.from(new Set((st.lijst || []).map(x => x.abonnement).filter(Boolean))).sort();
+        const opt = (waarde, label, aan) => '<option value="' + this.escapeHtml(waarde) + '"' + (aan ? ' selected' : '') + '>' + this.escapeHtml(label) + '</option>';
+        const gesch = (t.geschiedenis || []).slice().reverse();
+        document.getElementById('modalContent').innerHTML =
+            '<h3>' + (id ? this.escapeHtml(t.toestel || (t.soort === 'tablet' ? 'Tablet' : 'Gsm')) : (t.soort === 'tablet' ? 'Nieuwe tablet' : 'Nieuwe werkgsm')) + '</h3>' +
+            (id ? '<p style="font-size:12px;color:var(--qe-grey);margin-bottom:10px">Laatst bewaard door ' + this.escapeHtml(t.door || '?') + ' op ' + this._toestelDatum(t.bijgewerkt) + '</p>' : '') +
+            '<div style="display:flex;gap:8px"><div class="form-group" style="flex:1"><label>Soort</label><select class="form-input" id="tstSoort">' +
+                opt('gsm', 'Gsm', t.soort === 'gsm') + opt('tablet', 'Tablet', t.soort === 'tablet') + '</select></div>' +
+            '<div class="form-group" style="flex:1"><label>Stand</label><select class="form-input" id="tstStatus">' +
+                ['in gebruik', 'reserve', 'defect', 'ingeleverd'].map(s => opt(s, s.charAt(0).toUpperCase() + s.slice(1), t.status === s)).join('') + '</select></div></div>' +
+            '<div class="form-group"><label>Werknemer</label><select class="form-input" id="tstEmp" onchange="app._toestelEmpGekozen()">' +
+                opt('', '— niemand (reserve) —', !t.empId) + emps.map(e => opt(String(e.employeeId), e.name + (e.role ? ' (' + e.role + ')' : ''), String(e.employeeId) === String(t.empId || ''))).join('') + '</select></div>' +
+            '<div class="form-group"><label>Gekregen op</label><input type="date" class="form-input" id="tstDatum" value="' + v('gekregenOp') + '"></div>' +
+            '<div class="form-group"><label>Toestel (merk en model)</label><input type="text" class="form-input" id="tstToestel" maxlength="80" placeholder="bv. Samsung Galaxy A55" value="' + v('toestel') + '"></div>' +
+            '<div class="form-group"><label>IMEI</label><input type="text" class="form-input" id="tstImei" inputmode="numeric" maxlength="20" placeholder="15 cijfers (*#06#)" value="' + v('imei') + '" oninput="app._toestelImeiMelding()"></div>' +
+            '<div class="form-group"><label>IMEI 2 (dubbele simkaart)</label><input type="text" class="form-input" id="tstImei2" inputmode="numeric" maxlength="20" placeholder="optioneel" value="' + v('imei2') + '" oninput="app._toestelImeiMelding()"></div>' +
+            '<div id="tstImeiMeld" style="font-size:12px;color:var(--accent);margin:-6px 2px 8px"></div>' +
+            '<div class="form-group"><label>Gsm-nummer</label><input type="tel" class="form-input" id="tstNummer" maxlength="30" placeholder="bv. 0470 12 34 56" value="' + v('nummer') + '"></div>' +
+            '<div class="form-group"><label>Abonnement</label><input type="text" class="form-input" id="tstAbo" maxlength="80" list="tstAboLijst" placeholder="bv. Proximus Business 20 GB" value="' + v('abonnement') + '">' +
+                '<datalist id="tstAboLijst">' + abos.map(a => '<option value="' + this.escapeHtml(a) + '">').join('') + '</datalist></div>' +
+            '<div class="form-group"><label>Abonnement € per maand</label><input type="text" class="form-input" id="tstPrijs" inputmode="decimal" placeholder="optioneel" value="' + (t.prijs != null ? Number(t.prijs).toFixed(2).replace('.', ',') : '') + '"></div>' +
+            '<div class="form-group"><label>Opmerking</label><textarea class="form-input" id="tstOpm" rows="2" maxlength="500" placeholder="bv. hoesje en lader meegegeven">' + v('opmerking') + '</textarea></div>' +
+            '<p style="font-size:11.5px;color:var(--qe-grey);margin:-4px 2px 12px">Zet hier nooit een PIN- of PUK-code.</p>' +
+            (gesch.length ? '<div class="nfc-kop">Vorige houders</div>' + gesch.map(g => '<div style="display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:5px 0"><span>' +
+                this.escapeHtml(g.naam || '?') + '</span><span style="color:var(--qe-grey)">' + this._toestelDatum(g.van) + ' → ' + this._toestelDatum(g.tot) + '</span></div>').join('') + '<div style="height:10px"></div>' : '') +
+            '<button class="btn btn-primary btn-full" id="tstBewaarKnop" onclick="app.toestelBewaar()" style="margin-bottom:8px">✓ Opslaan</button>' +
+            '<button class="btn btn-outline btn-full" onclick="app.closeModal()" style="margin-bottom:8px">Annuleren</button>' +
+            (id ? '<button class="btn btn-outline btn-full" style="color:var(--qe-red)" onclick="app.toestelVerwijder()">Verwijderen</button>' : '');
+        this.openModal();
+        this._toestelImeiMelding();
+    },
+
+    _toestelWaarden() {
+        const w = (id) => { const e = document.getElementById(id); return e ? String(e.value) : ''; };
+        return { soort: w('tstSoort'), status: w('tstStatus'), empId: w('tstEmp'), gekregenOp: w('tstDatum'), toestel: w('tstToestel').trim(),
+            imei: w('tstImei').replace(/\D/g, ''), imei2: w('tstImei2').replace(/\D/g, ''), nummer: w('tstNummer').trim(),
+            abonnement: w('tstAbo').trim(), prijs: w('tstPrijs').trim(), opmerking: w('tstOpm').trim() };
+    },
+
+    /** Een andere houder: de datum wordt vandaag (tenzij al aangepast), de stand volgt mee. */
+    _toestelEmpGekozen() {
+        const o = this._tstOpen || {}, emp = document.getElementById('tstEmp').value, d = document.getElementById('tstDatum'), st = document.getElementById('tstStatus');
+        if (o.id && emp !== String(o.empId || '') && d.value === String(o.gekregenOp || '')) d.value = new Date().toISOString().slice(0, 10);
+        if (emp && st.value === 'reserve') st.value = 'in gebruik';
+        if (!emp && st.value === 'in gebruik') st.value = 'reserve';
+    },
+
+    _toestelImeiMelding() {
+        const m = document.getElementById('tstImeiMeld');
+        if (!m) return;
+        const w = this._toestelWaarden(), fout = [];
+        [w.imei, w.imei2].forEach((s, i) => {
+            if (!s) return;
+            if (s.length !== 15) fout.push('IMEI' + (i ? ' 2' : '') + ' heeft ' + s.length + ' cijfers (moet 15 zijn)');
+            else if (!this._toestelImeiOk(s)) fout.push('IMEI' + (i ? ' 2' : '') + ' klopt niet: kijk hem na met *#06#');
+        });
+        m.textContent = fout.join(' · ');
+    },
+
+    async toestelBewaar() {
+        const o = this._tstOpen || {}, w = this._toestelWaarden();
+        if (!w.toestel && !w.imei && !w.nummer) { this.toast('Vul minstens het toestel, de IMEI of het nummer in.', true); return; }
+        if (w.prijs && !/^\d+([.,]\d{1,2})?$/.test(w.prijs)) { this.toast('De prijs per maand is geen bedrag (bv. 19,50).', true); return; }
+        const slecht = [w.imei, w.imei2].filter(s => s && !this._toestelImeiOk(s));
+        if (slecht.length && !confirm('IMEI ' + slecht.join(' en ') + ' lijkt niet te kloppen. Toch opslaan?')) return;
+        let empNaam = '';
+        if (w.empId) {
+            try { const e = (await RobawsAPI.getActiveEmployees()).find(x => String(x.employeeId) === w.empId); empNaam = e ? e.name : (o.empNaam || ''); } catch (_e) { empNaam = o.empNaam || ''; }
+        }
+        const knop = document.getElementById('tstBewaarKnop');
+        if (knop) { knop.disabled = true; knop.textContent = 'Bewaren…'; }
+        try {
+            const j = await this._toestelFetch('app-toestel', { toestel: Object.assign({}, w, { id: o.id || '', versie: o.bijgewerkt || '', empNaam }) });
+            this._tst.lijst = j.toestellen || this._tst.lijst;
+            this.closeModal();
+            this.toast((w.soort === 'tablet' ? 'Tablet' : 'Gsm') + ' opgeslagen');
+            this._toestelRender();
+        } catch (e) {
+            if (knop) { knop.disabled = false; knop.textContent = '✓ Opslaan'; }
+            this.toast((e && e.message) || 'Opslaan mislukt', true);
+        }
+    },
+
+    async toestelVerwijder() {
+        const o = this._tstOpen || {};
+        if (!o.id) return;
+        if (!confirm('Dit toestel helemaal verwijderen, met zijn vorige houders?\n\nIs het toestel terug binnen of weg, kies dan liever de stand "Ingeleverd": dan blijft het te zien.')) return;
+        try {
+            const j = await this._toestelFetch('app-toestel', { verwijderId: o.id });
+            this._tst.lijst = j.toestellen || [];
+            this.closeModal();
+            this.toast('Toestel verwijderd');
+            this._toestelRender();
+        } catch (e) { this.toast((e && e.message) || 'Verwijderen mislukt', true); }
+    },
+
     /** v395: de kaarten van de Logistiek-hub volgens wat deze persoon mag zien. */
     _logHubRender() {
         const delen = RobawsAPI.mijnLogistiekDelen();
@@ -9811,8 +11377,15 @@ const app = {
         toon('logKaartMijnVoertuig', delen.indexOf('mijnvoertuig') >= 0);
         toon('logKaartVoertuigen', delen.indexOf('voertuigen') >= 0);
         toon('logKaartGereedschap', delen.indexOf('gereedschap') >= 0);
+        toon('logKaartNfc', beheer && (delen.indexOf('voertuigen') >= 0 || delen.indexOf('gereedschap') >= 0 || RobawsAPI.magAppTool('klok')));   // v431
         toon('logKaartBudget', delen.indexOf('budget') >= 0);
         toon('logKaartGas', delen.indexOf('gasflessen') >= 0);
+        toon('logKaartMagazijn', delen.indexOf('magazijn') >= 0);   // v429
+        // v434: gsm's & tablets (bureel = beheren, anders = alleen het eigen toestel)
+        toon('logKaartToestellen', delen.indexOf('toestellen') >= 0 || delen.indexOf('mijntoestel') >= 0);
+        const tstT = document.getElementById('logToestellenTitel'), tstS = document.getElementById('logToestellenSub');
+        if (tstT) tstT.textContent = delen.indexOf('toestellen') >= 0 ? 'Gsm’s & tablets' : 'Mijn gsm of tablet';
+        if (tstS) tstS.textContent = delen.indexOf('toestellen') >= 0 ? 'Wie heeft welk toestel, IMEI en abonnement' : 'IMEI, nummer en abonnement van jouw toestel';
         const meer = document.getElementById('logMeerLater');
         if (meer) meer.style.display = beheer ? '' : 'none';
         const gasSub = document.getElementById('logGasSub');
@@ -9858,6 +11431,1050 @@ const app = {
         const opNaam = (flessen || []).filter(m => mijn && String(m.assignedEmployeeId || '') === mijn);
         const inCamionet = (flessen || []).filter(m => opNaam.indexOf(m) < 0 && m.stockLocationId && locIds.indexOf(String(m.stockLocationId)) >= 0);
         return { opNaam, inCamionet, locIds };
+    },
+
+    // =========================================================
+    // v429 (Worker v503): MAGAZIJN OP DE GSM — de stock scannen.
+    // Vraag Levi 12 okt 2026: "Het is de bedoeling dat er ook winkelmanden kunnen gevuld worden door de codes te scannen in het
+    // magazijn." + uitgaand materiaal "gemengd" (duur materiaal scannen met de werf, kleingoed via de bakjes, elke week een kast
+    // tellen). Ontwerp C (keuze Levi uit klikbare varianten): vier soorten bovenaan (Bijbestellen · Meenemen · Ontvangen · Tellen),
+    // de camera blijft open (scan het ene vak na het andere), een lijst met − aantal +, Klaar = één boeking + samenvatting.
+    // Elke code gaat naar de Worker (/bel-api/shop-app-stk-code, kop X-App-Sessie): het artikelnummer van het etiket, een EAN of een
+    // code die iemand koppelde. Onbekend = koppelen aan een artikel (de app onthoudt de code). Een handscanner (PDA) tikt de code in
+    // het codevak of, zonder vak, als snelle toetsen + Enter. Klaar = /bel-api/shop-app-stk-actie met een vast kid per reeks: een
+    // herkansing boekt nooit dubbel. De reeks staat ook op de gsm (localStorage qe_mag_reeks_<fiche>, 3 dagen): een herstart of een
+    // update verliest niets. Er wordt hier nooit iets besteld en er staat nooit een prijs.
+    // =========================================================
+    MAG_MODI: [
+        { k: 'bij', naam: 'Bijbestellen', sub: 'Loop langs de bakjes en scan wat bijna op is' },
+        { k: 'mee', naam: 'Meenemen', sub: 'Scan wat je meeneemt naar de werf' },
+        { k: 'ont', naam: 'Ontvangen', sub: 'Scan wat er geleverd is' },
+        { k: 'tel', naam: 'Tellen', sub: 'Scan elk vak en vul het aantal in' },
+    ],
+    MAG_TTL: 3 * 86400000,          // een reeks die niet bewaard werd, blijft 3 dagen op de gsm
+    MAG_WERF_TTL: 4 * 3600000,      // de gekozen werf (meenemen) geldt 4 uur: morgen begin je niet per ongeluk op de werf van gisteren
+    MAG_PAUZE_MS: 120000,           // 2 minuten niets gescand: de camera pauzeert (batterij)
+    MAG_LEV: { desco: 'Desco', vanoirschot: 'Van Oirschot', stg: 'STG', metalunion: 'Metalunion', carnoy: 'Carnoy', viessmann: 'Viessmann' },
+
+    openMagazijn() {
+        if (!RobawsAPI.magLogistiekDeel('magazijn')) { this.toast('Geen toegang tot het magazijn', true); return; }
+        this.navigate('screenMagazijn', true);
+    },
+
+    // ---- de reeks (op de gsm bewaard) ----
+    _magSleutel() { return 'qe_mag_reeks_' + String((this.currentUser && this.currentUser.robawsEmployeeId) || 'x'); },
+    _magState() {
+        const emp = String((this.currentUser && this.currentUser.robawsEmployeeId) || '');
+        if (this._mag && this._mag.emp === emp) return this._mag;
+        let m = null;
+        try { m = JSON.parse(localStorage.getItem(this._magSleutel()) || 'null'); } catch (_) { m = null; }
+        if (!m || typeof m !== 'object' || String(m.emp) !== emp || !(Date.now() - (Number(m.t) || 0) < this.MAG_TTL)) m = null;
+        const bureel = !!(this.currentUser && this.currentUser.role === 'bureel');
+        if (!m) m = { emp, modus: bureel ? 'bij' : 'mee', lijst: [], werf: null, kid: null, t: Date.now() };
+        if (!this.MAG_MODI.some((x) => x.k === m.modus)) m.modus = 'mee';
+        m.lijst = (Array.isArray(m.lijst) ? m.lijst : []).filter((r) => r && r.k && r.code).slice(0, 300);
+        m.lijst.forEach((r) => { r.bezig = false; });
+        if (m.werf && !(Date.now() - (Number(m.werf.t) || 0) < this.MAG_WERF_TTL)) m.werf = null;
+        m.klaar = null;
+        this._mag = m;
+        return m;
+    },
+    _magBewaar() {
+        const m = this._mag;
+        if (!m) return;
+        m.t = Date.now();
+        try {
+            if (!m.lijst.length && !m.werf && !m.kid) localStorage.removeItem(this._magSleutel());
+            else localStorage.setItem(this._magSleutel(), JSON.stringify({ emp: m.emp, modus: m.modus, lijst: m.lijst.map((r) => Object.assign({}, r, { bezig: undefined })), werf: m.werf, kid: m.kid, t: m.t }));
+        } catch (_) {}
+    },
+    _magNieuwK() { return 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); },
+    _magNieuwKid() { return 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); },
+    _magSchoon(s) {
+        // geen stuurtekens (een handscanner stuurt soms een prefix), geen spaties aan de randen
+        return Array.from(String(s == null ? '' : s)).filter((c) => { const n = c.charCodeAt(0); return n >= 32 && n !== 127; }).join('').trim();
+    },
+    _magCodeSl(code) { return String(code || '').replace(/\s+/g, '').toUpperCase(); },
+    _magRond(x) { return Math.round((Number(x) || 0) * 1000) / 1000; },
+    _magFmt(x) { try { return this._magRond(x).toLocaleString('nl-BE', { maximumFractionDigits: 3 }); } catch (_) { return String(this._magRond(x)); } },
+    _magEsc(s) { return this.escapeHtml(String(s == null ? '' : s)); },
+    /** Naam van een artikel uit de webshop. Carnoy schrijft "nl|fr| maat": dan de Nederlandse naam met de maat. */
+    _magWebNaam(w) {
+        const d = String((w && (w.n || w.c)) || '').split('|').map((x) => x.trim()).filter(Boolean);
+        if (d.length >= 3 && d[d.length - 1].length <= 24) return d[0] + ' ' + d[d.length - 1];
+        return d.join(' ');
+    },
+
+    // ---- aantallen (ontwerp C) ----
+    /** Bijbestellen: aanvullen tot het maximum, in hele verpakkingen (zoals Bijbestellen in de webshop). */
+    _magVoorstel(a) {
+        const per = Number(a.per) > 0 ? Number(a.per) : 1;
+        const peil = (Number(a.n) || 0) + (Number(a.besteld) || 0);
+        if (!(Number(a.ma) > 0)) return per;
+        const ruw = Math.max(per, Number(a.ma) - peil);
+        const op = Math.ceil(ruw / per) * per;
+        const neer = Math.max(per, Math.floor(ruw / per) * per);
+        return peil + op <= Number(a.ma) ? op : neer;
+    },
+    _magStap(r, modus) {
+        if (modus === 'bij') return (r.art && Number(r.art.per) > 0) ? Number(r.art.per) : 1;
+        return Number(r.per) > 0 ? Number(r.per) : 1;   // een doos-code telt de inhoud van de doos
+    },
+    _magStartN(r, modus) {
+        const a = r.art || {};
+        if (modus === 'bij') return this._magVoorstel(a);
+        if (modus === 'ont') return Number(a.besteld) > 0 ? Number(a.besteld) : this._magStap(r, modus);
+        if (modus === 'tel') return Number(a.n) || 0;
+        return this._magStap(r, modus);
+    },
+    _magHint(r, modus) {
+        const a = r.art || {}, f = (x) => this._magFmt(x);
+        const stock = Number(a.n) || 0, besteld = Number(a.besteld) || 0;
+        if (modus === 'bij') {
+            if (!(Number(a.ma) > 0)) return { t: 'geen maximum ingesteld' + (a.bij ? ' · al op de lijst (' + f(a.bij.n) + ')' : ''), k: '' };
+            const na = stock + besteld + r.n;
+            return { t: (na > Number(a.ma) ? 'boven max (' + f(na) + ')' : 'tot max ' + f(a.ma)) + (a.bij ? ' · al op de lijst (' + f(a.bij.n) + ')' : ''), k: na > Number(a.ma) ? 'rood' : '' };
+        }
+        if (modus === 'mee') {
+            if (!a.geteld) return { t: 'nog niet geteld', k: '' };
+            const rest = this._magRond(stock - r.n);
+            if (rest < 0) return { t: 'meer dan op stock (' + f(stock) + ')', k: 'oranje' };
+            if (a.mi != null && rest < Number(a.mi)) return { t: 'daarna ' + f(rest) + ', onder min', k: 'oranje' };
+            return { t: 'daarna ' + f(rest) + ' op stock', k: '' };
+        }
+        if (modus === 'ont') return { t: besteld > 0 ? 'besteld ' + f(besteld) : 'niet besteld', k: '' };
+        if (!a.geteld) return { t: 'nog nooit geteld', k: '' };
+        const d = this._magRond(r.n - stock);
+        return d === 0 ? { t: 'klopt met de stock', k: '' } : { t: 'verschil ' + (d > 0 ? '+' : '') + f(d), k: 'oranje' };
+    },
+    _magInfo(a) {
+        const f = (x) => this._magFmt(x);
+        const delen = [a.vak ? 'Vak ' + a.vak : (a.plaats || 'Geen vak')];
+        delen.push(a.geteld ? f(a.n) + ' ' + (a.eh || 'st') + ' op stock' : 'nog niet geteld');
+        if (a.mi != null) delen.push('min ' + f(a.mi));
+        if (a.ma != null) delen.push('max ' + f(a.ma));
+        return delen.join(' · ');
+    },
+
+    // ---- de server ----
+    async _magApi(pad, opts) {
+        const s = RobawsAPI.sessieLees();
+        const fout = (t, code) => { const e = new Error(t); e.code = code; return e; };
+        if (!s || !s.token) throw fout('Meld je opnieuw aan in de app.', 'sessie');
+        const init = { headers: { 'X-App-Sessie': s.token } };
+        if (opts && opts.body) { init.method = 'POST'; init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
+        let r;
+        try { r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/' + pad, init, (opts && opts.ms) || 12000); }
+        catch (_) { throw fout('Geen verbinding', 'net'); }
+        let j = null;
+        try { j = await r.json(); } catch (_) {}
+        if (r.status === 401 && j && j.sessie === false) throw fout('Meld je opnieuw aan in de app.', 'sessie');
+        if (r.status === 503 && j && j.db === false) throw fout(j.error || 'De stock staat nog niet aan.', 'uit');
+        if ((r.status === 404 && (!j || /onbekend/i.test(String(j.error || '')))) || r.status === 401) throw fout('Het magazijn staat nog niet aan op de server.', 'oud');
+        if (!r.ok || !j) throw fout((j && j.error) || ('Er ging iets mis (' + r.status + ')'), r.status >= 500 ? 'server' : 'fout');
+        return j;
+    },
+
+    // ---- het scherm ----
+    loadMagazijn() {
+        const host = document.getElementById('magHost');
+        if (!host) return;
+        const m = this._magState();
+        if (!host.querySelector('#magVak')) this._magOpbouw(host);
+        this._magRender();
+        this._magToetsenAan();
+        if (!this._magZichtFn) {
+            this._magZichtFn = () => {
+                if (document.hidden) {
+                    if (this._magCam && this._magCam.stream) { this._magCamStop(); this._magCamTerug = true; }
+                } else if (this._magCamTerug) {
+                    this._magCamTerug = false;
+                    if (this.currentScreen === 'screenMagazijn' && this._mag && !this._mag.klaar) this._magCamStart();
+                }
+            };
+            document.addEventListener('visibilitychange', this._magZichtFn);
+        }
+        if (!this._magOnlineFn) {
+            this._magOnlineFn = () => { if (this.currentScreen === 'screenMagazijn') this._magOpzoekenWacht(); };
+            window.addEventListener('online', this._magOnlineFn);
+        }
+        this._magOpzoekenWacht();
+        if (!m.klaar) this._magCamStart();
+        if (m.modus === 'mee') this._magWervenLaden();
+    },
+    /** Weg van het scherm (navigate): camera uit, geen toetsen meer opvangen. De reeks blijft. */
+    _magVerlaat() {
+        this._magCamStop();
+        this._magCamTerug = false;
+        if (this._magHerkansT) { clearTimeout(this._magHerkansT); this._magHerkansT = null; }
+        if (this._magToetsFn) { document.removeEventListener('keydown', this._magToetsFn, true); this._magToetsFn = null; }
+        this.magKoppelSluit();
+        this.magWerfSluit();
+    },
+    _magOpbouw(host) {
+        const modi = this.MAG_MODI.map((x) => '<button type="button" data-k="' + x.k + '" onclick="app.magKiesModus(\'' + x.k + '\')">' + x.naam + '</button>').join('');
+        host.innerHTML =
+            '<div class="mag">' +
+            '<div class="mag-kop"><div class="mag-titel">Magazijn</div><div class="mag-sub" id="magSub"></div>' +
+            '<div class="mag-seg" role="group" aria-label="Wat doe je?" id="magSeg">' + modi + '</div></div>' +
+            '<div class="mag-banner" id="magBanner" style="display:none"></div>' +
+            '<div id="magReeks" class="mag-reeks">' +
+            '<div class="mag-cam" id="magVak" onclick="app.magCamTik()">' +
+            '<video id="magVideo" playsinline autoplay muted></video>' +
+            '<span class="mag-hoek lb"></span><span class="mag-hoek rb"></span><span class="mag-hoek lo"></span><span class="mag-hoek ro"></span><span class="mag-lijn"></span>' +
+            '<div class="mag-cam-tekst" id="magCamTekst">Camera starten…</div>' +
+            '<div class="mag-cam-melding" id="magCamMelding"></div>' +
+            '<button type="button" class="mag-cam-pauze" id="magCamPauze" aria-label="Camera pauzeren" onclick="event.stopPropagation();app.magCamPauze()"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"></rect><rect x="14" y="5" width="4" height="14" rx="1"></rect></svg></button>' +
+            '</div>' +
+            '<div class="mag-coderij">' +
+            '<button type="button" class="mag-natief" id="magNatief" onclick="app.magNatief()">Scanner van de gsm</button>' +
+            '<label for="magCode" class="mag-sr">Code typen of scannen met een handscanner</label>' +
+            '<input id="magCode" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="go" placeholder="Code typen" onkeydown="app.magCodeToets(event)">' +
+            '<button type="button" class="mag-code-ok" onclick="app.magCodeOk()">OK</button>' +
+            '</div>' +
+            '<div id="magWerf"></div>' +
+            '<div id="magLijst" class="mag-lijst"></div>' +
+            '</div>' +
+            '<div id="magKlaarScherm" class="mag-klaar" style="display:none"></div>' +
+            '<div class="mag-voet" id="magVoet"><button type="button" id="magKlaarKnop" onclick="app.magKlaar()">Klaar</button></div>' +
+            '</div>';
+        const nat = document.getElementById('magNatief');
+        if (nat && !this._gfScanNatiefKan()) nat.style.display = 'none';
+    },
+    _magRender() {
+        const m = this._magState();
+        const md = this.MAG_MODI.find((x) => x.k === m.modus) || this.MAG_MODI[0];
+        const sub = document.getElementById('magSub');
+        if (sub) sub.textContent = md.sub;
+        document.querySelectorAll('#magSeg button').forEach((b) => { const aan = b.dataset.k === m.modus; b.classList.toggle('aan', aan); b.setAttribute('aria-pressed', aan ? 'true' : 'false'); });
+        const reeks = document.getElementById('magReeks'), klaar = document.getElementById('magKlaarScherm'), voet = document.getElementById('magVoet');
+        if (reeks) reeks.style.display = m.klaar ? 'none' : '';
+        if (klaar) klaar.style.display = m.klaar ? '' : 'none';
+        if (voet) voet.style.display = m.klaar ? 'none' : '';
+        if (m.klaar) { this._magKlaarRender(); return; }
+        this._magWerfRender();
+        this._magLijstRender();
+        this._magVoetBij();
+    },
+    _magBanner(tekst, code) {
+        const b = document.getElementById('magBanner');
+        if (!b) return;
+        if (!tekst) { b.style.display = 'none'; b.textContent = ''; return; }
+        b.textContent = tekst + (code === 'uit' || code === 'oud' ? ' Scannen werkt pas als het magazijn aanstaat.' : '');
+        b.style.display = '';
+    },
+
+    // ---- de lijst ----
+    _magLijstRender() {
+        const box = document.getElementById('magLijst');
+        if (!box) return;
+        const m = this._magState();
+        box.innerHTML = m.lijst.length ? m.lijst.map((r) => this._magRijHtml(r)).join('') : '<div class="mag-leeg" id="magLeeg">Nog niets gescand in deze reeks.</div>';
+    },
+    _magRijHtml(r) {
+        const m = this._magState(), e = (s) => this._magEsc(s), k = e(r.k);
+        let kop, info, infoKlasse = '', onder = '';
+        if (r.wacht) {
+            kop = 'Code ' + e(r.code);
+            info = e(r.fout || 'Wordt opgezocht…');
+            if (r.fout) onder = '<button type="button" class="mag-opnieuw" onclick="app.magOpnieuw(\'' + k + '\')">Opnieuw opzoeken</button>';
+        } else if (r.onbekend) {
+            kop = 'Onbekende code';
+            info = (r.ean ? 'EAN ' : 'Code ') + e(r.code) + ' · nog niet gekoppeld';
+            infoKlasse = ' paars';
+            onder = '<button type="button" class="mag-koppel" onclick="app.magKoppel(\'' + k + '\')">Koppelen aan een artikel</button>';
+        } else {
+            kop = e(r.art.naam);
+            info = e(this._magInfo(r.art));
+            const h = this._magHint(r, m.modus);
+            onder = '<div class="mag-rij-voet"><span class="mag-hint' + (h.k ? ' ' + h.k : '') + '" id="magHint-' + k + '">' + e(h.t) + '</span>' +
+                '<span class="mag-stap" role="group" aria-label="Aantal">' +
+                '<button type="button" aria-label="Minder" onclick="app.magStap(\'' + k + '\',-1)">−</button>' +
+                '<input id="magN-' + k + '" type="number" inputmode="decimal" step="any" min="0" value="' + e(this._magRond(r.n)) + '" aria-label="Aantal" oninput="app.magTypN(\'' + k + '\', this.value)" onchange="app.magZetN(\'' + k + '\', this.value)">' +
+                '<button type="button" aria-label="Meer" onclick="app.magStap(\'' + k + '\',1)">+</button>' +
+                '</span></div>';
+        }
+        return '<div class="mag-rij' + (r.onbekend ? ' onbekend' : '') + (r.wacht ? ' wacht' : '') + '" id="magRij-' + k + '">' +
+            '<div class="mag-rij-kop"><div class="mag-rij-tekst"><span class="mag-naam">' + kop + '</span><span class="mag-info' + infoKlasse + '">' + info + '</span></div>' +
+            '<button type="button" class="mag-weg" aria-label="Weghalen: ' + kop + '" onclick="app.magWeg(\'' + k + '\')">×</button></div>' +
+            onder + '</div>';
+    },
+    _magRijNieuw(r) {
+        const box = document.getElementById('magLijst');
+        if (!box) return;
+        const leeg = document.getElementById('magLeeg');
+        if (leeg) leeg.remove();
+        box.insertAdjacentHTML('afterbegin', this._magRijHtml(r));
+    },
+    /** Eén regel bijwerken. Typ je net in het aantal van die regel, dan blijft het vak staan (alleen de hint verandert). */
+    _magRijBij(r) {
+        const el = document.getElementById('magRij-' + r.k);
+        if (!el) { this._magRijNieuw(r); return; }
+        const act = document.activeElement;
+        if (act && act.id === 'magN-' + r.k && r.art) { this._magHintBij(r); return; }
+        el.outerHTML = this._magRijHtml(r);
+    },
+    _magHintBij(r) {
+        const h = this._magHint(r, this._magState().modus);
+        const el = document.getElementById('magHint-' + r.k);
+        if (el) { el.textContent = h.t; el.className = 'mag-hint' + (h.k ? ' ' + h.k : ''); }
+    },
+    _magRijWeg(k) {
+        const el = document.getElementById('magRij-' + k);
+        if (el) el.remove();
+        if (!this._magState().lijst.length) this._magLijstRender();
+    },
+    _magFlits(k) {
+        const el = document.getElementById('magRij-' + k);
+        if (!el) return;
+        el.classList.remove('flits');
+        void el.offsetWidth;
+        el.classList.add('flits');
+    },
+    _magVoetBij() {
+        const m = this._magState();
+        const n = m.lijst.filter((r) => r.art && !r.onbekend && !r.wacht).length;
+        const b = document.getElementById('magKlaarKnop');
+        if (!b) return;
+        b.disabled = !n || !!this._magBezig;
+        b.textContent = this._magBezig ? 'Bewaren…' : (n ? 'Klaar · ' + n + (n === 1 ? ' artikel' : ' artikels') : 'Klaar');
+    },
+    magWeg(k) {
+        const m = this._magState();
+        const i = m.lijst.findIndex((r) => r.k === k);
+        if (i < 0) return;
+        m.lijst.splice(i, 1);
+        this._magRijWeg(k);
+        this._magVoetBij();
+        this._magBewaar();
+    },
+    magStap(k, richting) {
+        const m = this._magState();
+        const r = m.lijst.find((x) => x.k === k && x.art);
+        if (!r) return;
+        const stap = this._magStap(r, m.modus);
+        const onder = m.modus === 'tel' ? 0 : stap;
+        r.n = this._magRond(Math.max(onder, r.n + richting * stap));
+        const inp = document.getElementById('magN-' + k);
+        if (inp) inp.value = String(this._magRond(r.n));
+        this._magHintBij(r);
+        this._magBewaar();
+    },
+    _magLeesN(v, modus) {
+        const n = Number(String(v == null ? '' : v).replace(',', '.'));
+        if (!isFinite(n) || n < 0) return null;
+        if (modus !== 'tel' && n < 0.001) return null;
+        return this._magRond(Math.min(n, 1e6));
+    },
+    magTypN(k, v) {
+        const m = this._magState();
+        const r = m.lijst.find((x) => x.k === k && x.art);
+        if (!r) return;
+        const n = this._magLeesN(v, m.modus);
+        if (n == null) return;
+        r.n = n;
+        this._magHintBij(r);
+        this._magBewaar();
+    },
+    magZetN(k, v) {
+        const m = this._magState();
+        const r = m.lijst.find((x) => x.k === k && x.art);
+        if (!r) return;
+        const n = this._magLeesN(v, m.modus);
+        if (n != null) r.n = n;
+        const inp = document.getElementById('magN-' + k);
+        if (inp) inp.value = String(this._magRond(r.n));
+        this._magHintBij(r);
+        this._magBewaar();
+    },
+    async magKiesModus(k) {
+        const m = this._magState();
+        const nieuw = this.MAG_MODI.find((x) => x.k === k);
+        if (!nieuw || (m.modus === k && !m.klaar)) return;
+        if (m.klaar) { m.klaar = null; m.modus = k; this._magBewaar(); this._magRender(); this._magCamStart(); if (k === 'mee') this._magWervenLaden(); return; }
+        const arts = m.lijst.filter((r) => r.art && !r.onbekend);
+        if (arts.length) {
+            const oud = (this.MAG_MODI.find((x) => x.k === m.modus) || {}).naam || '';
+            const ok = await QEClock._showConfirmModal('Wisselen naar ' + nieuw.naam + '?',
+                (arts.length === 1 ? 'Het gescande artikel blijft' : 'De ' + arts.length + ' gescande artikels blijven') + ' in de lijst, maar de aantallen van <b>' + this._magEsc(oud) + '</b> worden opnieuw voorgesteld voor <b>' + this._magEsc(nieuw.naam) + '</b>.',
+                'Wisselen', 'Annuleren');
+            if (!ok) return;
+        }
+        m.modus = k;
+        m.kid = null;
+        m.lijst.forEach((r) => { if (r.art && !r.onbekend) r.n = this._magRond(this._magStartN(r, k)); });
+        this._magBewaar();
+        this._magRender();
+        if (k === 'mee') this._magWervenLaden();
+    },
+
+    // ---- een code verwerken (camera, scanner van de gsm, codevak, handscanner) ----
+    async _magCode(ruw, getypt) {
+        const m = this._magState();
+        const code = this._magSchoon(ruw).slice(0, 120);
+        if (!code) return;
+        if (m.klaar) { m.klaar = null; this._magRender(); this._magCamStart(); }
+        const sl = this._magCodeSl(code);
+        let r = m.lijst.find((x) => Array.isArray(x.codes) && x.codes.indexOf(sl) >= 0);
+        if (!r && this._magCodeMem) { const id = this._magCodeMem.get(sl); if (id) r = m.lijst.find((x) => x.art && x.art.id === id); }
+        if (r) {
+            if (r.wacht) { r.extra = (r.extra || 0) + 1; this._magMeld('Wordt nog opgezocht…', 'wacht'); this._magBewaar(); if (r.fout) this._magOpzoeken(r); return; }
+            if (r.onbekend) { this._magMeld('Onbekende code · koppel ze eerst aan een artikel', 'onbekend'); this._magFlits(r.k); return; }
+            const stap = this._magStap(r, m.modus);
+            r.n = this._magRond(r.n + stap);
+            if (Array.isArray(r.codes) && r.codes.indexOf(sl) < 0) r.codes.push(sl);
+            this._magRijBij(r);
+            this._magFlits(r.k);
+            this._magBewaar();
+            this._magMeld('+' + this._magFmt(stap) + ' · ' + r.art.naam, 'ok');
+            this._magTril('nfcRead');
+            return;
+        }
+        r = { k: this._magNieuwK(), code, codes: [sl], wacht: true, extra: 0, t: Date.now(), getypt: !!getypt };
+        m.lijst.unshift(r);
+        this._magRijNieuw(r);
+        this._magVoetBij();
+        this._magBewaar();
+        await this._magOpzoeken(r);
+    },
+    async _magOpzoeken(r) {
+        const m = this._mag;
+        if (!m || !r || r.bezig) return;
+        r.bezig = true;
+        let j = null, fout = null;
+        try { j = await this._magApi('shop-app-stk-code?c=' + encodeURIComponent(r.code), { ms: 10000 }); }
+        catch (e) { fout = e; }
+        r.bezig = false;
+        if (m !== this._mag || m.lijst.indexOf(r) < 0) return;   // de reeks of de regel is intussen weg
+        if (fout) {
+            r.fout = fout.code === 'net' ? 'Geen verbinding · nog niet opgezocht' : (fout.message || 'Opzoeken mislukt');
+            if (fout.code === 'sessie' || fout.code === 'uit' || fout.code === 'oud') this._magBanner(fout.message, fout.code);
+            this._magRijBij(r);
+            this._magBewaar();
+            this._magMeld(r.fout, 'fout');
+            this._magTril('error');
+            // kwam er intussen verbinding (of een nieuwe scan) terwijl deze vraag nog liep: meteen opnieuw; anders straks vanzelf
+            if (fout.code === 'net') {
+                if (r.nogEens) { r.nogEens = false; setTimeout(() => this._magOpzoeken(r), 300); }
+                else this._magHerkansingPlan();
+            }
+            return;
+        }
+        r.nogEens = false;
+        this._magBanner('');
+        r.wacht = false;
+        r.fout = '';
+        if (j.onbekend) {
+            r.onbekend = true;
+            r.ean = j.ean || '';
+            r.cand = (Array.isArray(j.arts) ? j.arts : []).filter((a) => a && a.id).slice(0, 6);
+            r.web = (Array.isArray(j.web) ? j.web : []).slice(0, 6);
+            this._magRijBij(r);
+            this._magVoetBij();
+            this._magBewaar();
+            this._magMeld('Onbekende code · koppel ze aan een artikel', 'onbekend');
+            this._magTril('error');
+            return;
+        }
+        this._magArtZet(r, j.art, Number(j.per) || 1);
+    },
+    /** Een regel krijgt zijn artikel. Staat dat artikel al in de lijst (met een andere code), dan telt het daar bij. */
+    _magArtZet(r, art, per) {
+        const m = this._mag;
+        if (!m || !art || !art.id) return;
+        this._magCodeMem = this._magCodeMem || new Map();
+        (r.codes || []).forEach((c) => this._magCodeMem.set(c, art.id));
+        const extra = Number(r.extra) || 0;
+        const ander = m.lijst.find((x) => x !== r && x.art && x.art.id === art.id);
+        if (ander) {
+            ander.art = art;
+            ander.n = this._magRond(ander.n + this._magStap(ander, m.modus) * (1 + extra));
+            ander.codes = Array.from(new Set((ander.codes || []).concat(r.codes || [])));
+            m.lijst.splice(m.lijst.indexOf(r), 1);
+            this._magRijWeg(r.k);
+            this._magRijBij(ander);
+            this._magFlits(ander.k);
+        } else {
+            r.onbekend = false; r.cand = null; r.web = null; r.ean = '';
+            r.art = art;
+            r.per = per > 0 ? per : 1;
+            r.n = this._magRond(this._magStartN(r, m.modus) + this._magStap(r, m.modus) * extra);
+            r.extra = 0;
+            this._magRijBij(r);
+            this._magFlits(r.k);
+        }
+        this._magVoetBij();
+        this._magBewaar();
+        this._magMeld('✓ ' + art.naam, 'ok');
+        this._magTril('nfcRead');
+    },
+    magOpnieuw(k) {
+        const r = this._magState().lijst.find((x) => x.k === k && x.wacht);
+        if (!r) return;
+        r.fout = '';
+        this._magRijBij(r);
+        this._magOpzoeken(r);
+    },
+    /** Codes die nog niet opgezocht konden worden (geen verbinding): opnieuw proberen. */
+    _magOpzoekenWacht() {
+        const m = this._mag;
+        if (!m) return;
+        m.lijst.filter((r) => r.wacht).slice(0, 10).forEach((r) => { if (r.bezig) r.nogEens = true; else this._magOpzoeken(r); });
+    },
+    /** Zonder verbinding: om de 10 seconden opnieuw proberen zolang het magazijnscherm open is (en bij het event "online"). */
+    _magHerkansingPlan() {
+        if (this._magHerkansT) return;
+        this._magHerkansT = setTimeout(() => {
+            this._magHerkansT = null;
+            if (this.currentScreen !== 'screenMagazijn' || document.hidden) return;
+            this._magOpzoekenWacht();
+        }, 10000);
+    },
+    _magTril(soort) { try { if (window.QEMarble && typeof QEMarble.haptic === 'function') QEMarble.haptic(soort); } catch (_) {} },
+    _magMeld(tekst, soort) {
+        const el = document.getElementById('magCamMelding');
+        if (!el) return;
+        el.textContent = tekst;
+        el.className = 'mag-cam-melding zicht ' + (soort || '');
+        clearTimeout(this._magMeldTimer);
+        this._magMeldTimer = setTimeout(() => { el.className = 'mag-cam-melding'; }, 1800);
+    },
+
+    // ---- het codevak en een handscanner (PDA: tikt de code + Enter) ----
+    magCodeToets(e) {
+        if (e && (e.key === 'Enter' || e.keyCode === 13)) { e.preventDefault(); this.magCodeOk(); }
+    },
+    magCodeOk() {
+        const inp = document.getElementById('magCode');
+        if (!inp) return;
+        const v = inp.value;
+        inp.value = '';
+        if (this._magSchoon(v)) this._magCode(v, true);
+    },
+    /** Een handscanner zonder codevak in focus: snelle toetsen (minder dan 80 ms ertussen) + Enter = een code. Een mens typt trager. */
+    _magToetsenAan() {
+        if (this._magToetsFn) return;
+        this._magToetsBuf = '';
+        this._magToetsT = 0;
+        this._magToetsFn = (e) => {
+            if (this.currentScreen !== 'screenMagazijn') return;
+            const doel = e.target;
+            if (doel && doel.id === 'magCode') return;
+            if (doel && (doel.tagName === 'INPUT' || doel.tagName === 'TEXTAREA' || doel.tagName === 'SELECT' || doel.isContentEditable)) return;
+            if (document.getElementById('magKoppelSheet') || document.getElementById('magWerfSheet')) return;
+            const nu = Date.now();
+            if (e.key === 'Enter' || e.key === 'Tab') {
+                const buf = this._magToetsBuf;
+                this._magToetsBuf = '';
+                if (buf.length >= 3 && nu - this._magToetsT < 400) { e.preventDefault(); this._magCode(buf, false); }
+                return;
+            }
+            if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                if (nu - this._magToetsT > 80) this._magToetsBuf = '';
+                this._magToetsBuf += e.key;
+                this._magToetsT = nu;
+            }
+        };
+        document.addEventListener('keydown', this._magToetsFn, true);
+    },
+
+    // ---- de camera (blijft open; zelfde herkenning als de etiketscanner: BarcodeDetector → ZXing → jsQR) ----
+    _magCamToon(stand, extra) {
+        const t = document.getElementById('magCamTekst'), vak = document.getElementById('magVak'), video = document.getElementById('magVideo');
+        if (!t || !vak) return;
+        vak.dataset.stand = stand;
+        if (video) video.style.visibility = stand === 'loopt' ? 'visible' : 'hidden';
+        const teksten = {
+            start: 'Camera starten…',
+            loopt: 'De camera blijft open: scan het ene vak na het andere',
+            pauze: 'Camera gepauzeerd · tik om verder te scannen',
+            fout: 'Geen live camera in deze app-versie. Gebruik de scanner van de gsm of typ de code.',
+            herkenning: 'Codes lezen lukt niet op deze gsm. Gebruik de scanner van de gsm of typ de code.',
+        };
+        t.textContent = extra || teksten[stand] || '';
+    },
+    magCamTik() {
+        const c = this._magCam;
+        if (c && (c.stream || c.start)) return;
+        const m = this._magState();
+        if (m.klaar) return;
+        this._magCamStart();
+    },
+    magCamPauze() {
+        if (this._magCam && (this._magCam.stream || this._magCam.start)) { this._magCamStop(); this._magCamToon('pauze'); }
+        else this._magCamStart();
+    },
+    _magCamStop() {
+        const c = this._magCam;
+        this._magCam = null;
+        if (!c) return;
+        if (c.timer) clearTimeout(c.timer);
+        if (c.stream) { try { c.stream.getTracks().forEach((t) => t.stop()); } catch (_) {} }
+        const video = document.getElementById('magVideo');
+        if (video) { try { video.srcObject = null; } catch (_) {} video.style.visibility = 'hidden'; }
+    },
+    async _magCamStart() {
+        if (this.currentScreen !== 'screenMagazijn') return;
+        if (this._magCam && (this._magCam.stream || this._magCam.start)) return;
+        const video = document.getElementById('magVideo');
+        if (!video) return;
+        const c = { start: true, stream: null, timer: null, laatste: '', laatsteT: 0, rustTot: 0, sinds: Date.now(), lastHit: Date.now() };
+        this._magCam = c;
+        this._magCamToon('start');
+        try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('geen camera-API');
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+            if (this._magCam !== c || this.currentScreen !== 'screenMagazijn' || !document.getElementById('magVideo')) { try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {} return; }
+            c.stream = stream;
+            c.start = false;
+            video.srcObject = stream;
+            const toon = () => { if (this._magCam === c) this._magCamToon('loopt'); };
+            video.addEventListener('playing', toon, { once: true });
+            await video.play().catch(() => {});
+            if (video.readyState >= 2) toon();
+            let detector = null, zx = false;
+            if (window.BarcodeDetector) {
+                try { detector = new BarcodeDetector({ formats: this.GAS_SCAN_FORMATEN }); }
+                catch (_) { try { detector = new BarcodeDetector({ formats: ['qr_code', 'code_128', 'ean_13'] }); } catch (_2) { detector = null; } }
+            }
+            if (!detector) { try { await this._gfLaadZxing(); zx = true; } catch (_) { zx = false; } }
+            if (!detector && !zx) { try { await this._qrLaadJsqr(); } catch (_) {} }
+            if (this._magCam !== c) return;
+            if (!detector && !zx && !window.jsQR) { this._magCamStop(); this._magCamToon('herkenning'); return; }
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            let bezig = false, detFouten = 0;
+            const stap = async () => {
+                if (this._magCam !== c || !c.stream) return;
+                const nu = Date.now();
+                if (nu - c.lastHit > this.MAG_PAUZE_MS) { this._magCamStop(); this._magCamToon('pauze'); return; }
+                const blad = document.getElementById('magKoppelSheet') || document.getElementById('magWerfSheet');
+                if (!bezig && !blad && nu >= c.rustTot && video.readyState >= 2 && (video.videoWidth || 0) > 0) {
+                    bezig = true;
+                    try {
+                        const k = this._magKader(video);
+                        canvas.width = k.dw; canvas.height = k.dh;
+                        ctx.drawImage(video, k.sx, k.sy, k.sw, k.sh, 0, 0, k.dw, k.dh);
+                        let tekst = null;
+                        if (detector) {
+                            const res = await detector.detect(canvas);
+                            if (res && res[0]) tekst = res[0].rawValue;
+                        } else if (zx) {
+                            tekst = this._gfZxingDecode(canvas);
+                        } else if (window.jsQR) {
+                            const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                            const q = jsQR(img.data, canvas.width, canvas.height, { inversionAttempts: 'dontInvert' });
+                            if (q && q.data) tekst = q.data;
+                        }
+                        if (tekst) this._magTreffer(tekst);
+                    } catch (_) {
+                        if (detector && ++detFouten >= 5) { detector = null; try { await this._gfLaadZxing(); zx = true; } catch (_2) {} }
+                    }
+                    bezig = false;
+                }
+                if (this._magCam === c) c.timer = setTimeout(stap, detector ? 150 : 220);
+            };
+            stap();
+        } catch (e) {
+            if (this._magCam === c) this._magCam = null;
+            // geweigerd (toestemming) of geen camera: een andere uitleg dan een app-versie zonder camera in de app
+            const naam = String((e && e.name) || '');
+            if (naam === 'NotAllowedError' || naam === 'SecurityError') this._magCamToon('fout', 'De app mag de camera niet gebruiken. Geef toestemming bij Profiel → App bijwerken → Toestel & toestemmingen, of typ de code.');
+            else if (naam === 'NotFoundError' || naam === 'OverconstrainedError' || naam === 'NotReadableError') this._magCamToon('fout', 'De camera is niet beschikbaar. Tik hier om het opnieuw te proberen, of typ de code.');
+            else this._magCamToon('fout');
+        }
+    },
+    /** Het zichtbare deel van het beeld (object-fit: cover) = wat de decoder ziet. */
+    _magKader(video) {
+        const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+        let sx = 0, sy = 0, sw = vw, sh = vh;
+        try {
+            const b = document.getElementById('magVak').getBoundingClientRect();
+            if (b.width > 0 && b.height > 0) {
+                const schaal = Math.max(b.width / vw, b.height / vh);
+                sw = Math.min(vw, Math.round(b.width / schaal));
+                sh = Math.min(vh, Math.round(b.height / schaal));
+                sx = Math.max(0, Math.round((vw - sw) / 2));
+                sy = Math.max(0, Math.round((vh - sh) / 2));
+            }
+        } catch (_) {}
+        const dw = Math.min(1024, sw), dh = Math.max(1, Math.round(sh * dw / sw));
+        return { sx, sy, sw, sh, dw, dh };
+    },
+    /** Een gelezen code. Dezelfde code die in beeld blijft, telt maar één keer (eerst 2,5 s iets anders of niets in beeld). */
+    _magTreffer(tekst) {
+        const t = this._magSchoon(tekst);
+        const c = this._magCam;
+        if (!t || !c) return;
+        const nu = Date.now();
+        if (t === c.laatste && nu - c.laatsteT < 2500) { c.laatsteT = nu; return; }
+        c.laatste = t; c.laatsteT = nu; c.lastHit = nu; c.rustTot = nu + 900;
+        this._magCode(t, false);
+    },
+    /** De scanner van de gsm (Google, uit de APK): één code, daarna terug naar de lijst. */
+    magNatief() {
+        if (!this._gfScanNatiefKan() || this._gfScanNatiefKapot) { this.toast('De scanner van de gsm werkt hier niet: richt de camera hierboven op de code of typ ze', true); return; }
+        this._magCamStop();
+        this._gfScanDoel = 'magazijn';
+        this._gfScanNatiefBezig = true;
+        try { QEBridge.scanBarcode(); }
+        catch (_) { this._gfScanNatiefBezig = false; this._gfScanDoel = 'fiche'; this._magCamStart(); }
+    },
+    _magNatiefTerug(tekst, fout) {
+        if (fout && fout !== 'geannuleerd') { this._gfScanNatiefKapot = true; this.toast('Scanner van de gsm niet beschikbaar (' + fout + ')', true); }
+        if (tekst) this._magCode(String(tekst), false);
+        if (this.currentScreen === 'screenMagazijn' && this._mag && !this._mag.klaar) this._magCamStart();
+    },
+
+    // ---- meenemen: naar welke werf? ----
+    async _magWervenLaden(vers) {
+        if (!vers && this._magWerven && Date.now() - this._magWerven.t < 10 * 60e3) { this._magWerfRender(); return; }
+        if (this._magWervenBezig) return;
+        this._magWervenBezig = true;
+        this._magWerfRender();
+        let ctx = null;
+        try { ctx = await this._mbCtx(null); } catch (_) { ctx = null; }
+        this._magWervenBezig = false;
+        this._magWerven = { t: Date.now(), werven: (ctx && Array.isArray(ctx.werven)) ? ctx.werven : [], projecten: (ctx && Array.isArray(ctx.projecten)) ? ctx.projecten : [] };
+        this._magWerfRender();
+    },
+    _magWerfSleutel(w) { return w ? (w.projectId ? 'p' + w.projectId : (w.orderId ? 'o' + w.orderId : (w.planningId ? 'pl' + w.planningId : 'v' + String(w.naam || '').toLowerCase()))) : ''; },
+    _magWerfRender() {
+        const box = document.getElementById('magWerf');
+        if (!box) return;
+        const m = this._magState();
+        if (m.modus !== 'mee') { box.innerHTML = ''; return; }
+        const e = (s) => this._magEsc(s);
+        const lijst = (this._magWerven && this._magWerven.werven) || [];
+        const gekozen = m.werf ? this._magWerfSleutel(m.werf) : '';
+        const chips = lijst.slice(0, 8).map((w, i) => {
+            const aan = this._magWerfSleutel(w) === gekozen;
+            return '<button type="button" class="mag-chip' + (aan ? ' aan' : '') + '" aria-pressed="' + (aan ? 'true' : 'false') + '" onclick="app.magWerfKies(' + i + ')">' + e(w.naam) + (w.projectNr ? ' <small>' + e(w.projectNr) + '</small>' : '') + '</button>';
+        });
+        if (m.werf && !lijst.slice(0, 8).some((w) => this._magWerfSleutel(w) === gekozen)) {
+            chips.unshift('<button type="button" class="mag-chip aan" aria-pressed="true" onclick="app.magWerfZoek()">' + e(m.werf.naam) + (m.werf.projectNr ? ' <small>' + e(m.werf.projectNr) + '</small>' : '') + '</button>');
+        }
+        chips.push('<button type="button" class="mag-chip ander" onclick="app.magWerfZoek()">Andere werf…</button>');
+        const laden = this._magWervenBezig && !lijst.length ? '<span class="mag-werf-laden">Werven laden…</span>' : '';
+        box.innerHTML = '<div class="mag-werf' + (m.werf ? '' : ' leeg') + '" id="magWerfBlok"><span class="mag-werf-kop">Alles in deze reeks gaat naar</span>' +
+            '<div class="mag-chips">' + chips.join('') + laden + '</div></div>';
+    },
+    _magWerfZet(w) {
+        const m = this._magState();
+        if (!w || !w.naam) return;
+        m.werf = { key: this._magWerfSleutel(w), naam: String(w.naam).slice(0, 120), projectId: w.projectId ? String(w.projectId) : '', projectNr: w.projectNr || '', orderId: w.orderId ? String(w.orderId) : '', orderNr: w.orderNr || '', planningId: w.planningId ? String(w.planningId) : '', t: Date.now() };
+        m.kid = null;
+        this._magBewaar();
+        this._magWerfRender();
+    },
+    magWerfKies(i) {
+        const w = ((this._magWerven && this._magWerven.werven) || [])[i];
+        if (w) this._magWerfZet(w);
+    },
+    magWerfZoek() {
+        this.magWerfSluit();
+        const ov = document.createElement('div');
+        ov.id = 'magWerfSheet';
+        ov.className = 'mag-sheet-ov';
+        ov.innerHTML = '<div class="mag-sheet" role="dialog" aria-modal="true" aria-labelledby="magWerfKop"><span class="mag-greep" aria-hidden="true"></span>' +
+            '<h2 id="magWerfKop">Naar welke werf?</h2>' +
+            '<label for="magWerfZoekVak" class="mag-sr">Zoek een werf</label>' +
+            '<input id="magWerfZoekVak" type="search" autocomplete="off" placeholder="Naam, projectnummer of gemeente" oninput="app.magWerfFilter(this.value)">' +
+            '<div id="magWerfLijst" class="mag-kieslijst"></div>' +
+            '<button type="button" class="btn btn-outline btn-full" onclick="app.magWerfSluit()">Annuleren</button></div>';
+        ov.onclick = (e) => { if (e.target === ov) this.magWerfSluit(); };
+        document.body.appendChild(ov);
+        if (!this._magWerven) this._magWervenLaden();
+        this.magWerfFilter('');
+    },
+    magWerfSluit() { const s = document.getElementById('magWerfSheet'); if (s) s.remove(); },
+    magWerfFilter(q) {
+        const box = document.getElementById('magWerfLijst');
+        if (!box) return;
+        const e = (s) => this._magEsc(s);
+        const norm = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[^a-z0-9 ]/g, ' ');
+        const woorden = norm(q).split(/\s+/).filter(Boolean);
+        const bron = [].concat((this._magWerven && this._magWerven.werven) || [], (this._magWerven && this._magWerven.projecten) || []);
+        const gezien = new Set();
+        const lijst = [];
+        for (const w of bron) {
+            const sl = this._magWerfSleutel(w);
+            if (gezien.has(sl)) continue;
+            const t = norm([w.naam, w.projectNr, w.orderNr, w.plaats, w.adres].join(' '));
+            if (woorden.length && !woorden.every((x) => t.indexOf(x) >= 0)) continue;
+            gezien.add(sl);
+            lijst.push(w);
+            if (lijst.length >= 30) break;
+        }
+        this._magWerfKeuzes = lijst;
+        const typ = this._magSchoon(q);
+        let h = lijst.map((w, i) => '<button type="button" class="mag-kies" onclick="app.magWerfKiesUit(' + i + ')"><span class="mag-kies-naam">' + e(w.naam) + '</span><span class="mag-kies-info">' +
+            e([w.projectNr || w.orderNr, w.plaats, w.wanneer].filter(Boolean).join(' · ') || 'werf') + '</span></button>').join('');
+        if (typ.length >= 3) h += '<button type="button" class="mag-kies ander" onclick="app.magWerfVrij()"><span class="mag-kies-naam">Andere werf: ' + e(typ) + '</span><span class="mag-kies-info">staat niet in de lijst</span></button>';
+        if (!h) h = '<div class="mag-leeg">' + (this._magWervenBezig ? 'Werven laden…' : 'Typ de naam van de werf.') + '</div>';
+        box.innerHTML = h;
+    },
+    magWerfKiesUit(i) {
+        const w = (this._magWerfKeuzes || [])[i];
+        if (!w) return;
+        this._magWerfZet(w);
+        this.magWerfSluit();
+    },
+    magWerfVrij() {
+        const inp = document.getElementById('magWerfZoekVak');
+        const naam = this._magSchoon(inp && inp.value).slice(0, 120);
+        if (naam.length < 3) return;
+        this._magWerfZet({ naam });
+        this.magWerfSluit();
+    },
+
+    // ---- een onbekende code koppelen ----
+    magKoppel(k) {
+        const r = this._magState().lijst.find((x) => x.k === k && x.onbekend);
+        if (!r) return;
+        this.magKoppelSluit();
+        this._magKoppelK = k;
+        this._magKoppelZoekNr = 0;
+        const e = (s) => this._magEsc(s);
+        const ov = document.createElement('div');
+        ov.id = 'magKoppelSheet';
+        ov.className = 'mag-sheet-ov';
+        ov.innerHTML = '<div class="mag-sheet" role="dialog" aria-modal="true" aria-labelledby="magKoppelKop"><span class="mag-greep" aria-hidden="true"></span>' +
+            '<h2 id="magKoppelKop">Deze code kennen we nog niet</h2>' +
+            '<p class="mag-sheet-tekst">' + (r.ean ? 'EAN ' : 'Code ') + '<b>' + e(r.code) + '</b>. Kies het artikel; de app onthoudt de code voor de volgende keer.</p>' +
+            '<label for="magKoppelZoekVak" class="mag-sr">Zoek het artikel</label>' +
+            '<input id="magKoppelZoekVak" type="search" autocomplete="off" placeholder="Zoek op naam, nummer of vak, bv. flexcon" oninput="app.magKoppelZoek(this.value)">' +
+            '<div id="magKoppelLijst" class="mag-kieslijst"></div>' +
+            '<button type="button" class="btn btn-outline btn-full" onclick="app.magKoppelSluit()">Annuleren</button></div>';
+        ov.onclick = (ev) => { if (ev.target === ov) this.magKoppelSluit(); };
+        document.body.appendChild(ov);
+        this._magKoppelToon({ arts: r.cand || [], web: r.web || [], eerste: true });
+    },
+    magKoppelSluit() {
+        const s = document.getElementById('magKoppelSheet');
+        if (s) s.remove();
+        clearTimeout(this._magKoppelTimer);
+        this._magKoppelK = null;
+        // een open vraag "waar ligt het?" = geannuleerd
+        if (this._magPlaatsOk) { const ok = this._magPlaatsOk; this._magPlaatsOk = null; try { ok(null); } catch (_) {} }
+    },
+    /** Lijst in het koppelblad: eerst wat al in de stock staat, dan de webshop. Een nieuw stockartikel maken mag alleen het bureel. */
+    _magKoppelToon(res) {
+        const box = document.getElementById('magKoppelLijst');
+        if (!box) return;
+        const e = (s) => this._magEsc(s);
+        const bureel = this._adminIsBureel();
+        const arts = (res.arts || []).filter((a) => a && a.id);
+        const web = (res.web || []).filter((w) => w && w.lev && w.c);
+        this._magKoppelKeuzes = { arts, web };
+        let h = '';
+        if (arts.length) {
+            h += '<div class="mag-kies-kop">' + (res.eerste ? 'Hoort de code bij een van deze?' : 'In de stock') + '</div>';
+            h += arts.map((a, i) => '<button type="button" class="mag-kies" onclick="app.magKoppelKies(\'a\',' + i + ')"><span class="mag-kies-naam">' + e(a.naam) + '</span><span class="mag-kies-info">' + e(this._magInfo(a)) + '</span></button>').join('');
+        }
+        const inStock = web.filter((w) => w.art || w.mag), nieuw = web.filter((w) => !w.art && !w.mag);
+        if (inStock.length) {
+            h += '<div class="mag-kies-kop">In de stock (uit de webshop)</div>';
+            h += inStock.map((w) => { const i = web.indexOf(w); return '<button type="button" class="mag-kies" onclick="app.magKoppelKies(\'w\',' + i + ')"><span class="mag-kies-naam">' + e(this._magWebNaam(w)) + '</span><span class="mag-kies-info">' + e([this.MAG_LEV[w.lev] || w.lev, w.c, w.mag && w.mag.vak ? 'vak ' + w.mag.vak : (w.mag && w.mag.plaats) || ''].filter(Boolean).join(' · ')) + '</span></button>'; }).join('');
+        }
+        if (nieuw.length) {
+            h += '<div class="mag-kies-kop">Nog niet in de stock</div>';
+            if (bureel) {
+                h += nieuw.map((w) => { const i = web.indexOf(w); return '<button type="button" class="mag-kies nieuw" onclick="app.magKoppelKies(\'w\',' + i + ')"><span class="mag-kies-naam">' + e(this._magWebNaam(w)) + '</span><span class="mag-kies-info">' + e([w.m, this.MAG_LEV[w.lev] || w.lev, w.c].filter(Boolean).join(' · ')) + ' · nieuw in de stock</span></button>'; }).join('');
+            } else {
+                h += '<div class="mag-leeg">Staat het artikel niet in de stock? Vraag het bureel om het toe te voegen.</div>';
+            }
+        }
+        if (!h) h = '<div class="mag-leeg">' + (res.eerste ? 'Zoek het artikel hierboven.' : (res.fout ? e(res.fout) : 'Niets gevonden. Probeer een ander woord of het nummer.')) + '</div>';
+        box.innerHTML = h;
+    },
+    magKoppelZoek(q) {
+        clearTimeout(this._magKoppelTimer);
+        const t = this._magSchoon(q);
+        if (t.length < 2) {
+            const r = this._magState().lijst.find((x) => x.k === this._magKoppelK);
+            this._magKoppelToon({ arts: (r && r.cand) || [], web: (r && r.web) || [], eerste: true });
+            return;
+        }
+        const nr = ++this._magKoppelZoekNr;
+        this._magKoppelTimer = setTimeout(async () => {
+            const box = document.getElementById('magKoppelLijst');
+            if (box && !box.querySelector('.mag-kies')) box.innerHTML = '<div class="mag-leeg">Zoeken…</div>';
+            let j = null, fout = null;
+            try { j = await this._magApi('shop-app-stk-zoek?q=' + encodeURIComponent(t), { ms: 12000 }); } catch (e) { fout = e; }
+            if (nr !== this._magKoppelZoekNr || !document.getElementById('magKoppelSheet')) return;
+            if (fout) { this._magKoppelToon({ arts: [], web: [], fout: fout.code === 'net' ? 'Geen verbinding' : fout.message }); return; }
+            this._magKoppelToon({ arts: j.arts || [], web: j.web || [] });
+        }, 300);
+    },
+    async magKoppelKies(soort, i) {
+        const k = this._magKoppelK;
+        const m = this._magState();
+        const r = m.lijst.find((x) => x.k === k && x.onbekend);
+        const kz = this._magKoppelKeuzes || { arts: [], web: [] };
+        if (!r) { this.magKoppelSluit(); return; }
+        const body = { code: r.code, per: 1, naam: String((this.currentUser && this.currentUser.name) || '').slice(0, 60) };
+        let nieuwArt = false;
+        if (soort === 'a') {
+            const a = kz.arts[i];
+            if (!a) return;
+            body.art = a.id;
+        } else {
+            const w = kz.web[i];
+            if (!w) return;
+            body.web = { lev: w.lev, c: w.c };
+            if (!w.art && !w.mag) {
+                if (!this._adminIsBureel()) { this.toast('Alleen het bureel kan een nieuw artikel in de stock zetten', true); return; }
+                nieuwArt = true;
+                const plaats = await this._magPlaatsVraag(w);
+                if (plaats == null) return;
+                if (plaats) body.plaats = plaats;
+            } else if (w.art) {
+                delete body.web;
+                body.art = w.art;
+            }
+        }
+        if (this._magKoppelBezig) return;
+        this._magKoppelBezig = true;
+        const box = document.getElementById('magKoppelLijst');
+        if (box) box.classList.add('bezig');
+        let j = null, fout = null;
+        try { j = await this._magApi('shop-app-stk-koppel', { body }); } catch (e) { fout = e; }
+        this._magKoppelBezig = false;
+        if (box) box.classList.remove('bezig');
+        if (fout) { this.toast(fout.code === 'net' ? 'Geen verbinding: koppelen lukte niet' : (fout.message || 'Koppelen lukte niet'), true); return; }
+        this.magKoppelSluit();
+        if (m !== this._mag || m.lijst.indexOf(r) < 0 || !j || !j.art) return;
+        this._magArtZet(r, j.art, 1);
+        this.toast(j.nieuw ? 'Nieuw in de stock: ' + j.art.naam : (nieuwArt ? 'Dit artikel stond al in de stock: de code hoort er nu bij' : 'Gekoppeld: de app herkent deze code voortaan'));
+    },
+    /** Een nieuw stockartikel zonder vak (bv. een pomp op een rek): waar ligt het? null = geannuleerd. */
+    _magPlaatsVraag(w) {
+        return new Promise((ok) => {
+            const box = document.getElementById('magKoppelLijst');
+            if (!box) { ok(null); return; }
+            const e = (s) => this._magEsc(s);
+            this._magPlaatsOk = ok;
+            box.innerHTML = '<div class="mag-kies-kop">Nieuw in de stock</div><div class="mag-nieuw-naam">' + e(this._magWebNaam(w)) + '</div>' +
+                '<label for="magPlaats" class="mag-veldlab">Waar ligt het? (bv. pompenrek)</label>' +
+                '<input id="magPlaats" type="text" maxlength="60" autocomplete="off" placeholder="Laat leeg als het in een vak komt">' +
+                '<div class="mag-rij-knoppen"><button type="button" class="btn btn-outline" onclick="app._magPlaatsAntw(null)">Terug</button>' +
+                '<button type="button" class="btn btn-primary" onclick="app._magPlaatsAntw(document.getElementById(\'magPlaats\').value)">Toevoegen aan de stock</button></div>';
+        });
+    },
+    _magPlaatsAntw(v) {
+        const ok = this._magPlaatsOk;
+        this._magPlaatsOk = null;
+        if (v == null) {
+            const r = this._magState().lijst.find((x) => x.k === this._magKoppelK);
+            this._magKoppelToon({ arts: (r && r.cand) || [], web: (r && r.web) || [], eerste: true });
+            if (ok) ok(null);
+            return;
+        }
+        if (ok) ok(this._magSchoon(v).slice(0, 60));
+    },
+
+    // ---- klaar: één boeking ----
+    async magKlaar() {
+        const m = this._magState();
+        if (this._magBezig || m.klaar) return;
+        const rijen = m.lijst.filter((r) => r.art && !r.onbekend && !r.wacht);
+        if (!rijen.length) { this.toast('Scan eerst een artikel', true); return; }
+        if (m.modus === 'mee' && !m.werf) {
+            this.toast('Kies eerst naar welke werf het materiaal gaat', true);
+            const w = document.getElementById('magWerfBlok');
+            if (w) { try { w.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {} w.classList.remove('flits'); void w.offsetWidth; w.classList.add('flits'); }
+            return;
+        }
+        const open = m.lijst.filter((r) => r.wacht).length, onb = m.lijst.filter((r) => r.onbekend).length;
+        if (open || onb) {
+            const delen = [];
+            if (open) delen.push(open + (open === 1 ? ' code is' : ' codes zijn') + ' nog niet opgezocht');
+            if (onb) delen.push(onb + (onb === 1 ? ' code is' : ' codes zijn') + ' nog niet gekoppeld');
+            const ok = await QEClock._showConfirmModal('Toch bewaren?', this._magEsc(delen.join(' en ')) + '. Die tellen niet mee en blijven in de lijst.', 'Bewaren zonder die codes', 'Terug');
+            if (!ok) return;
+        }
+        const modus = m.modus;
+        const was = {};
+        rijen.forEach((r) => { was[r.art.id] = { n: Number(r.art.n) || 0, geteld: !!r.art.geteld, naam: r.art.naam, eh: r.art.eh || 'st' }; });
+        const regels = rijen.map((r) => ({ art: r.art.id, n: this._magRond(r.n) })).filter((x) => modus === 'tel' ? x.n >= 0 : x.n > 0);
+        const werf = modus === 'mee' && m.werf ? { naam: m.werf.naam, projectNr: m.werf.projectNr || '', orderNr: m.werf.orderNr || '', projectId: m.werf.projectId || '', planningId: m.werf.planningId || '' } : null;
+        if (!m.kid) m.kid = this._magNieuwKid();
+        this._magBewaar();
+        this._magBezig = true;
+        this._magVoetBij();
+        const delen = [];
+        for (let i = 0; i < regels.length; i += 100) delen.push(regels.slice(i, i + 100));
+        const uit = { regels: [], arts: [], fouten: [], werf: '' };
+        let fout = null;
+        try {
+            for (let i = 0; i < delen.length; i++) {
+                const body = { modus, regels: delen[i], kid: delen.length > 1 ? m.kid + '-' + (i + 1) : m.kid, naam: String((this.currentUser && this.currentUser.name) || '').slice(0, 60) };
+                if (werf) body.werf = werf;
+                const j = await this._magApi('shop-app-stk-actie', { body, ms: 20000 });
+                uit.regels.push(...(Array.isArray(j.regels) ? j.regels : delen[i]));
+                uit.arts.push(...(Array.isArray(j.arts) ? j.arts : []));
+                uit.fouten.push(...(Array.isArray(j.fouten) ? j.fouten : []));
+                if (j.werf) uit.werf = j.werf;
+            }
+        } catch (e) { fout = e; }
+        this._magBezig = false;
+        if (fout) {
+            this._magVoetBij();
+            this._magTril('error');
+            if (fout.code === 'sessie' || fout.code === 'uit' || fout.code === 'oud') this._magBanner(fout.message, fout.code);
+            this.toast(fout.code === 'net' ? 'Niet bewaard: geen verbinding. Tik opnieuw op Klaar: er wordt niets dubbel geboekt.' : ('Niet bewaard: ' + (fout.message || 'er ging iets mis')), true);
+            return;
+        }
+        // wat geboekt is, gaat uit de lijst; onbekende en niet opgezochte codes blijven staan
+        const geboekt = new Set(uit.regels.map((x) => x.art));
+        const naArt = {};
+        uit.arts.forEach((a) => { if (a && a.id) naArt[a.id] = a; });
+        m.lijst = m.lijst.filter((r) => !(r.art && !r.onbekend && !r.wacht && geboekt.has(r.art.id)));
+        m.kid = null;
+        const kop = { bij: 'Op de bijbestellijst gezet', mee: 'Afgeboekt op de werf', ont: 'Op stock gezet', tel: 'Telling bewaard' }[modus];
+        const kopSub = modus === 'mee' ? (uit.werf || (werf && werf.naam) || '') : '';
+        const foutVan = {};
+        uit.fouten.forEach((f) => { if (f && f.art) foutVan[f.art] = f.fout || 'niet bewaard'; });
+        const lijnen = uit.regels.filter((x) => !foutVan[x.art]).map((x) => {
+            const w = was[x.art] || {}, na = naArt[x.art] || {};
+            const f = (v) => this._magFmt(v);
+            let sub = '';
+            if (modus === 'mee') sub = na.geteld ? 'nog ' + f(na.n) + ' op stock' : '';
+            else if (modus === 'ont') sub = na.geteld ? 'nu ' + f(na.n) + ' op stock' : 'nog niet geteld';
+            else if (modus === 'tel') sub = w.geteld ? 'was ' + f(w.n) : 'eerste telling';
+            return { tekst: f(x.n) + ' × ' + (w.naam || na.naam || x.art), sub };
+        });
+        const fouten = uit.fouten.map((f) => ({ tekst: ((was[f.art] && was[f.art].naam) || f.art) + ': ' + (f.fout || 'niet bewaard') }));
+        if (modus === 'mee') m.werf = null;   // de volgende reeks kiest opnieuw zijn werf
+        m.klaar = { modus, kop, kopSub, lijnen, fouten, rest: m.lijst.length };
+        this._magBewaar();
+        this._magCamStop();
+        this._magRender();
+        try { window.scrollTo(0, 0); } catch (_) {}
+        this._magTril(fouten.length ? 'error' : 'success');
+    },
+    _magKlaarRender() {
+        const box = document.getElementById('magKlaarScherm');
+        const m = this._magState();
+        if (!box || !m.klaar) return;
+        const e = (s) => this._magEsc(s), k = m.klaar;
+        box.innerHTML = '<div class="mag-ok' + (k.fouten.length && !k.lijnen.length ? ' fout' : '') + '" aria-hidden="true">' +
+            (k.fouten.length && !k.lijnen.length ? '!' : '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>') + '</div>' +
+            '<h2>' + e(k.lijnen.length ? k.kop : 'Niets bewaard') + '</h2>' +
+            (k.kopSub && k.lijnen.length ? '<div class="mag-klaar-sub">' + e(k.kopSub) + '</div>' : '') +
+            k.lijnen.map((l) => '<div class="mag-res"><span>' + e(l.tekst) + '</span>' + (l.sub ? '<small>' + e(l.sub) + '</small>' : '') + '</div>').join('') +
+            k.fouten.map((l) => '<div class="mag-res fout"><span>' + e(l.tekst) + '</span></div>').join('') +
+            (k.rest ? '<div class="mag-res-noot">' + k.rest + (k.rest === 1 ? ' code staat' : ' codes staan') + ' nog in de lijst (niet gekoppeld of niet opgezocht).</div>' : '') +
+            '<button type="button" class="btn btn-primary btn-full mag-nieuw" onclick="app.magNieuweReeks()">Nieuwe reeks</button>';
+    },
+    magNieuweReeks() {
+        const m = this._magState();
+        m.klaar = null;
+        this._magBewaar();
+        this._magRender();
+        this._magCamStart();
+        if (m.modus === 'mee') this._magWervenLaden();
     },
 
     openVoertuigen() {
@@ -11746,6 +14363,7 @@ const app = {
         }
         this._matKoppelRender();
         if (k.stap === 'ok' && this.currentScreen === 'screenGereedschap') this.loadGereedschap();
+        if (k.stap === 'ok' && this.currentScreen === 'screenNfcTags') this.loadNfcTags();   // v431
     },
     _matKoppelFout(r) {
         const k = this._matKoppel;
@@ -12986,6 +15604,7 @@ const app = {
      *  code; fout = 'geannuleerd' (gebruiker sloot de scanner) of een reden. */
     _gfScanNatief(tekst, fout) {
         this._gfScanNatiefBezig = false;
+        if (this._gfScanDoel === 'magazijn') { this._gfScanDoel = 'fiche'; this._magNatiefTerug(tekst, fout); return; }   // v429
         if (tekst) { this._gfScanVerwerk(String(tekst)); return; }
         if (fout && fout !== 'geannuleerd') {
             this._gfScanNatiefKapot = true;   // deze sessie niet meer proberen (module niet beschikbaar)
@@ -14143,7 +16762,7 @@ const app = {
                         + '<div style="font-size:13.5px;font-weight:600;color:var(--ink)">' + esc(e.name || em) + '</div>'
                         + '<div style="font-size:11.5px;color:var(--g3);margin-bottom:7px">' + esc(em) + '</div>'
                         + extraRij
-                        + '<div style="font-size:11.5px;font-weight:600;color:var(--g1);margin:2px 0 4px">Logistiek' + (g.rol === 'bureel' ? '' : ' <span style="font-weight:400">(alleen bekijken)</span>') + (std ? ' <span style="font-weight:400;color:var(--g3)">· standaard</span>' : '') + '</div>'
+                        + '<div style="font-size:11.5px;font-weight:600;color:var(--g1);margin:2px 0 4px">Logistiek' + (g.rol === 'bureel' ? '' : ' <span style="font-weight:400">(alleen bekijken; het magazijn scannen wel)</span>') + (std ? ' <span style="font-weight:400;color:var(--g3)">· standaard</span>' : '') + '</div>'
                         + '<div style="display:flex;gap:16px;flex-wrap:wrap">' + logVinkjes + '</div>' + voertuigRegel + '</div>';
                 }).join('');
             }
@@ -15122,14 +17741,14 @@ const app = {
     // v278: AANVRAGEN-tab (hub: Verlof / Materiaal / Materieel) +
     // verlofsaldo + chat op een aanvraag + goedkeur-hub (Verlof/Facturen).
     // ============================================================
-    _aanvraagTab: 'verlof',
+    _aanvraagTab: 'materiaal',   // v427: Materiaal eerst, Verlof achteraan (vraag Levi 12 okt 2026)
     openAanvragenTab() {
         const u = RobawsAPI.getLoggedInUser();
         const card = document.getElementById('aanvraagGoedkeurenCard');
         const isBureel = u && u.role === 'bureel';
         if (card) card.style.display = isBureel ? 'block' : 'none';
         if (isBureel) this._refreshAanvraagGoedkeurCount();
-        this.setAanvraagTab(this._aanvraagTab || 'verlof');
+        this.setAanvraagTab(this._aanvraagTab || 'materiaal');
     },
 
     setAanvraagTab(tab) {
@@ -21260,6 +23879,11 @@ const app = {
                 // Badge tonen op planning-scherm
                 const badge = document.getElementById('woCount');
                 if (badge) { badge.textContent = count; badge.style.background = 'var(--qe-orange)'; }
+            } else if (this._lastPlanningCount !== null && count < this._lastPlanningCount
+                    && this.currentScreen === 'screenPlanning' && !this._submitInProgress
+                    && this._localDateStr(this.currentDate) === date) {
+                // v423: een dagplanning viel weg (bv. een collega zette jouw uren op zijn werkbon) → meteen uit de lijst
+                this.loadPlanning();
             }
             this._lastPlanningCount = count;
         } catch (e) { /* stille fout bij polling */ }
@@ -21307,7 +23931,10 @@ const app = {
         const result = hours.map(h => ({ ...h }));
 
         // Bereken totaal werkuren
-        const werkEntries = result.filter(h => h.type === 'klant');
+        // v422: uren die bij het uitklokken over meerdere werkbonnen VERDEELD werden (exact: true) blijven
+        // exact zoals verdeeld — samen precies de geklokte uren (vraag Levi: nooit meer of minder). Alleen de
+        // rest wordt zoals altijd op het halfuur afgerond.
+        const werkEntries = result.filter(h => h.type === 'klant' && !h.exact);
         if (werkEntries.length > 0) {
             const totalRaw = werkEntries.reduce((sum, h) => sum + (h.duration || 0), 0);
             const totalRounded = this.roundHoursForInvoice(totalRaw, this.selectedUurcode);
@@ -21622,8 +24249,41 @@ const app = {
 
     // v292: pull-to-refresh (native SwipeRefreshLayout) uitzetten zodra er een
     // pop-up/overlay openstaat — anders triggert omhoog scrollen in een modal een
-    // ongewilde app-refresh. Een MutationObserver houdt de status bij, dus dit
-    // werkt voor ELKE overlay (modal, PDF-viewer, Marble-loader/succes, …).
+    // ongewilde app-refresh.
+    // v427: HERSCHREVEN (melding Levi 12 okt 2026: "Heel vaak als je naar beneden hebt gescrolt en je wil terug naar
+    // boven scrollen, scrolt hij niet maar refresht hij."). De APK (SwipeRefreshLayout 1.1.0 rond de WebView) kijkt
+    // alleen of de PAGINA bovenaan staat. Twee gevolgen:
+    //  1) een venster over het hele scherm (km-formulier, uren verdelen, gasfles, webshop, ...) of een lijst die zelf
+    //     scrolt, ziet hij niet: stond de pagina eronder bovenaan, dan werd elke veeg naar beneden "verversen" in
+    //     plaats van scrollen. De lijst van v292 kende maar een paar vensters (1 van de ±30 eigen vensters).
+    //  2) begon een veeg lager op de pagina en kwam ze tijdens die veeg bovenaan, dan rekende hij met het beginpunt van
+    //     een VORIGE veeg (dat vergeet hij niet) en kon hij midden in de veeg toch beginnen te trekken.
+    // Daarom beslist de www VOORAF en zet ze de schakelaar van de APK (QEBridge.setPullToRefreshEnabled, APK >= 1.243):
+    //  - UIT, meteen: zodra er een groot vast vlak midden op het scherm ligt, of de pagina of een zichtbare lijst niet
+    //    bovenaan staat;
+    //  - weer AAN: alleen als niemand het scherm aanraakt, alles bovenaan staat en het 250 ms rustig bleef, nooit midden
+    //    in een veeg. Verversen kan dus alleen nog met een NIEUWE veeg die bovenaan begint (zoals in Chrome).
+    _PTR_RUST_MS: 250,
+    _ptrPaginaTop() {
+        const se = document.scrollingElement || document.documentElement;
+        return Math.max((se && se.scrollTop) || 0, window.pageYOffset || 0);
+    },
+    // Hoort el bij een vast vlak dat een groot deel van het scherm bedekt (venster, sheet, laadscherm)? De kop, de
+    // menubalk onderaan, een melding en de +-knop zijn ook vast, maar klein: die tellen niet.
+    _ptrInVastVlak(el) {
+        const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+        for (let i = 0; el && el.nodeType === 1 && i < 80; i++, el = el.parentElement) {
+            if (el === document.body || el === document.documentElement) return false;
+            let cs = null;
+            try { cs = getComputedStyle(el); } catch (_e) { return false; }
+            if (cs && cs.position === 'fixed') {
+                const r = el.getBoundingClientRect();
+                if (r.height >= vh * 0.4 && r.width >= vw * 0.6) return true;
+            }
+        }
+        return false;
+    },
+    // Staat er een venster open? De vensters van v292 bij naam + elk groot vast vlak op drie punten midden op het scherm.
     _pullRefreshOverlayOpen() {
         try {
             const m = document.getElementById('modalOverlay');
@@ -21633,21 +24293,122 @@ const app = {
             for (let i = 0; i < nodes.length; i++) {
                 if (nodes[i].offsetWidth > 0 || nodes[i].offsetHeight > 0) return true;
             }
+            const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+            if (vw && vh && typeof document.elementFromPoint === 'function') {
+                const punten = [0.35, 0.5, 0.65];
+                for (let i = 0; i < punten.length; i++) {
+                    const el = document.elementFromPoint(vw / 2, vh * punten[i]);
+                    if (el && this._ptrInVastVlak(el)) return true;
+                }
+            }
             return false;
         } catch (_e) { return false; }
     },
+    // Een zichtbare lijst of tekstvak die zelf scrolt en niet bovenaan staat (bijgehouden via de scroll-gebeurtenissen).
+    _ptrLijstNietBovenaan() {
+        const set = this._ptrScrollers;
+        if (!set || !set.size) return null;
+        let gevonden = null;
+        set.forEach((el) => {
+            if (gevonden) return;
+            if (!el || !el.isConnected) { set.delete(el); return; }
+            if ((el.scrollTop || 0) > 1 && el.getClientRects().length) gevonden = el;
+        });
+        return gevonden;
+    },
+    // Staat er een tekenvak (handtekening: canvas met touch-action:none) in beeld? Bij een korte werkbon staat het vak
+    // bovenaan: een handtekening met een haal naar beneden mag dan geen "verversen" worden.
+    _ptrTekenvakInBeeld() {
+        const vh = window.innerHeight || 0;
+        const lijst = document.querySelectorAll('canvas');
+        for (let i = 0; i < lijst.length; i++) {
+            const r = lijst[i].getBoundingClientRect();
+            if (!r.width || !r.height || r.bottom <= 0 || r.top >= vh) continue;
+            if (getComputedStyle(lijst[i]).touchAction === 'none') return true;
+        }
+        return false;
+    },
+    // Mag "trek om te verversen" nu? { mag, reden: 'venster' | 'pagina' | 'lijst' | 'tekenvak' }
+    _ptrBeoordeel() {
+        try {
+            if (this._pullRefreshOverlayOpen()) return { mag: false, reden: 'venster' };
+            if (this._ptrPaginaTop() > 1) return { mag: false, reden: 'pagina' };
+            if (this._ptrLijstNietBovenaan()) return { mag: false, reden: 'lijst' };
+            if (this._ptrTekenvakInBeeld()) return { mag: false, reden: 'tekenvak' };
+            return { mag: true, reden: '' };
+        } catch (_e) { return { mag: false, reden: 'fout' }; }
+    },
+    _ptrZet(aan) {
+        if (this._ptrAan === aan) return;
+        this._ptrAan = aan;
+        try { if (window.QEBridge && QEBridge.setPullToRefreshEnabled) QEBridge.setPullToRefreshEnabled(aan); } catch (_e) {}
+    },
     _syncPullRefresh() {
-        const open = this._pullRefreshOverlayOpen();
-        if (open === this._lastPullState) return;
-        this._lastPullState = open;
-        try { if (window.QEBridge && QEBridge.setPullToRefreshEnabled) QEBridge.setPullToRefreshEnabled(!open); } catch (_e) {}
+        const b = this._ptrBeoordeel();
+        this._ptrStand = b;
+        if (!b.mag) {
+            clearTimeout(this._ptrAanT); this._ptrAanT = null;
+            this._ptrZet(false);
+            return;
+        }
+        if (this._ptrAan === true || this._ptrVingers > 0 || this._ptrAanT) return;
+        this._ptrAanT = setTimeout(() => {
+            this._ptrAanT = null;
+            if (this._ptrVingers > 0) return;            // iemand raakt het scherm intussen aan: bij het loslaten opnieuw
+            const b2 = this._ptrBeoordeel();
+            this._ptrStand = b2;
+            this._ptrZet(!!b2.mag);
+        }, this._PTR_RUST_MS);
+    },
+    // Raakt de vinger iets aan in een lijst die niet bovenaan staat? (extra vangnet bij het aanraken)
+    _ptrDoelNietBovenaan(el) {
+        for (let i = 0; el && el.nodeType === 1 && i < 80; i++, el = el.parentElement) {
+            if (el === document.body || el === document.documentElement) break;
+            if ((el.scrollTop || 0) > 1) return true;
+        }
+        return false;
     },
     _installPullRefreshGuard() {
         if (this._pullGuardInstalled) return;
         this._pullGuardInstalled = true;
         try {
-            const schedule = () => { clearTimeout(this._pullSyncT); this._pullSyncT = setTimeout(() => this._syncPullRefresh(), 60); };
-            new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+            this._ptrScrollers = new Set();
+            this._ptrVingers = 0;
+            const plan = () => { clearTimeout(this._pullSyncT); this._pullSyncT = setTimeout(() => this._syncPullRefresh(), 60); };
+            this._ptrPlan = plan;
+            new MutationObserver(plan).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'hidden', 'open'] });
+            const opties = { capture: true, passive: true };
+            // Wat scrolt (pagina, venster, lijst): weg van boven = meteen uit; terug boven = opnieuw beoordelen.
+            document.addEventListener('scroll', (e) => {
+                const t = e.target;
+                let top;
+                if (t && t.nodeType === 1) {
+                    const set = this._ptrScrollers;
+                    set.add(t);
+                    if (set.size > 200) {
+                        set.forEach((x) => { if (!x.isConnected) set.delete(x); });
+                        if (set.size > 200) { const oud = Array.from(set).slice(0, set.size - 150); oud.forEach((x) => { if (x !== t) set.delete(x); }); }
+                    }
+                    top = t.scrollTop || 0;
+                } else top = this._ptrPaginaTop();
+                if (top > 1) { if (this._ptrAan !== false || this._ptrAanT) this._syncPullRefresh(); }
+                else plan();
+            }, opties);
+            const tel = (e) => { this._ptrVingers = (e && e.touches) ? e.touches.length : 0; };
+            document.addEventListener('touchstart', (e) => {
+                tel(e);
+                clearTimeout(this._ptrAanT); this._ptrAanT = null;
+                if (this._ptrAan !== false) {
+                    let t = e.target;
+                    if (t && t.nodeType !== 1) t = t.parentElement;
+                    if (this._ptrPaginaTop() > 1 || this._ptrDoelNietBovenaan(t) || this._ptrInVastVlak(t)) this._ptrZet(false);
+                }
+            }, opties);
+            const los = (e) => { tel(e); if (!this._ptrVingers) this._syncPullRefresh(); };
+            document.addEventListener('touchend', los, opties);
+            document.addEventListener('touchcancel', los, opties);
+            window.addEventListener('resize', plan);
+            document.addEventListener('visibilitychange', () => { if (!document.hidden) { this._ptrVingers = 0; plan(); } });
             this._syncPullRefresh();
         } catch (_e) {}
     },
@@ -22307,6 +25068,750 @@ const app = {
     },
 
     // ============================================================
+    // v428: "WAT IS ER NIEUW?" — na een update toont de app bij het aanmelden één venster met wat er voor DEZE werknemer
+    // veranderd is (inhoud: js/nieuw.js, per rol). Eén keer per werknemer per update (localStorage
+    // qe_nieuw_gezien_<fiche>); wie op dit toestel nog niets zag, krijgt alles sinds de versie van vóór de update
+    // (qe_nieuw_vorige, gezet bij de update in init). Teruglezen: Profiel → App bijwerken → Wat is er nieuw?
+    // ============================================================
+    _nieuwSleutel() {
+        const u = this.currentUser || {};
+        const e = u.robawsEmployeeId || u.employeeId;
+        return e ? 'qe_nieuw_gezien_' + e : null;
+    },
+    _nieuwRollen() {
+        const r = [];
+        try { const u = RobawsAPI.getLoggedInUser(); if (u && u.role) r.push(u.role); } catch (_e) {}
+        if (this.currentUser && this.currentUser.role) r.push(this.currentUser.role);
+        try { const a = this._activeRole(); if (a) r.push(a); } catch (_e) {}
+        return r.filter((x, i) => r.indexOf(x) === i);
+    },
+    async _nieuwHuidigeVersie() {
+        if (this._wwwVersie > 0) return this._wwwVersie;
+        try { const d = await (await fetch('version.json?_=' + Date.now())).json(); this._wwwVersie = Number(d.version) || 0; } catch (_e) {}
+        return this._wwwVersie || 0;
+    },
+    _nieuwZetGezien(v) {
+        const s = this._nieuwSleutel();
+        if (s && v > 0) { try { localStorage.setItem(s, String(v)); } catch (_e) {} }
+    },
+    _nieuwPlan() {
+        clearTimeout(this._nieuwT);
+        this._nieuwT = setTimeout(() => { this._nieuwControle(0).catch(() => {}); }, 1500);
+    },
+    async _nieuwControle(poging) {
+        if (!window.QENieuw || !this.currentUser || document.getElementById('nieuwVenster')) return;
+        let wissel = false;
+        try { wissel = !!(RobawsAPI.wisselStand && RobawsAPI.wisselStand()); } catch (_e) {}
+        if (wissel) return;          // profiel van een collega bekijken: zijn venster niet opgebruiken
+        const sleutel = this._nieuwSleutel();
+        if (!sleutel) return;
+        const tot = await this._nieuwHuidigeVersie();
+        if (!(tot > 0)) return;
+        let gezien = 0, vorige = 0;
+        try { gezien = Number(localStorage.getItem(sleutel)) || 0; } catch (_e) {}
+        try { vorige = Number(localStorage.getItem('qe_nieuw_vorige')) || 0; } catch (_e) {}
+        // Alleen wat nieuw is sinds de versie die vóór de update op dit toestel stond (vraag Levi 12 okt 2026: "elke keer enkel
+        // al de updates ... die nieuw zijn sinds de huidig geïnstalleerde versie"), en niets wat deze werknemer al zag.
+        if (!gezien && !vorige) { this._nieuwZetGezien(tot); return; }  // nieuw toestel of nieuwe werknemer zonder update: niets inhalen
+        const vanaf = Math.max(gezien, vorige);
+        if (vanaf >= tot) return;
+        const res = QENieuw.voor({ vanaf, tot, rollen: this._nieuwRollen(), max: 12 });
+        if (!res.aantal) { this._nieuwZetGezien(tot); return; }
+        // wacht tot er niets anders open staat (de overgang na het aanmelden, een melding, een venster, een gescande tag, ...)
+        const bezig = document.hidden || this._pullRefreshOverlayOpen() || (this.currentUser && !document.getElementById('loginScreen').classList.contains('hidden'));
+        if (bezig) {
+            if (poging < 300) this._nieuwT = setTimeout(() => { this._nieuwControle(poging + 1).catch(() => {}); }, 1000);
+            return;
+        }
+        this.openNieuw({ res, gezienTot: tot });
+    },
+    /** Open het venster. opts.res = vooraf berekend (na een update); opts.alles = alles teruglezen (vanuit Profiel). */
+    async openNieuw(opts) {
+        opts = opts || {};
+        if (!window.QENieuw) return;
+        let res = opts.res;
+        if (!res) {
+            const tot = await this._nieuwHuidigeVersie();
+            res = QENieuw.voor({ vanaf: 0, tot: tot || Infinity, rollen: this._nieuwRollen(), max: 60 });
+        }
+        this._nieuwOpen = { gezienTot: opts.gezienTot || 0, alles: !!opts.alles, res };
+        const oud = document.getElementById('nieuwVenster');
+        if (oud) oud.remove();
+        const el = document.createElement('div');
+        el.id = 'nieuwVenster';
+        el.setAttribute('role', 'dialog');
+        el.setAttribute('aria-modal', 'true');
+        el.setAttribute('aria-labelledby', 'nwTitel');
+        el.setAttribute('data-overlay', '1');
+        el.className = 'nw nw-c';
+        el.innerHTML = this._nieuwHtml();
+        document.body.appendChild(el);
+        try { const k = el.querySelector('.nw-c-kaart'); if (k) { k.setAttribute('tabindex', '-1'); k.focus({ preventScroll: true }); } } catch (_e) {}   // focus op het venster (schermlezer), geen rand op de knop
+    },
+    /** Sluiten = gelezen (alleen het venster na een update telt mee; teruglezen verandert niets). */
+    nieuwSluit() {
+        const o = this._nieuwOpen;
+        const el = document.getElementById('nieuwVenster');
+        if (el) el.remove();
+        if (o && o.gezienTot) this._nieuwZetGezien(o.gezienTot);
+        this._nieuwOpen = null;
+    },
+    nieuwLees(slug) {
+        this.nieuwSluit();
+        try { this.hlOpen(slug); } catch (_e) {}
+    },
+    /** Een regel open- of dichtklappen (de uitleg staat onder de titel). */
+    nieuwKlap(i) {
+        const el = document.querySelector('#nieuwVenster [data-nw-i="' + i + '"]');
+        if (!el) return;
+        const open = el.classList.toggle('open');
+        const knop = el.querySelector('.nw-c-rij');
+        if (knop) knop.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) { try { el.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (_e) {} }
+    },
+    _nieuwHtml() {
+        const o = this._nieuwOpen || {};
+        const res = o.res || { groepen: [], aantal: 0 };
+        const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+        const n = res.aantal;
+        const datums = res.groepen.map((g) => g.datumTekst);
+        const kopDatum = o.alles ? 'Alle updates' : (datums.length === 1 ? 'Update van ' + datums[0] : 'Sinds je vorige update');
+        const titel = o.alles ? 'Wat is er nieuw?' : (n === 1 ? 'Er is iets nieuw' : 'Er zijn ' + n + ' nieuwigheden');
+        let rol = 'technieker';
+        try { rol = this._hlRol(); } catch (_e) {}
+        // "Lees meer" alleen als het hoofdstuk voor deze werknemer echt bestaat (anders een knop die niets doet)
+        const meer = (it) => {
+            let ok = false;
+            try { ok = !!(it.hoofdstuk && window.QEHandleiding && QEHandleiding.vind(it.hoofdstuk, rol)); } catch (_e) {}
+            return ok ? '<button type="button" class="nw-meer" onclick="app.nieuwLees(\'' + esc(it.hoofdstuk) + '\')">Lees meer</button>' : '';
+        };
+        const eenOpen = n === 1;        // één nieuwigheid: de uitleg staat meteen open
+        let i = 0;
+        const item = (it) => {
+            const k = i++;
+            return '<div class="nw-c-item' + (eenOpen ? ' open' : '') + '" data-nw-i="' + k + '">'
+                + '<button type="button" class="nw-c-rij" onclick="app.nieuwKlap(' + k + ')" aria-expanded="' + (eenOpen ? 'true' : 'false') + '">'
+                + '<span class="nw-pil nw-' + esc(it.s) + '">' + esc(it.label) + '</span>'
+                + '<span class="nw-c-titel">' + esc(it.titel) + '</span>'
+                + '<span class="nw-c-pijl">' + this.icon('chevron-right', { size: 16 }) + '</span></button>'
+                + '<div class="nw-c-uitleg"><div class="nw-it-tekst">' + esc(it.tekst) + '</div>' + meer(it) + '</div></div>';
+        };
+        const lijst = !n ? '<div class="nw-leeg">Nog niets te melden.</div>'
+            : res.groepen.map((g) => (res.groepen.length > 1 || o.alles ? '<div class="nw-datum">' + esc(g.datumTekst) + '</div>' : '')
+                + g.items.map(item).join('')).join('');
+        const verborgen = res.verborgen ? '<div class="nw-nog">En nog ' + res.verborgen + ' oudere. Teruglezen kan in je Profiel, bij App bijwerken.</div>' : '';
+        return '<div class="nw-scrim" onclick="app.nieuwSluit()"></div>'
+            + '<div class="nw-c-kaart"><div class="nw-lijn"></div>'
+            + '<div class="nw-c-kop"><div class="nw-label">' + esc(kopDatum) + '</div>'
+            + '<h2 id="nwTitel" class="nw-titel">' + esc(titel) + '</h2>'
+            + (n ? '<div class="nw-sub">' + (eenOpen ? 'Dit is er veranderd.' : 'Tik op een regel voor de uitleg.') + '</div>' : '') + '</div>'
+            + '<div class="nw-c-lijst">' + lijst + verborgen + '</div>'
+            + '<div class="nw-voet"><button type="button" class="btn btn-primary btn-full" data-nw-focus onclick="app.nieuwSluit()">'
+            + (o.alles ? 'Sluiten' : 'Begrepen') + '</button></div></div>';
+    },
+
+    // ============================================================
+    // v428 + Worker v502: MELDINGEN VAN HET BUREEL (vraag Levi 12 okt 2026: "Ik wil ook zelf meldingen kunnen laten
+    // verschijnen vanuit mijn account in de app ... zoals bv "Iedereen binnenkomen vanavond" zodat iedereen dat weet.")
+    // Ontvangen: bij het opstarten, als de app terug op de voorgrond komt en elke 3 minuten vraagt de app de actieve
+    // meldingen op (GET /bel-api/app-meldingen, kop X-App-Sessie). Een nieuwe verschijnt in het kaartje #medVenster
+    // (zelfde vorm als "Wat is er nieuw?", de tekst meteen volledig) en staat tot de einddatum bovenaan de planning
+    // (#medBalk). Gelezen = lokaal (qe_med_gelezen_<fiche>) én in de Worker (de afzender ziet wie las); lukt dat laatste
+    // niet, dan blijft het in qe_med_rij_<fiche> tot de volgende controle. Versturen: Organisatie → Meldingen, alleen
+    // voor wie de Worker als afzender kent (MELDING_AFZENDERS, nu enkel Levi). Niet tijdens een profielwissel.
+    // ============================================================
+    _medActief: [],
+    _medAfzender: null,
+    _MED_POLL_MS: 180000,
+    /**
+     * v433 + APK 1.248 (vraag Levi 15 okt 2026: "Ik zou ook een melding willen op de app wanneer er een mededeling wordt
+     * gemaakt", variant A): de gsm kijkt elk kwartier zelf bij de Worker (MededelingWorker, ook met de app dicht) en toont
+     * een nieuwe melding als melding op de gsm. Hij krijgt hiervoor dezelfde route, sessie en rol als hierboven. Alleen
+     * voor de eigen aanmelding (_medKanVragen: niet tijdens een profielwissel); afmelden wist het (logout).
+     */
+    _medNativeZet() {
+        try {
+            if (!window.QENative || QENative.versie() < 5 || !this._medKanVragen()) return;
+            const s = RobawsAPI.sessieLees();
+            const o = { url: RobawsAPI.WORKER_AUTH_URL, sessie: s.token, rol: this._nieuwRollen().join(','), fiche: this._medFiche() };
+            const sleutel = JSON.stringify(o);
+            if (sleutel === this._medNativeLaatst) return;
+            if (QENative.zetMededelingen(o)) this._medNativeLaatst = sleutel;
+        } catch (_e) {}
+    },
+    _medFiche() {
+        const u = this.currentUser || {};
+        return String(u.robawsEmployeeId || u.employeeId || '');
+    },
+    _medLijstLees(soort) {
+        const f = this._medFiche();
+        if (!f) return [];
+        try { const a = JSON.parse(localStorage.getItem('qe_med_' + soort + '_' + f) || '[]'); return Array.isArray(a) ? a.map(String) : []; }
+        catch (_e) { return []; }
+    },
+    _medLijstZet(soort, ids) {
+        const f = this._medFiche();
+        if (!f) return;
+        try { localStorage.setItem('qe_med_' + soort + '_' + f, JSON.stringify(ids.slice(-100))); } catch (_e) {}
+    },
+    _medKanVragen() {
+        let wissel = false;
+        try { wissel = !!(RobawsAPI.wisselStand && RobawsAPI.wisselStand()); } catch (_e) {}
+        let sessie = null;
+        try { sessie = RobawsAPI.sessieLees(); } catch (_e) {}
+        return !!(this.currentUser && !wissel && sessie);
+    },
+    /** Vanuit showApp: eerst de meldingen (hoogstens 8 s), dan "Wat is er nieuw?"; daarna elke 3 minuten en bij terugkeer. */
+    _medStart() {
+        if (!this._medLuistert) {
+            this._medLuistert = true;
+            // v433: tik op een melding van het bureel op de gsm (APK 1.248) = meteen kijken en het kaartje tonen
+            try { if (window.QENative) QENative.op('melding', (d) => { if (d && d.data && d.data.soort === 'mededeling') this._medControle().catch(() => {}); }); } catch (_e) {}
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) this._medUitgesteld = {};   // v435: terug in de app = een open vraag komt weer
+                if (document.hidden || Date.now() - (this._medLaatst || 0) < 20000) return;
+                this._medControle().catch(() => {});
+            });
+        }
+        clearInterval(this._medInterval);
+        this._medInterval = setInterval(() => { if (!document.hidden) this._medControle().catch(() => {}); }, this._MED_POLL_MS);
+        clearTimeout(this._medT);
+        this._medT = setTimeout(() => {
+            let gedaan = false;
+            const verder = () => { if (gedaan) return; gedaan = true; try { this._nieuwPlan(); } catch (_e) {} };
+            setTimeout(verder, 8000);
+            this._medControle().then(verder, verder);
+        }, 1200);
+    },
+    async _medControle() {
+        if (!this._medKanVragen()) { this._medActief = []; this._medBalkTekenen(); return; }
+        if (this._medVraagt) return;
+        this._medVraagt = true;
+        this._medLaatst = Date.now();
+        let j = null;
+        try {
+            const s = RobawsAPI.sessieLees();
+            const rol = this._nieuwRollen().join(',');
+            const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/app-meldingen?rol=' + encodeURIComponent(rol),
+                { headers: { 'X-App-Sessie': s.token } }, 10000);
+            try { j = await r.json(); } catch (_e) {}
+            if (!r.ok || !j || !j.ok || !Array.isArray(j.items)) j = null;   // oude Worker (404) of verlopen sessie (401): niets tonen
+        } catch (_e) { j = null; }
+        finally { this._medVraagt = false; }
+        if (!j || !this._medKanVragen()) return;
+        this._medAfzender = !!j.afzender;
+        this._medNativeZet();
+        this._medKaartBij();
+        this._medActief = j.items;
+        // al gelezen op een ander toestel: ook hier onthouden
+        const gelezen = this._medLijstLees('gelezen');
+        let bij = false;
+        j.items.forEach((m) => { if (m.l && gelezen.indexOf(String(m.id)) < 0) { gelezen.push(String(m.id)); bij = true; } });
+        if (bij) this._medLijstZet('gelezen', gelezen);
+        this._medBalkTekenen();
+        this._medBevestig();
+        const nieuw = j.items.filter((m) => this._medMoetTonen(m, gelezen));
+        if (nieuw.length) this._medToon(0);
+    },
+    /** Een nieuwe melding tonen zodra er niets anders open staat (en niet midden in het typen). */
+    _medToon(poging) {
+        clearTimeout(this._medToonT);
+        if (!this._medKanVragen() || document.getElementById('medVenster')) return;
+        if (this._medBezigScherm()) {
+            if (poging < 300) this._medToonT = setTimeout(() => this._medToon(poging + 1), 2000);   // hoogstens 10 minuten wachten
+            return;
+        }
+        const gelezen = this._medLijstLees('gelezen');
+        const nu = Date.now();
+        const nog = (this._medActief || []).filter((m) => this._medMoetTonen(m, gelezen) && Number(m.tot) > nu);
+        if (nog.length) this.openMelding({ items: nog });
+    },
+    /**
+     * v435 (vraag Levi 16 okt 2026: "Ik wil ook dat er bij meldingen een bevestiging gevraagd kan worden"; per melding Geen |
+     * Verplicht bevestigen | Ja/Nee-vraag, Worker v565): een melding komt (terug) zolang ze ongelezen is of zolang de Worker zegt dat
+     * deze werknemer nog moet antwoorden (m.vraag). "Later" zet een open vraag opzij tot de app opnieuw opent of terug op de voorgrond komt.
+     */
+    _medMoetTonen(m, gelezen) {
+        if (!m || !m.id) return false;
+        if ((gelezen || this._medLijstLees('gelezen')).indexOf(String(m.id)) < 0) return true;
+        return !!m.vraag && !(this._medUitgesteld && this._medUitgesteld[m.id]);
+    },
+    _medBezigScherm() {
+
+        if (document.hidden) return true;
+        const login = document.getElementById('loginScreen');
+        if (login && !login.classList.contains('hidden')) return true;
+        if (this._gsm) return true;                                  // de webshop in de app
+        if (this._pullRefreshOverlayOpen()) return true;             // een venster, het km-formulier, een betaling, ...
+        const a = document.activeElement;
+        if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable)) return true;
+        return false;
+    },
+    /** opts.items = de meldingen; opts.alles = vanuit de strook op de planning (knop "Sluiten"). */
+    openMelding(opts) {
+        opts = opts || {};
+        const items = (opts.items || []).filter((m) => m && m.id);
+        if (!items.length) return;
+        const oud = document.getElementById('medVenster');
+        if (oud) oud.remove();
+        this._medOpen = { items, alles: !!opts.alles };
+        const el = document.createElement('div');
+        el.id = 'medVenster';
+        el.setAttribute('role', 'dialog');
+        el.setAttribute('aria-modal', 'true');
+        el.setAttribute('aria-labelledby', 'medTitel');
+        el.setAttribute('data-overlay', '1');
+        el.className = 'nw nw-c nw-med';
+        el.innerHTML = this._medHtml();
+        document.body.appendChild(el);
+        try { const k = el.querySelector('.nw-c-kaart'); if (k) { k.setAttribute('tabindex', '-1'); k.focus({ preventScroll: true }); } } catch (_e) {}   // focus op het venster (schermlezer), geen rand op de knop
+        if (!opts.alles) { try { if (window.QEMarble && QEMarble.haptic) QEMarble.haptic('success'); } catch (_e) {} }
+    },
+    /** Sluiten = gelezen (ook via de terugknop); tikken naast het kaartje sluit bewust niet. */
+    medSluit() {
+        const o = this._medOpen;
+        const el = document.getElementById('medVenster');
+        if (el) el.remove();
+        this._medOpen = null;
+        if (o && o.items) {
+            if (!this._medUitgesteld) this._medUitgesteld = {};
+            o.items.forEach((m) => { if (m.vraag) this._medUitgesteld[m.id] = Date.now(); });   // v435: "Later"
+            this._medGelezen(o.items.map((m) => String(m.id)));
+        }
+        this._medBalkTekenen();
+        try { this._nieuwPlan(); } catch (_e) {}   // moest "Wat is er nieuw?" nog komen, dan kan het nu
+    },
+    _medGelezen(ids, zonderWorker) {
+        const gelezen = this._medLijstLees('gelezen');
+        const rij = this._medLijstLees('rij');
+        ids.forEach((id) => {
+            if (gelezen.indexOf(id) >= 0) return;
+            gelezen.push(id);
+            if (!zonderWorker) rij.push(id);
+        });
+        this._medLijstZet('gelezen', gelezen);
+        this._medLijstZet('rij', rij);
+        this._medBevestig();
+        // v433: gelezen = ook de melding op de gsm weg (APK 1.248, tag med_<id>)
+        try { if (window.QENative && QENative.versie() >= 5) ids.forEach((id) => QENative.annuleerMelding('med_' + id)); } catch (_e) {}
+    },
+    /** Wat gelezen is maar nog niet bij de Worker staat, doorsturen (de afzender ziet wie las). */
+    async _medBevestig() {
+        const rij = this._medLijstLees('rij');
+        if (!rij.length || this._medBevestigt || !this._medKanVragen()) return;
+        this._medBevestigt = true;
+        const deel = rij.slice(0, 20);
+        try {
+            const s = RobawsAPI.sessieLees();
+            const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/app-melding-gelezen', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Sessie': s.token }, body: JSON.stringify({ ids: deel }),
+            }, 10000);
+            if (r.ok || r.status === 400) this._medLijstZet('rij', this._medLijstLees('rij').filter((id) => deel.indexOf(id) < 0));
+        } catch (_e) {}
+        finally { this._medBevestigt = false; }
+    },
+    _medHtml() {
+        const o = this._medOpen || { items: [] };
+        const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+        const n = o.items.length;
+        const label = n === 1 ? 'Melding · ' + this._medTijd(o.items[0].t) : n + ' meldingen';
+        const groot = n === 1 && String(o.items[0].tekst || '').length <= 90;
+        const items = o.items.map((m) => '<div class="nw-med-item" data-med-id="' + esc(m.id) + '">'
+            + '<p class="nw-med-tekst' + (groot ? ' groot' : '') + '">' + esc(m.tekst) + '</p>'
+            + '<div class="nw-med-van">' + esc(m.door || 'Het bureel') + (n > 1 ? ' · ' + esc(this._medTijd(m.t)) : '') + '</div>'
+            + this._medAntwHtml(m) + '</div>').join('');
+        const open = o.items.some((m) => m.vraag);   // v435: nog een antwoord nodig = "Later" in plaats van Begrepen
+        return '<div class="nw-scrim"></div>'
+            + '<div class="nw-c-kaart"><div class="nw-lijn"></div>'
+            + '<div class="nw-c-kop"><h2 id="medTitel" class="nw-label">' + esc(label) + '</h2></div>'
+            + '<div class="nw-c-lijst">' + items + '</div>'
+            + '<div class="nw-voet"><button type="button" class="btn ' + (open ? 'btn-outline' : 'btn-primary') + ' btn-full" data-nw-focus onclick="app.medSluit()">'
+            + (o.alles ? 'Sluiten' : (open ? 'Later' : 'Begrepen')) + '</button></div></div>';
+    },
+    /** v435: het antwoordblok onder een melding die een bevestiging of een Ja/Nee vraagt (niet voor de afzender zelf). */
+    _medAntwHtml(m) {
+        const bev = m.bev === 'bevestig' || m.bev === 'janee' ? m.bev : '';
+        if (!bev || !(m.vraag || m.a)) return '';
+        const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+        const id = esc(m.id);
+        const bezig = this._medAntwoordt === m.id;
+        const fout = m._fout ? '<div class="med-antw-fout" role="alert">' + esc(m._fout) + '</div>' : '';
+        if (bev === 'bevestig') {
+            if (m.a === 'ok') return '<div class="med-antw"><div class="med-antw-ok">' + this.icon('check', { size: 16 }) + ' Bevestigd</div></div>';
+            return '<div class="med-antw"><div class="med-antw-vraag">Het bureel vraagt je dit te bevestigen.</div>'
+                + '<button type="button" class="btn btn-primary btn-full med-bevestig"' + (bezig ? ' disabled' : '') + ' onclick="app.medAntwoord(\'' + id + '\', \'ok\')">'
+                + (bezig ? 'Bewaren…' : 'Ik bevestig') + '</button>' + fout + '</div>';
+        }
+        const opm = m._opm != null ? m._opm : (m.o || '');
+        const knop = (w, tekst) => '<button type="button" class="med-jn' + (m.a === w ? ' aan' : '') + '" aria-pressed="' + (m.a === w ? 'true' : 'false') + '"'
+            + (bezig ? ' disabled' : '') + ' onclick="app.medAntwoord(\'' + id + '\', \'' + w + '\')">' + tekst + '</button>';
+        return '<div class="med-antw"><div class="med-antw-vraag">' + (m.a ? 'Je antwoordde <b>' + (m.a === 'ja' ? 'Ja' : 'Nee') + '</b>. Wijzigen kan nog.' : 'Het bureel vraagt een antwoord.') + '</div>'
+            + '<div class="med-jn-rij">' + knop('ja', 'Ja') + knop('nee', 'Nee') + '</div>'
+            + '<input type="text" class="form-input med-opm" data-med-opm="' + id + '" maxlength="140" placeholder="Opmerking (niet verplicht)" value="' + esc(opm) + '"'
+            + ' oninput="app.medOpmTik(\'' + id + '\', this.value)" aria-label="Opmerking bij je antwoord">'
+            + (m.a && opm !== (m.o || '') ? '<div class="med-antw-hint">Tik opnieuw op Ja of Nee om je opmerking te bewaren.</div>' : '')
+            + fout + '</div>';
+    },
+    medOpmTik(id, w) {
+        const m = ((this._medOpen && this._medOpen.items) || []).find((x) => String(x.id) === String(id));
+        if (m) m._opm = String(w || '').slice(0, 140);
+    },
+    /** v435: bevestigen ('ok') of Ja/Nee bewaren in de Worker (app-melding-antwoord). Lukt het niet, dan blijft het kaartje staan. */
+    async medAntwoord(id, a) {
+        const o = this._medOpen;
+        const m = ((o && o.items) || []).find((x) => String(x.id) === String(id));
+        if (!m || this._medAntwoordt) return;
+        const opm = m.bev === 'janee' ? String(m._opm != null ? m._opm : (m.o || '')).replace(/\s+/g, ' ').trim().slice(0, 140) : '';
+        this._medAntwoordt = m.id;
+        m._fout = '';
+        this._medHerteken();
+        let j = null, fout = '';
+        try {
+            const s = RobawsAPI.sessieLees();
+            if (!s) fout = 'Je aanmelding is verlopen. Meld je opnieuw aan en probeer het dan nog eens.';
+            else {
+                const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/app-melding-antwoord', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Sessie': s.token }, body: JSON.stringify({ id: m.id, a, o: opm }),
+                }, 12000);
+                try { j = await r.json(); } catch (_e) {}
+                if (!r.ok || !j || !j.ok) fout = r.status === 401 ? 'Je aanmelding is verlopen. Meld je opnieuw aan en probeer het dan nog eens.'
+                    : ((j && j.error) || ('Bewaren mislukte (' + r.status + '). Probeer opnieuw.'));
+            }
+        } catch (_e) { fout = 'Geen verbinding: je antwoord is niet bewaard. Probeer opnieuw.'; }
+        finally { this._medAntwoordt = null; }
+        if (fout) { m._fout = fout; this._medHerteken(); return; }
+        const zet = (x) => { x.a = j.a; x.o = j.o || ''; x.vraag = false; x.l = true; x._opm = null; x._fout = ''; };
+        zet(m);
+        (this._medActief || []).forEach((x) => { if (String(x.id) === String(m.id)) zet(x); });
+        this._medGelezen([String(m.id)], true);   // de Worker zette ze al op gelezen
+        try { if (window.QEMarble && QEMarble.haptic) QEMarble.haptic('success'); } catch (_e) {}
+        this._medHerteken();
+        this._medBalkTekenen();
+    },
+    _medHerteken() {
+        const el = document.getElementById('medVenster');
+        if (!el || !this._medOpen) return;
+        const lijst = el.querySelector('.nw-c-lijst');
+        const scroll = lijst ? lijst.scrollTop : 0;
+        el.innerHTML = this._medHtml();
+        const nieuw = el.querySelector('.nw-c-lijst');
+        if (nieuw) nieuw.scrollTop = scroll;
+    },
+    _medDag(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); },
+    /** "vandaag 14:02", "gisteren 09:15", "ma 6 okt 14:02" */
+    _medTijd(ms) {
+        const d = new Date(Number(ms) || 0);
+        if (!(d.getTime() > 0)) return '';
+        const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        const v = Math.round((this._medDag(new Date()) - this._medDag(d)) / 86400000);
+        if (v === 0) return 'vandaag ' + hm;
+        if (v === 1) return 'gisteren ' + hm;
+        return ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'][d.getDay()] + ' ' + d.getDate() + ' '
+            + ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'][d.getMonth()] + ' ' + hm;
+    },
+    /** "vandaag", "morgen", "vrijdag 17 oktober" */
+    _medTotTekst(ms) {
+        const d = new Date(Number(ms) || 0);
+        const v = Math.round((this._medDag(d) - this._medDag(new Date())) / 86400000);
+        if (v === 0) return 'vandaag';
+        if (v === 1) return 'morgen';
+        return ['zondag', 'maandag', 'dinsdag', 'woensdag', 'donderdag', 'vrijdag', 'zaterdag'][d.getDay()] + ' ' + d.getDate() + ' '
+            + ['januari', 'februari', 'maart', 'april', 'mei', 'juni', 'juli', 'augustus', 'september', 'oktober', 'november', 'december'][d.getMonth()];
+    },
+    /** De strook bovenaan de planning: de actieve meldingen (hoogstens twee, nieuwste eerst). */
+    _medBalkTekenen() {
+        const el = document.getElementById('medBalk');
+        if (!el) return;
+        const nu = Date.now();
+        const lijst = (this._medKanVragen() ? (this._medActief || []) : []).filter((m) => Number(m.tot) > nu);
+        if (!lijst.length) { el.classList.remove('aan'); el.innerHTML = ''; return; }
+        const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+        const gelezen = this._medLijstLees('gelezen');
+        let h = lijst.slice(0, 2).map((m) => '<button type="button" class="med-rij" onclick="app.medBalkOpen()">'
+            + '<span class="med-icoon">' + this.icon('megafoon', { size: 20 }) + '</span>'
+            + '<span class="med-inhoud"><span class="med-tekst">' + esc(m.tekst) + '</span>'
+            + '<span class="med-van">' + esc(m.door || 'Het bureel') + ' · ' + esc(this._medTijd(m.t)) + (m.vraag ? ' · <b class="med-vraagt">' + (m.bev === 'janee' ? 'antwoord gevraagd' : 'bevestiging gevraagd') + '</b>' : '') + '</span></span>'
+            + (gelezen.indexOf(String(m.id)) < 0 || m.vraag ? '<span class="med-stip" title="' + (m.vraag ? 'Antwoord gevraagd' : 'Nieuw') + '"></span>' : '')
+            + '</button>').join('');
+        if (lijst.length > 2) {
+            const rest = lijst.length - 2;
+            h += '<button type="button" class="med-rij" onclick="app.medBalkOpen()"><span class="med-inhoud"><span class="med-van">En nog '
+                + rest + (rest === 1 ? ' melding' : ' meldingen') + '</span></span></button>';
+        }
+        el.innerHTML = h;
+        el.classList.add('aan');
+    },
+    medBalkOpen() {
+        const nu = Date.now();
+        const lijst = (this._medActief || []).filter((m) => Number(m.tot) > nu);
+        if (lijst.length) this.openMelding({ items: lijst, alles: true });
+    },
+
+    // ---------- versturen (Organisatie → Meldingen, alleen een afzender) ----------
+    _MED_TOT: [['vandaag', 'Vandaag', 0], ['morgen', 'Morgen', 1], ['3d', '3 dagen', 2], ['week', '1 week', 6]],
+    _MED_DOEL: [['iedereen', 'Iedereen'], ['monteur', 'Monteurs'], ['technieker', 'Techniekers'], ['bureel', 'Bureel']],
+    // v435: bevestiging vragen (Worker v565)
+    _MED_BEV: [['geen', 'Nee', 'Je collega\'s tikken op Begrepen.'],
+        ['bevestig', 'Bevestigen', 'Je collega\'s tikken op Ik bevestig. Tot dan komt de melding terug als ze de app openen.'],
+        ['janee', 'Ja of Nee', 'Schrijf je melding als vraag. Je collega\'s antwoorden Ja of Nee, met een opmerking als ze willen.']],
+    openMeldingen() { this.navigate('screenMeldingen', true); },
+    _medKaartBij() {
+        const k = document.getElementById('orgKaartMeldingen');
+        if (k) k.style.display = this._medAfzender ? '' : 'none';
+    },
+    /** Einde van de gekozen dag (23:59:59), in de tijd van het toestel. */
+    _medTotMs(k) {
+        const r = this._MED_TOT.find((x) => x[0] === k) || this._MED_TOT[0];
+        const d = new Date();
+        d.setHours(23, 59, 59, 999);
+        d.setDate(d.getDate() + r[2]);
+        return d.getTime();
+    },
+    _medDoelTekst(doel) {
+        const d = Array.isArray(doel) && doel.length ? doel : ['iedereen'];
+        if (d.indexOf('iedereen') >= 0) return 'iedereen';
+        const naam = { monteur: 'de monteurs', technieker: 'de techniekers', bureel: 'het bureel' };
+        const l = d.map((x) => naam[x] || x);
+        return l.length > 1 ? l.slice(0, -1).join(', ') + ' en ' + l[l.length - 1] : l[0];
+    },
+    loadMeldingen() {
+        if (!this._medForm) this._medForm = { doel: ['iedereen'], tot: 'vandaag', bev: 'geen', kid: '' };
+        this._medFormTekenen();
+        this.medTekstTel(true);
+        this._medBeheerLaden();
+    },
+    _medFormTekenen() {
+        const f = this._medForm;
+        if (!f) return;
+        const chip = (aan, actie, tekst) => '<button type="button" class="dp-chip' + (aan ? ' aan' : '') + '" aria-pressed="' + (aan ? 'true' : 'false') + '" onclick="' + actie + '">' + tekst + '</button>';
+        const doel = document.getElementById('medDoel');
+        if (doel) doel.innerHTML = this._MED_DOEL.map((d) => chip(f.doel.indexOf(d[0]) >= 0, "app.medDoelKies('" + d[0] + "')", d[1])).join('');
+        const tot = document.getElementById('medTot');
+        if (tot) tot.innerHTML = this._MED_TOT.map((t) => chip(f.tot === t[0], "app.medTotKies('" + t[0] + "')", t[1])).join('');
+        const tt = document.getElementById('medTotTekst');
+        if (tt) tt.textContent = 'Zichtbaar tot en met ' + this._medTotTekst(this._medTotMs(f.tot)) + ', 23:59.';
+        const bev = document.getElementById('medBev');
+        if (bev) bev.innerHTML = this._MED_BEV.map((b) => chip((f.bev || 'geen') === b[0], "app.medBevKies('" + b[0] + "')", b[1])).join('');
+        const bt = document.getElementById('medBevTekst');
+        if (bt) bt.textContent = (this._MED_BEV.find((b) => b[0] === (f.bev || 'geen')) || this._MED_BEV[0])[2];
+    },
+    medBevKies(k) {
+        if (!this._medForm) return;
+        this._medForm.bev = this._MED_BEV.some((b) => b[0] === k) ? k : 'geen';
+        this._medForm.kid = '';
+        this._medFormTekenen();
+    },
+    medDoelKies(d) {
+        const f = this._medForm;
+        if (!f) return;
+        if (d === 'iedereen') f.doel = ['iedereen'];
+        else {
+            let l = f.doel.filter((x) => x !== 'iedereen');
+            l = l.indexOf(d) >= 0 ? l.filter((x) => x !== d) : l.concat([d]);
+            if (!l.length || l.length >= 3) l = ['iedereen'];
+            f.doel = this._MED_DOEL.map((x) => x[0]).filter((x) => l.indexOf(x) >= 0);
+        }
+        f.kid = '';
+        this._medFormTekenen();
+    },
+    medTotKies(k) {
+        if (!this._medForm) return;
+        this._medForm.tot = k;
+        this._medForm.kid = '';
+        this._medFormTekenen();
+    },
+    medTekstTel(alleenTellen) {
+        const t = document.getElementById('medTekst');
+        const n = document.getElementById('medTeller');
+        if (t && n) n.textContent = t.value.length + ' / 500';
+        if (!alleenTellen && this._medForm) this._medForm.kid = '';   // andere tekst = een nieuwe melding
+    },
+    async medVerstuur() {
+        const f = this._medForm;
+        if (!f || this._medVerstuurt) return;
+        const t = document.getElementById('medTekst');
+        const fout = document.getElementById('medFout');
+        const knop = document.getElementById('btnMedVerstuur');
+        const zetFout = (x) => { if (fout) { fout.textContent = x || ''; fout.style.display = x ? '' : 'none'; } };
+        const tekst = String((t && t.value) || '').trim();
+        if (!tekst) { zetFout('Typ eerst wat je wil laten weten.'); try { t.focus(); } catch (_e) {} return; }
+        zetFout('');
+        const tot = this._medTotMs(f.tot);
+        const ja = await QEClock._showConfirmModal('Melding versturen?',
+            'Voor <b>' + this.escapeHtml(this._medDoelTekst(f.doel)) + '</b>, zichtbaar tot en met ' + this.escapeHtml(this._medTotTekst(tot))
+            + (f.bev === 'bevestig' ? ', <b>bevestiging gevraagd</b>' : (f.bev === 'janee' ? ', <b>Ja of Nee gevraagd</b>' : '')) + ':<br><br>'
+            + this.escapeHtml(tekst).replace(/\n/g, '<br>'), 'Versturen', 'Annuleren');
+        if (!ja || this._medVerstuurt) return;
+        if (!f.kid) f.kid = 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        this._medVerstuurt = true;
+        if (knop) { knop.disabled = true; knop.textContent = 'Versturen…'; }
+        let res = null;
+        try {
+            const s = RobawsAPI.sessieLees();
+            if (!s) zetFout('Je aanmelding is verlopen. Meld je opnieuw aan en probeer het dan nog eens.');
+            else {
+                const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/app-melding-zet', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Sessie': s.token },
+                    body: JSON.stringify({ tekst, doel: f.doel, tot, kid: f.kid, bev: f.bev && f.bev !== 'geen' ? f.bev : undefined }),
+                }, 15000);
+                let j = null;
+                try { j = await r.json(); } catch (_e) {}
+                if (r.ok && j && j.ok && j.item) res = j;
+                else if (r.status === 401) zetFout('Je aanmelding is verlopen. Meld je opnieuw aan en probeer het dan nog eens.');
+                else if (r.status === 404) zetFout('De Worker kent de meldingen nog niet: plak eerst Worker v502.');
+                else zetFout((j && j.error) || ('Versturen mislukte (' + r.status + '). Probeer opnieuw.'));
+            }
+        } catch (_e) {
+            zetFout('Geen verbinding: je melding is niet verstuurd. Probeer opnieuw.');
+        } finally {
+            this._medVerstuurt = false;
+            if (knop) { knop.disabled = false; knop.textContent = 'Melding versturen'; }
+        }
+        if (!res) return;
+        // terug naar de standaard (iedereen, vandaag): een volgende melding gaat nooit per ongeluk naar een kleinere groep
+        f.kid = '';
+        f.doel = ['iedereen'];
+        f.tot = 'vandaag';
+        f.bev = 'geen';
+        this._medFormTekenen();
+        if (t) t.value = '';
+        this.medTekstTel(true);
+        this._medGelezen([String(res.item.id)], true);   // de afzender las ze al (de Worker weet dat)
+        this.toast(res.dubbel ? 'Deze melding was al verstuurd' : 'Melding verstuurd');
+        this._medBeheerLaden();
+        this._medControle().catch(() => {});             // de strook bovenaan de planning bijwerken
+    },
+    async _medBeheerLaden() {
+        const box = document.getElementById('medLijst');
+        if (!box) return;
+        if (!this._medBeheer) box.innerHTML = '<div class="spinner"></div>';
+        let j = null, fout = '';
+        try {
+            const s = RobawsAPI.sessieLees();
+            if (!s) fout = 'Je aanmelding is verlopen. Meld je opnieuw aan.';
+            else {
+                const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/app-meldingen-beheer', { headers: { 'X-App-Sessie': s.token } }, 12000);
+                try { j = await r.json(); } catch (_e) {}
+                if (r.status === 403) fout = (j && j.error) || 'Meldingen sturen kan alleen vanuit het account dat dat mag.';
+                else if (r.status === 404) fout = 'De Worker kent de meldingen nog niet: plak eerst Worker v502.';
+                else if (!r.ok || !j || !j.ok || !Array.isArray(j.items)) fout = 'De lijst kon niet geladen worden. Tik op Vernieuwen.';
+            }
+        } catch (_e) { fout = 'Geen verbinding. Tik op Vernieuwen.'; }
+        if (fout) { this._medBeheer = null; box.innerHTML = '<div class="med-leeg">' + this.escapeHtml(fout) + '</div>'; return; }
+        this._medBeheer = j.items;
+        let emps = [];
+        try { emps = await RobawsAPI.getActiveEmployees(); } catch (_e) {}
+        this._medEmps = (emps || []).filter((e) => e && e.email && e.employeeId != null);
+        this._medBeheerTekenen();
+    },
+    _medBeheerTekenen() {
+        const box = document.getElementById('medLijst');
+        if (!box) return;
+        const lijst = this._medBeheer || [];
+        if (!lijst.length) { box.innerHTML = '<div class="med-leeg">Nog geen meldingen verstuurd.</div>'; return; }
+        const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+        const nu = Date.now();
+        box.innerHTML = lijst.map((m) => {
+            const actief = !m.weg && Number(m.tot) > nu;
+            const stand = m.weg ? ['weg', 'Ingetrokken'] : (actief ? ['actief', 'Actief'] : ['voorbij', 'Verlopen']);
+            const wanneer = m.weg ? 'ingetrokken ' + this._medTijd(m.weg) : (actief ? 'zichtbaar tot en met ' : 'zichtbaar tot ') + this._medTotTekst(m.tot);
+            const meta = 'Voor ' + this._medDoelTekst(m.doel) + ' · ' + wanneer + ' · verstuurd ' + this._medTijd(m.t) + (m.door ? ' door ' + m.door : '')
+                + (m.bev === 'bevestig' ? ' · bevestiging gevraagd' : (m.bev === 'janee' ? ' · Ja/Nee-vraag' : ''));
+            const lz = this._medLezersInfo(m);
+            return '<div class="card med-kaart">'
+                + '<div class="med-k-tekst">' + esc(m.tekst) + '</div>'
+                + '<div class="med-k-meta">' + esc(meta) + '</div>'
+                + '<div class="med-k-stand"><span class="med-k-pil ' + stand[0] + '">' + stand[1] + '</span>'
+                + (lz ? '<button type="button" class="med-k-gelezen" aria-expanded="false" onclick="app.medLezersKlap(this)">' + esc(lz.kop) + '</button>' : '')
+                + '</div>'
+                + (lz ? '<div class="med-k-lezers">' + lz.html + '</div>' : '')
+                + (actief ? '<div class="med-k-knoppen"><button type="button" class="med-k-weg" onclick="app.medIntrekken(\'' + esc(m.id) + '\')">Intrekken</button></div>' : '')
+                + '</div>';
+        }).join('');
+    },
+    /** "Gelezen door 3 van 20" + wie wel en wie nog niet (de doelgroep = actieve werknemers met een e-mailadres, zonder de afzender). */
+    _medLezersInfo(m) {
+        if (!Array.isArray(m.lezers)) return null;
+        const doel = Array.isArray(m.doel) && m.doel.length ? m.doel : ['iedereen'];
+        const iedereen = doel.indexOf('iedereen') >= 0;
+        const afz = String(m.f || '');
+        const las = {};
+        m.lezers.forEach((x) => { if (x && x.f != null) las[String(x.f)] = Number(x.t) || 1; });
+        const doelEmps = (this._medEmps || []).filter((e) => String(e.employeeId) !== afz && (iedereen || doel.indexOf(e.role) >= 0));
+        const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+        if (!doelEmps.length) {
+            const n = Object.keys(las).filter((f) => f !== afz).length;
+            if (m.bev === 'bevestig' || m.bev === 'janee') {   // v435: zonder werknemerslijst alleen tellen
+                const lz = m.lezers.filter((x) => x && String(x.f) !== afz);
+                const tel = (w) => lz.filter((x) => x.a === w).length;
+                return { kop: m.bev === 'bevestig' ? 'Bevestigd door ' + tel('ok') + (tel('ok') === 1 ? ' collega' : ' collega\'s') : 'Ja ' + tel('ja') + ' · Nee ' + tel('nee'),
+                    html: '<div>De lijst van de werknemers kon niet geladen worden.</div>' };
+            }
+            return { kop: 'Gelezen door ' + n + (n === 1 ? ' collega' : ' collega\'s'), html: '<div>De lijst van de werknemers kon niet geladen worden.</div>' };
+        }
+        if (m.bev === 'bevestig' || m.bev === 'janee') return this._medAntwInfo(m, doelEmps);   // v435
+        const wel = doelEmps.filter((e) => las[String(e.employeeId)]).sort((a, b) => las[String(a.employeeId)] - las[String(b.employeeId)]);
+        const niet = doelEmps.filter((e) => !las[String(e.employeeId)]);
+        const html = (wel.length ? '<div><b>Gelezen:</b> ' + wel.map((e) => esc(e.name) + ' (' + esc(this._medTijd(las[String(e.employeeId)])) + ')').join(', ') + '</div>' : '<div>Nog niemand heeft ze gelezen.</div>')
+            + (niet.length ? '<div style="margin-top:4px"><b>Nog niet gelezen:</b> ' + niet.map((e) => esc(e.name)).join(', ') + '</div>' : '<div style="margin-top:4px">Iedereen heeft ze gelezen.</div>');
+        return { kop: 'Gelezen door ' + wel.length + ' van ' + doelEmps.length, html };
+    },
+    /** v435: verplicht bevestigen = wie bevestigde (met tijdstip), wie las maar nog niet bevestigde, wie nog niets las;
+     *  Ja/Nee = per antwoord de namen (met de opmerking) en wie nog niet antwoordde. */
+    _medAntwInfo(m, doelEmps) {
+        const esc = (x) => this.escapeHtml(String(x == null ? '' : x));
+        const per = {};
+        m.lezers.forEach((x) => { if (x && x.f != null) per[String(x.f)] = x; });
+        const van = (e) => per[String(e.employeeId)] || null;
+        const naam = (e) => esc(e.name);
+        const rij = (titel, lijst, fn) => lijst.length ? '<div class="med-k-rij"><b>' + titel + ' (' + lijst.length + '):</b> ' + lijst.map(fn).join(', ') + '</div>' : '';
+        const opTijd = (a, b) => (Number(van(a).at) || 0) - (Number(van(b).at) || 0);
+        if (m.bev === 'bevestig') {
+            const ok = doelEmps.filter((e) => van(e) && van(e).a === 'ok').sort(opTijd);
+            const las = doelEmps.filter((e) => van(e) && van(e).a !== 'ok');
+            const niet = doelEmps.filter((e) => !van(e));
+            const html = rij('Bevestigd', ok, (e) => naam(e) + ' (' + esc(this._medTijd(van(e).at)) + ')')
+                + rij('Gelezen, nog niet bevestigd', las, naam) + rij('Nog niet gelezen', niet, naam)
+                + (ok.length === doelEmps.length ? '<div class="med-k-rij">Iedereen heeft bevestigd.</div>' : '');
+            return { kop: 'Bevestigd door ' + ok.length + ' van ' + doelEmps.length, html };
+        }
+        const ja = doelEmps.filter((e) => van(e) && van(e).a === 'ja').sort(opTijd);
+        const nee = doelEmps.filter((e) => van(e) && van(e).a === 'nee').sort(opTijd);
+        const nog = doelEmps.filter((e) => !van(e) || (van(e).a !== 'ja' && van(e).a !== 'nee'));
+        const metOpm = (e) => naam(e) + (van(e).o ? ' <span class="med-k-opm">(' + esc(van(e).o) + ')</span>' : '');
+        const html = rij('Ja', ja, metOpm) + rij('Nee', nee, metOpm) + rij('Nog geen antwoord', nog, naam)
+            + (!nog.length ? '<div class="med-k-rij">Iedereen heeft geantwoord.</div>' : '');
+        return { kop: 'Ja ' + ja.length + ' · Nee ' + nee.length + ' · nog niet ' + nog.length, html };
+    },
+    medLezersKlap(knop) {
+
+        const box = knop && knop.parentElement && knop.parentElement.nextElementSibling;
+        if (!box || !box.classList.contains('med-k-lezers')) return;
+        const open = box.classList.toggle('open');
+        knop.classList.toggle('open', open);
+        knop.setAttribute('aria-expanded', open ? 'true' : 'false');
+    },
+    async medIntrekken(id) {
+        const m = (this._medBeheer || []).find((x) => x.id === id);
+        if (!m) return;
+        const ja = await QEClock._showConfirmModal('Melding intrekken?',
+            'Je collega\'s zien ze daarna niet meer:<br><br>' + this.escapeHtml(m.tekst).replace(/\n/g, '<br>'), 'Intrekken', 'Annuleren');
+        if (!ja) return;
+        try {
+            const s = RobawsAPI.sessieLees();
+            const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/app-melding-weg', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Sessie': s ? s.token : '' }, body: JSON.stringify({ id }),
+            }, 12000);
+            let j = null;
+            try { j = await r.json(); } catch (_e) {}
+            if (!r.ok || !j || !j.ok) { this.toast((j && j.error) || 'Intrekken mislukte. Probeer opnieuw.', true); return; }
+            this.toast('Melding ingetrokken');
+        } catch (_e) { this.toast('Geen verbinding. Probeer opnieuw.', true); return; }
+        this._medBeheerLaden();
+        this._medControle().catch(() => {});
+    },
+
+    // ============================================================
     // MAANDRECAP (v285 / 1.x v280) — "Spotify-Wrapped"-stories.
     // Data + opslag zit in window.QERecap (js/maand-recap.js); hier
     // enkel de trigger + de UI. De stories zijn zelfstandig (inline
@@ -22708,6 +26213,8 @@ const app = {
         const mag = this._orgMagProjecten();
         const kp = document.getElementById('orgKaartProjecten');
         if (kp) kp.style.display = mag ? '' : 'none';
+        // v428: Meldingen alleen voor wie de Worker als afzender kent (antwoord van de laatste controle)
+        try { this._medKaartBij(); if (this._medAfzender == null) this._medControle({ stil: true }); } catch (_e) {}
         const sub = document.getElementById('orgProjectenSub');
         if (!sub || !mag) return;
         Promise.all([RobawsAPI.getProjectenOverzicht(), RobawsAPI.getActiveEmployees().catch(() => [])]).then(([lijst, emps]) => {

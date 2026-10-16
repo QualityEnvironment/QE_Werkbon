@@ -330,13 +330,23 @@ const RobawsAPI = {
         { key: 'budget',       naam: 'Werknemersbudget', rollen: ['bureel'] },
         { key: 'gasflessen',   naam: 'Gasflessen',       rollen: ['bureel', 'monteur', 'technieker'] },
         { key: 'mijnvoertuig', naam: 'Eigen voertuig',   rollen: ['monteur', 'technieker'] },
+        // v429 (Worker v503): de stock in het magazijn scannen (meenemen, bijbestellen, ontvangen, tellen)
+        { key: 'magazijn',     naam: 'Magazijn (scannen)', rollen: ['bureel', 'monteur', 'technieker'] },
+        // v434 (Worker v564): werkgsm's en tablets. Bureel = alles beheren; monteur/technieker = alleen het eigen toestel bekijken
+        // (standaard uit, per persoon aan te vinken). De Worker beslist zelf wie wat ziet.
+        { key: 'toestellen',   naam: 'Gsm’s & tablets', rollen: ['bureel'] },
+        { key: 'mijntoestel',  naam: 'Eigen gsm/tablet', rollen: ['monteur', 'technieker'] },
     ],
     /** Zonder bewaarde keuze: de standaard van de rol. */
     LOG_STANDAARD: {
-        bureel: ['voertuigen', 'gereedschap', 'budget', 'gasflessen'],
-        monteur: ['gasflessen', 'mijnvoertuig'],
-        technieker: [],
+        bureel: ['voertuigen', 'gereedschap', 'budget', 'gasflessen', 'magazijn', 'toestellen'],
+        monteur: ['gasflessen', 'mijnvoertuig', 'magazijn'],
+        technieker: ['magazijn'],
     },
+    /** v429: staat de stock in gebruik? De Worker (v503) zegt het bij het aanmelden en bij app-rechten: pas als er artikels in de
+     *  stock staan (na "Koppelen" in de magazijnpagina). Zonder antwoord (oudere Worker) = nee: dan geen magazijn in de app. */
+    stockActief() { try { return localStorage.getItem('qe_stock_aan') === '1'; } catch (_e) { return false; } },
+    stockActiefZet(v) { try { localStorage.setItem('qe_stock_aan', v ? '1' : '0'); } catch (_e) { /* stil */ } },
     _logRol(rol) { return (rol === 'bureel' || rol === 'monteur') ? rol : 'technieker'; },
     /** Onderdelen die voor deze rol aan te vinken zijn (vaste volgorde). */
     logistiekDelenMogelijk(rol) {
@@ -367,7 +377,9 @@ const RobawsAPI = {
             try { keuze = JSON.parse(localStorage.getItem('qe_app_logistiek') || 'null'); } catch (_e) {}
             // een keuze van iemand anders op hetzelfde toestel telt niet
             if (keuze && keuze.email && String(keuze.email) !== String(u.email || '').toLowerCase().trim()) keuze = null;
-            return this.logistiekDelenVoor(u.role, keuze);
+            const delen = this.logistiekDelenVoor(u.role, keuze);
+            // v429: het magazijn pas als de stock in gebruik is (anders een leeg scherm voor wie het nog niet nodig heeft)
+            return this.stockActief() ? delen : delen.filter(k => k !== 'magazijn');
         } catch (_e) { return []; }
     },
     magLogistiekDeel(key) { return this.mijnLogistiekDelen().indexOf(String(key)) >= 0; },
@@ -394,7 +406,7 @@ const RobawsAPI = {
         let alg = null;
         try { alg = JSON.parse(localStorage.getItem('qe_api_alg') || 'null'); } catch (_e) {}
         if (!u || !u.email || !alg || !alg.key || !alg.secret) return false;
-        const voor = JSON.stringify([localStorage.getItem('qe_app_tools'), localStorage.getItem('qe_app_logistiek')]);
+        const voor = JSON.stringify([localStorage.getItem('qe_app_tools'), localStorage.getItem('qe_app_logistiek'), localStorage.getItem('qe_stock_aan')]);
         const res = await this._fetchWithTimeout(this.WORKER_AUTH_URL + '/bel-api/app-rechten',
             { headers: { 'X-App-Key': alg.key + ':' + alg.secret } }, 8000);
         if (!res.ok) return false;
@@ -406,12 +418,13 @@ const RobawsAPI = {
         if (j && Array.isArray(j.tools)) localStorage.setItem('qe_app_tools_bekend', JSON.stringify(j.tools.map(t => t.key)));
         if (j && j.gasConfig) this.gasConfigZet(j.gasConfig);   // v403
         if (j && Object.prototype.hasOwnProperty.call(j, 'wwvTag')) this.wwvTagZet(j.wwvTag);   // v417
+        if (j && Object.prototype.hasOwnProperty.call(j, 'stock')) this.stockActiefZet(!!j.stock);   // v429
         // alleen een Worker die de logistiek-keuze kent (v436) mag die bijwerken
         if (j && j.logistiek && j.logistiek.personen) {
             const l = j.logistiek.personen[em];
             this._zetMijnLogistiek(Array.isArray(l) ? { delen: l, bekend: j.logistiek.bekend } : null, em);
         }
-        return JSON.stringify([localStorage.getItem('qe_app_tools'), localStorage.getItem('qe_app_logistiek')]) !== voor;
+        return JSON.stringify([localStorage.getItem('qe_app_tools'), localStorage.getItem('qe_app_logistiek'), localStorage.getItem('qe_stock_aan')]) !== voor;
     },
     TASK_KEYS: { FACTUREN: 'facturen', OPVOLGING: 'opvolging', ARTIKELS: 'artikels', URENAANPASSING: 'urenAanpassing', OFFERTES: 'offertes', KEURINGEN: 'keuringen', URENBEWAKING: 'urenBewaking', MATERIEEL: 'materieel' },
     _taakGebruikers: {},
@@ -3550,6 +3563,7 @@ const RobawsAPI = {
                     } catch (_e) {}
                 }
                 if (wres.ok && wj && Object.prototype.hasOwnProperty.call(wj, 'wwvTag')) this.wwvTagZet(wj.wwvTag);   // v417
+                if (wres.ok && wj && Object.prototype.hasOwnProperty.call(wj, 'stock')) this.stockActiefZet(!!wj.stock);   // v429
                 if (wres.ok && wj.taakOntvangers) {
                     try { localStorage.setItem('qe_taak_ontvangers', JSON.stringify(wj.taakOntvangers)); } catch (_e) {}
                     this._taakOntvangersToepassen(wj.taakOntvangers);
@@ -4129,6 +4143,54 @@ const RobawsAPI = {
      *  (type 34) zijn echte opdrachten met een werkbon (gemeten 6 okt 2026). */
     isWachtPlanning(item) {
         return !!item && item.planningTypeId != null && String(item.planningTypeId) === this.WACHT_TYPE_ID;
+    },
+
+    /** v430: staat het vinkje "Foto's verplicht" (extraveld op de dagplanning, Selectievakje) aan? We zoeken een sleutel
+     *  met "foto" en "verplicht" (schrijfwijze van de apostrof maakt niet uit) en aanvaarden booleanValue of een tekst
+     *  als "ja"/"true"/"1"/"x" (zelfde regel als "Regie monteurs"). */
+    fotosVerplichtUit(ef) {
+        if (!ef || typeof ef !== 'object') return false;
+        for (const k of Object.keys(ef)) {
+            const kl = k.toLowerCase();
+            if (kl.indexOf('foto') < 0 || kl.indexOf('verplicht') < 0) continue;
+            const f = ef[k];
+            if (f === true) return true;
+            if (f && typeof f === 'object' && f.booleanValue === true) return true;
+            const s = String((f && typeof f === 'object' ? (f.stringValue ?? f.value) : f) ?? '').trim().toLowerCase();
+            if (s === 'true' || s === 'ja' || s === '1' || s === 'yes' || s === 'x') return true;
+        }
+        return false;
+    },
+
+    /** v432: de code van het sleutelkluisje op de werf = extraveld "Sleutelkluis code" (Tekst) op het PROJECT. Sleutel met
+     *  "sleutelkluis" erin (hoofdletters maken niet uit); leeg = null. */
+    sleutelkluisUit(ef) {
+        if (!ef || typeof ef !== 'object') return null;
+        for (const k of Object.keys(ef)) {
+            if (k.toLowerCase().indexOf('sleutelkluis') < 0) continue;
+            const f = ef[k];
+            const v = (f && typeof f === 'object') ? (f.stringValue ?? f.value ?? f.integerValue ?? f.decimalValue ?? null) : f;
+            const s = v == null ? '' : String(v).trim();
+            if (s) return s.slice(0, 80);
+        }
+        return null;
+    },
+
+    /** v432: sleutelkluis-code van een project (1 lezing per project, gedeeld door alle dagplanningen; 10 min onthouden). */
+    _kluisCache: {},
+    async projectSleutelkluis(projectId) {
+        if (!projectId) return null;
+        const id = String(projectId);
+        const c = this._kluisCache[id];
+        if (c && (Date.now() - c.at) < 10 * 60 * 1000) return c.p;
+        const p = (async () => {
+            try {
+                const r = await this.get('projects/' + id);
+                return (r && r.code === 200 && r.data) ? this.sleutelkluisUit(r.data.extraFields) : null;
+            } catch (_) { delete this._kluisCache[id]; return null; }
+        })();
+        this._kluisCache[id] = { at: Date.now(), p: p };
+        return p;
     },
 
     /** Wachtweken vanaf maandag van deze week, `wekenVooruit` weken ver.
@@ -5216,11 +5278,13 @@ const RobawsAPI = {
         }
         const dayItems = all.filter(it => ((it.startDate || '') + '').split('T')[0] === date);
         if (!dayItems.length) return 0;
-        const met = await this._getPlanningIdsWithWorkOrders(userId);
+        const met = await this._getPlanningIdsWithWorkOrders(userId, employeeId);   // v423: ook werkbonnen van collega's met jouw uren
         return dayItems.filter(it => !met.has(String(it.id))).length;
     },
 
-    async getPlanning(employeeId, date, userId = null) {
+    /** opts.vers (v423): de werkbonnen LIVE lezen i.p.v. de replica — bij het uitklokken telt ook een werkbon die een
+     *  collega net verstuurde. */
+    async getPlanning(employeeId, date, userId = null, opts = null) {
         // v138: GEEN whitelist meer — elke datum wordt geaccepteerd en strikt
         // gefilterd. Voorheen werd elke datum buiten {gisteren, vandaag, morgen}
         // gereset naar today wat ervoor zorgde dat morgen-chip soms vandaag-
@@ -5279,7 +5343,8 @@ const RobawsAPI = {
         filtered.sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
 
         // Check welke planning items al een werkbon hebben van DEZE gebruiker
-        const planningIdsMetWerkbon = await this._getPlanningIdsWithWorkOrders(userId);
+        // v423: of een werkbon (ook van een collega) met de uren van deze werknemer
+        const planningIdsMetWerkbon = await this._getPlanningIdsWithWorkOrders(userId, employeeId, opts);
 
         // Verrijk elk item met klantgegevens + BTW + ordernummer
         // v183: BTW-tarieven 1x als gecachede map (geen vat-tariffs/{id} per klant).
@@ -5297,6 +5362,7 @@ const RobawsAPI = {
             // v182: regie (timeAndMaterial) staat OP de dagplanning zelf. Primair
             // van het list-item, daarna eventueel overschreven door het detail-item.
             let planRegie = (item.timeAndMaterial === true);
+            let planFotos = this.fotosVerplichtUit(item.extraFields);   // v430: vinkje "Foto's verplicht"
             try {
                 const fullItem = await this.get(`planning-items/${item.id}`);
                 if (fullItem.code === 200 && fullItem.data) {
@@ -5308,6 +5374,7 @@ const RobawsAPI = {
                     // zowel "regie" als "monteur" bevat en accepteren booleanValue of
                     // stringValue ("true"/"ja"/"1"/"x") als aangevinkt.
                     const _ef = fullItem.data.extraFields || item.extraFields || {};
+                    if (fullItem.data.extraFields) planFotos = this.fotosVerplichtUit(fullItem.data.extraFields);
                     for (const _k of Object.keys(_ef)) {
                         const _kl = _k.toLowerCase();
                         if (_kl.includes('regie') && _kl.includes('monteur')) {
@@ -5342,9 +5409,14 @@ const RobawsAPI = {
                 hasWerkbon: hasWerkbon,
                 projectId: item.projectId != null ? String(item.projectId) : null,   // v400: werkpakket-keuze (nacalculatie)
                 timeAndMaterial: planRegie,   // v182: regie komt ENKEL van de dagplanning
+                fotosVerplicht: planFotos,    // v430: werkbon pas versturen met minstens één foto
                 client: null,
                 endClient: null,  // v102+: ook eindklant ophalen
+                sleutelkluis: null,   // v432: code van het sleutelkluisje (extraveld op het project)
             };
+            if (entry.projectId) {
+                try { entry.sleutelkluis = await this.projectSleutelkluis(entry.projectId); } catch (_) {}
+            }
 
             // Klant ophalen
             if (item.clientId) {
@@ -5397,22 +5469,32 @@ const RobawsAPI = {
         return { items: enriched, date, employeeId };
     },
 
-    async _getPlanningIdsWithWorkOrders(currentUserId = null) {
+    async _getPlanningIdsWithWorkOrders(currentUserId = null, employeeId = null, opts = null) {
         // Verzamel planningItemIds waarvoor de HUIDIGE GEBRUIKER al een werkbon heeft.
         // Meerdere techniekers kunnen op hetzelfde planning-item een werkbon indienen —
         // een planning-item verdwijnt alleen voor de technieker wiens werkbon eraan
         // gelinkt is (verantwoordelijke = zichzelf).
+        // v423 (vraag Levi 12 okt 2026): OF een werkbon (ook van een collega) met de UREN van deze werknemer — "vanaf dat er
+        // een werkbon bestaat met de uren van een bepaalde werknemer mag deze dagplanning niet meer te zien zijn voor deze
+        // werknemer" (collega's vulden elkaar mee in en daarna nog eens zichzelf = dubbele uren; gemeten 12 okt: 7 keer in 60
+        // dagen, 29,74 u). Daarom de lijst MET uurregels (include=timeEntries — gemeten 12 okt: volledig, ±30 % zwaarder; een
+        // planningItemId-filter bestaat niet op /work-orders). Bijproduct: per dagplanning wie er al uren op heeft
+        // (this._werkbonUren, voor urenOpDagplanning). opts.vers = live lezen (geen replica).
         const ids = new Set();
         const seenWoIds = new Set();
+        const perPlan = {};      // v423: planningItemId → [{ id, nr, userId, uren: { employeeId: uren } }]
+        let volledig = false;    // v423: alleen een volledige scan mag een "al ingevuld" bewijzen
         let offset = 0;
         const PAGE = 100;
+        const leesOpties = (opts && opts.vers) ? { bypassCache: true } : undefined;
 
         try {
             const sinceDate = this._localDateStr(null, -7);
             for (let p = 0; p < 15; p++) {
                 // v200: ?offset= i.p.v. ?page= (Robaws negeert page op /work-orders)
                 // + dedup op id, anders blijf je op dezelfde eerste 100 werkbons hangen.
-                const result = await this.get(`work-orders?limit=${PAGE}&offset=${offset}&sort=createdAt:desc`);
+                const result = await this.get(`work-orders?limit=${PAGE}&offset=${offset}&sort=createdAt:desc&include=timeEntries`, leesOpties);
+                if (!result || result.code !== 200) throw new Error('werkbonnen lezen: ' + (result && result.code));   // v423
                 const items = (result.data && result.data.items) || [];
                 if (items.length === 0) break;
 
@@ -5432,26 +5514,64 @@ const RobawsAPI = {
                     const woDate = wo.date || '';
                     if (woDate && woDate < sinceDate) continue;  // oud: overslaan, niet stoppen
                     if (wo.planningItemId) {
+                        const pid = String(wo.planningItemId);
+                        const woUserId = wo.assignedUserId || (wo.assignedUser && wo.assignedUser.id) || null;
+                        // v423: uren per werknemer op deze werkbon (alleen regels met uren > 0 en een werknemer)
+                        const uren = {};
+                        (Array.isArray(wo.timeEntries) ? wo.timeEntries : []).forEach((t) => {
+                            const h = parseFloat(t && t.hours) || 0;
+                            if (!(h > 0) || t.employeeId == null) return;
+                            const e = String(t.employeeId);
+                            uren[e] = Math.round(((uren[e] || 0) + h) * 100) / 100;
+                        });
+                        (perPlan[pid] = perPlan[pid] || []).push({ id: String(wo.id), nr: wo.logicId || null, userId: woUserId != null ? String(woUserId) : null, uren });
                         // Als we een currentUserId hebben, alleen werkbonnen van deze gebruiker tellen
                         if (currentUserId) {
-                            const woUserId = wo.assignedUserId || (wo.assignedUser && wo.assignedUser.id) || null;
                             if (String(woUserId) === String(currentUserId)) {
-                                ids.add(String(wo.planningItemId));
+                                ids.add(pid);
+                            } else if (employeeId != null && uren[String(employeeId)] > 0) {
+                                ids.add(pid);   // v423: een collega zette jouw uren op zijn werkbon
                             }
                         } else {
                             // Fallback: alle werkbonnen tellen (oorspronkelijk gedrag)
-                            ids.add(String(wo.planningItemId));
+                            ids.add(pid);
                         }
                     }
                 }
-                if (stop) break;
-                if (added === 0) break;
-                if (items.length < PAGE) break;
+                if (stop) { volledig = true; break; }
+                if (added === 0) { volledig = true; break; }
+                if (items.length < PAGE) { volledig = true; break; }
                 offset += PAGE;
             }
         } catch (e) { /* Bij fout: geen filtering, niet erg */ }
 
+        this._werkbonUren = { at: Date.now(), perPlan, volledig };   // v423
         return ids;
+    },
+
+    /** v423: wie heeft al uren op een werkbon van deze dagplanning, volgens de laatste werkbonnen-scan (getPlanning,
+     *  uitklokcontrole)? { employeeId: { uren, nrs: [werkbonnummers], userIds: [verantwoordelijken] } }, of null als er
+     *  geen volledige scan van hoogstens maxOudMs (standaard 2 min) oud is. */
+    urenOpDagplanning(planningItemId, maxOudMs = 120000) {
+        const w = this._werkbonUren;
+        if (!w || !w.volledig || (Date.now() - w.at) > maxOudMs) return null;
+        const uit = {};
+        (w.perPlan[String(planningItemId)] || []).forEach((b) => {
+            Object.keys(b.uren).forEach((e) => {
+                const x = uit[e] || (uit[e] = { uren: 0, nrs: [], userIds: [] });
+                x.uren = Math.round((x.uren + b.uren[e]) * 100) / 100;
+                if (b.nr && x.nrs.indexOf(b.nr) < 0) x.nrs.push(b.nr);
+                if (b.userId && x.userIds.indexOf(b.userId) < 0) x.userIds.push(b.userId);
+            });
+        });
+        return uit;
+    },
+
+    /** v423: zelfde vraag, maar eerst VERS (live) de werkbonnen lezen — vlak voor het versturen van een werkbon.
+     *  null = niet na te kijken (geen verbinding of de scan was niet volledig). */
+    async werkbonUrenVoorDagplanning(planningItemId) {
+        await this._getPlanningIdsWithWorkOrders(null, null, { vers: true });
+        return this.urenOpDagplanning(planningItemId, 60000);
     },
 
     // =============================================
@@ -5888,16 +6008,19 @@ const RobawsAPI = {
         for (const m of materials || []) {
             const li = {
                 type: 'LINE',
-                articleId: toStr(m.articleId),
                 quantity: parseFloat(m.quantity || 1),
                 description: m.name || '',
             };
+            // v424: alleen een echt Robaws-artikel (een getal) als articleId; een artikel uit de webshop of een eenmalig
+            // artikel = een vrije lijn met de omschrijving (vroeger ging "ws:…" of "__custom…" mee en weigerde Robaws de lijn)
+            const aid = toStr(m.articleId);
+            if (aid && /^\d+$/.test(aid)) li.articleId = aid;
             if (m.unitPrice != null) li.price = parseFloat(m.unitPrice);
             materialRequests.push(li);
             const r = await this.post(`work-orders/${workOrderId}/line-items`, li);
             if (r.code === 200 || r.code === 201) {
                 materialSuccess++;
-                log.push(`Item toegevoegd: ${li.articleId} x ${li.quantity}`);
+                log.push(`Item toegevoegd: ${li.articleId || li.description} x ${li.quantity}`);
             } else {
                 materialErrors.push({ sent: li, code: r.code, response: r.data });
                 log.push(`FOUT item: ${r.code}`);

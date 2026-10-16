@@ -58,7 +58,7 @@
     ] },
 
     { slug: 'app', deel: 'Voor je begint', kick: 'Even rondkijken', titel: 'Zo zit de app in elkaar', lead: 'Vier knoppen onderaan, drie dingen bovenaan.', blokken: [
-        { t: 'p', h: '<b>Onderaan staan 4 knoppen:</b><br><b>Planning</b> — jouw klanten van vandaag. Hier begin je.<br><b>Klok</b> — in- en uitklokken en je uren.<br><b>Klaar</b> — de werkbonnen die je al verstuurd hebt.<br><b>Aanvragen</b> — verlof aanvragen en materieel lenen.' },
+        { t: 'p', h: '<b>Onderaan staan 4 knoppen:</b><br><b>Planning</b> — jouw klanten van vandaag. Hier begin je.<br><b>Klok</b> — in- en uitklokken en je uren.<br><b>Klaar</b> — de werkbonnen die je al verstuurd hebt.<br><b>Organisatie</b> — je aanvragen (materiaal bestellen, materieel lenen, verlof aanvragen) en de rekenmachine.' },
         { t: 'p', h: '<b>Bovenaan rechts:</b> de <b>ⓘ-knop</b> legt élk scherm uit (' + L('hulp', 'Hulp in de app') + ') · het <b>rondje met je letter of foto</b> = je profiel · de <b>groene tekst</b> toont of je ingeklokt bent en sinds hoe laat.' },
         { t: 'p', h: '<b>De gekleurde woorden</b> op de planningskaarten tonen het soort werk: <b style="color:var(--green2,#2e7d32)">Onderhoud</b> (groen), <b style="color:#E88A2A">Herstelling</b> (oranje), <b style="color:#6A2C91">Installatie</b> (paars).' },
         { t: 'faq', items: [
@@ -91,13 +91,14 @@
         { t: 'stap', n: 4, h: 'Ben je bij de klant? <b>Tik op de kaart</b> — dan opent de werkorder.' },
         { t: 'p', h: '<b>De wacht-balk</b> (met het schildje, boven je planning) toont wie deze week de <b>wacht</b> heeft. Tik erop voor de komende weken. Heb jíj de wacht, dan kleurt de balk oranje.' },
         { t: 'faq', items: [
-            ['Mijn planning is leeg.', 'Trek het scherm even naar beneden om te verversen. Nog leeg? Dan is er (nog) niets ingepland — bel het bureau als dat niet klopt.'],
+            ['Mijn planning is leeg.', 'Scrol helemaal naar boven, laat los en trek het scherm dan even naar beneden om te verversen. Nog leeg? Dan is er (nog) niets ingepland — bel het bureau als dat niet klopt.'],
             ['Er kwam een nieuwe klant bij, zie ik dat?', 'Ja. De app kijkt elke 5 minuten of er iets bijkwam en toont dan een melding.'],
             ['Wat betekent "In bewerking" op een kaart?', 'Dat je al uren of materiaal invulde op die werkorder. Handig om te zien waar je mee bezig was.'],
             ['Wat betekent "Regie"?', 'Dat alle tijd en materiaal aan de klant wordt doorgerekend. Vul dan extra nauwkeurig in.'],
             ['Moet ik de klanten in deze volgorde doen?', 'Meestal wel — kantoor plant de route zo. Moet je afwijken? Even bellen met het bureau.'],
             ['Wie heeft er deze week de wacht?', 'Kijk op de wacht-balk boven je planning (het schildje). Tik erop om ook de komende weken te zien. De wacht zelf wordt door het bureau gepland — klopt iets niet, bel het bureau.'],
             ['Ik heb de wacht en er staat een dagplanning "WACHT" in mijn planning. Moet ik daar een werkbon voor invullen?', 'Nee. Die dagplanning toont alleen dat jij de wacht hebt. Ze telt niet mee als open werkbon: je kan gewoon uitklokken, ook als je die dag als monteur meehelpt.'],
+            ['Een dagplanning van vandaag is uit mijn planning verdwenen.', 'Dan zette een collega jouw uren al op zijn werkbon van die dagplanning. Je hoeft ze daar niet meer zelf in te vullen: dat gaf dubbele uren. Klopt het aantal uren niet, bv. omdat je langer doorwerkte? Zet het bij het uitklokken in "Opmerking voor het bureel" of meld het aan het bureel.'],
         ] },
     ] },
 
@@ -128,6 +129,24 @@
             ['Opent de app ook als ik met mijn bankkaart betaal?', 'Nee. De app reageert alleen op de tags van QE. Een bankkaart of een betaling met de gsm merkt de app niet.'],
             ['De app zegt dat de tag nog aan geen materieel hangt.', 'Dan is de tag nog niet gekoppeld. Vraag het bureel.'],
             ['Moet ik scannen als ik iets van een collega overneem?', 'Ja, graag: tik op <b>Ik neem het mee</b>. Zo weet iedereen waar het is.'],
+        ] },
+    ] },
+
+    // v429: het magazijn op de gsm (de stock scannen). Verschijnt pas in de app als de stock in gebruik is.
+    { slug: 'magazijn', deel: 'Jouw werkdag', kick: 'In het magazijn', titel: 'Het magazijn: scannen', lead: 'Scan wat je meeneemt, wat bijna op is, wat er geleverd is of wat er in een vak ligt.', scherm: 'screenLogistiek', blokken: [
+        { t: 'stap', n: 1, h: 'Tik onderaan op <b>Logistiek</b> en dan op <b>Magazijn</b>. Kies bovenaan wat je doet: <b>Bijbestellen</b>, <b>Meenemen</b>, <b>Ontvangen</b> of <b>Tellen</b>.' },
+        { t: 'stap', n: 2, h: 'De camera blijft open. Richt ze op het etiket van het vak of op de streepjescode van de doos. Elk artikel komt in de lijst. Scan je hetzelfde nog eens, dan telt het er een bij.' },
+        { t: 'stap', n: 3, h: 'Klopt het aantal niet? Tik op <b>−</b> of <b>+</b>, of tik op het getal en typ het juiste aantal.' },
+        { t: 'stap', n: 4, h: 'Neem je materiaal mee? Kies bovenaan <b>naar welke werf</b> het gaat. Staat je werf er niet bij, tik dan op <b>Andere werf</b>.' },
+        { t: 'stap', n: 5, h: 'Tik op <b>Klaar</b>. Je ziet meteen wat er bewaard is. Daarna begin je met <b>Nieuwe reeks</b>.' },
+        { t: 'tip', h: '<b>Bijbestellen</b>: loop langs de bakjes en scan wat bijna op is. Het bureel ziet je lijst in de webshop en bestelt. Er wordt niets vanzelf besteld.' },
+        { t: 'letop', h: 'Kent de app een code nog niet? Tik op <b>Koppelen aan een artikel</b> en kies het artikel. De volgende keer herkent de app de code.' },
+        { t: 'faq', items: [
+            ['Ik heb geen bereik in het magazijn.', 'Scan gewoon verder. Codes die de app nog niet kon opzoeken, blijven in de lijst staan en worden opgezocht zodra er weer verbinding is. Tik daarna op Klaar.'],
+            ['Ik tikte twee keer op Klaar.', 'Geen probleem: een reeks wordt maar één keer bewaard.'],
+            ['De camera staat stil.', 'Na twee minuten zonder scan pauzeert de camera om je batterij te sparen. Tik op het zwarte vak om verder te scannen.'],
+            ['Ik werk met een handscanner.', 'Scan gewoon: de code komt vanzelf in de lijst, ook als het codevak niet geselecteerd is.'],
+            ['Waar zie ik prijzen?', 'Nergens: het magazijn op de gsm toont alleen aantallen en vakken.'],
         ] },
     ] },
 
@@ -181,6 +200,7 @@
         { t: 'stap', n: 1, h: 'Tik op het tabblad <b>Foto’s</b> en dan op de <b>camera-knop</b>.' },
         { t: 'stap', n: 2, h: 'Maak duidelijke foto’s van je werk. <b>Meerdere foto’s mag altijd</b> — beter te veel dan te weinig.' },
         { t: 'stap', n: 3, h: 'Goede gewoonte: een foto <b>vóór</b> je begint en een foto <b>ná</b> je werk. Zo is er nooit discussie.' },
+        { t: 'letop', h: 'Staat er op je planning <b>Foto’s verplicht</b>? Dan vraagt het bureel foto’s van je werk. Je kan de werkbon pas versturen (en bij het uitklokken laten versturen) als er minstens één foto op staat. Staat er een foto op, dan wordt het <b>Foto’s ✓</b>.' },
         { t: 'letop', h: 'Bij een <b>onderhoud</b> is minstens <b>één foto van het attest verplicht</b>. Zonder die foto kan de werkbon niet verstuurd worden — de app houdt je tegen.' },
         { t: 'tip', h: 'Je foto’s blijven bewaard, óók als de app herstart of je even geen internet hebt. Je raakt ze niet kwijt.' },
         { t: 'faq', items: [
@@ -203,6 +223,7 @@
             ['De app zegt dat er een foto ontbreekt.', 'Bij onderhoud is een foto van het attest verplicht. Maak die foto — daarna kan je wél versturen.'],
             ['Hoe weet ik zeker dat hij verstuurd is?', 'Je ziet het vinkje-scherm én de werkbon staat daarna onder "Klaar". Staat er "wachtrij"? Dan vertrekt hij zodra er internet is.'],
             ['Moet de klant tekenen of betalen?', 'Nee. Jij verstuurt alleen de werkbon. Kantoor maakt de factuur en regelt de betaling.'],
+            ['De app zegt: "Deze uren staan al op een werkbon".', 'Een collega zette die uren al op zijn werkbon van dezelfde dagplanning. Tik op <b>"Verstuur zonder die uren"</b>: de rest van je werkbon (materiaal, foto’s, andere collega’s) gaat gewoon mee. Klopt het aantal uren niet? Meld het aan het bureel.'],
         ] },
     ] },
 
@@ -219,6 +240,7 @@
             ['De klant wil niet tekenen.', 'Leg uit dat het gewoon bevestigt dat het werk is uitgevoerd. Blijft het een probleem? Bel kantoor vóór je verstuurt.'],
             ['Er klopt iets niet in het totaal.', 'Ga terug naar de tabbladen Uren of Materiaal en verbeter het daar. Het overzicht rekent zichzelf opnieuw uit.'],
             ['Welk BTW-tarief moet ik kiezen?', 'Meestal kiest de app het zelf op basis van de klantgegevens. Zie je het verkeerde tarief? Bel kantoor — niet gokken.'],
+            ['De app zegt: "Deze uren staan al op een werkbon".', 'Een collega zette die uren al op zijn werkbon van dezelfde dagplanning. Tik op <b>"Verstuur zonder die uren"</b>: de rest van je werkbon gaat gewoon mee. Klopt het aantal uren niet? Meld het aan het bureel.'],
             ['Mag ik korting geven?', 'Ja: tik onder het totaal op "+ Korting toevoegen" — percentage of een bedrag in euro, eventueel met een reden. Een bedrag in euro is wat de klant écht minder betaalt (€15 korting = €15 van het eindtotaal). De korting komt als aparte lijn op de factuur en het te betalen bedrag (QR/Bancontact/cash) past zich automatisch aan. Weghalen kan met het kruisje naast de korting-regel.'],
         ] },
     ] },
@@ -306,6 +328,7 @@
     /* ══ DEEL: NAKIJKEN & RECHTZETTEN ══ */
     { slug: 'uitklokken', deel: 'Nakijken & rechtzetten', kick: 'Einde van de dag', titel: 'Uitklokken + kilometers', lead: 'Scan de tag. Kijk je kilometers na. Bevestig. In die volgorde.', scherm: 'screenClock', blokken: [
         { t: 'stap', n: 1, h: 'Houd je telefoon <b>tegen de NFC-tag</b>, net zoals ’s morgens.' },
+        { t: 'tip', rol: 'monteur', h: '<b>Nog openstaande dagplanningen van vandaag?</b> Bij één werkbon vraagt de app of je je geklokte uren erop wil zetten. Werkte je op meerdere werven, dan krijg je eerst het scherm <b>"Uren verdelen"</b>: geef bij elke werkbon in hoeveel je eraan werkte (uren en minuten). Samen moet het precies je gewerkte uren zijn; onderaan zie je wat er nog te verdelen is. Met <b>"Rest hier"</b> zet je wat overblijft op die werkbon. Een dagplanning met 0 u blijft open staan.' },
         { t: 'stap', n: 2, h: 'De app toont je <b>kilometers</b>, heen en terug. Die rekent de app zelf uit: je hoeft niets in te vullen.' },
         { t: 'stap', n: 3, h: 'Kies je <b>mobiliteit</b>: chauffeur (alleen of met passagiers) of passagier. Klok je uit <b>aan het bureau</b>, dan kies je ook hoe je vandaag naar het werk kwam: <b>fiets, auto of openbaar vervoer</b>.' },
         { t: 'stap', n: 4, h: 'Iets bijzonders vandaag? Schrijf het in <b>"Opmerking voor het bureel"</b>, bv. <i>vroeger begonnen om de file voor te zijn, afgesproken met de projectleider</i>. Het bureel ziet het meteen bij het nakijken van je uren. Niets te melden? Laat het vak leeg.' },
@@ -314,6 +337,8 @@
         { t: 'letop', h: '<b>Steek je telefoon pas weg als je het eindscherm zag.</b> Dan weet je zeker dat je uitgeklokt bent én je kilometers binnen zijn.' },
         { t: 'tip', h: '<b>Met de camionet terug naar het bureau en dan met je eigen vervoer naar huis?</b> Scan na het uitklokken op de werf de <b>woon-werkverkeer-tag</b> aan het bureau (naast de bureau-tag en de L&amp;L-tag). De app rekent je terugrit opnieuw uit en vraagt hoe je naar het werk kwam. Zonder die scan telt er die dag geen woon-werkverkeer. Sluit je de dag af met <b>laden en lossen</b> aan het bureau? Dan vraagt de app het bij die tweede L&amp;L-scan en hoef je de woon-werkverkeer-tag niet te scannen.' },
         { t: 'faq', items: [
+            ['Ik werkte vandaag op meerdere werven. Op welke werkbon komen mijn uren?', 'Op de werkbonnen die jij kiest. Bij het uitklokken verdeel je je gewerkte uren over je openstaande dagplanningen, bv. 1u, 4u en 3u. De app laat je pas verder als het samen precies klopt en verstuurt dan alle werkbonnen. Wie je aanvinkt bij "Voor wie zijn de uren?" krijgt dezelfde verdeling.', 'monteur'],
+            ['Ik zette de uren van een collega mee op mijn werkbon. Moet hij nog iets doen?', 'Nee. Zodra jouw werkbon verstuurd is, verdwijnt die dagplanning uit zijn planning en vult hij zijn uren daar niet nog eens in. Staat een collega bij "Voor wie zijn de uren?" in het grijs? Dan staan zijn uren al op een werkbon van die dagplanning.', 'monteur'],
             ['Ik ben vroeger begonnen omdat het zo afgesproken was.', 'Zet het bij het uitklokken in het vak "Opmerking voor het bureel" (met wie het afgesproken was). Dan staat het bij je uren en hoeft niemand het te onthouden. Begon je duidelijk vroeger dan je startuur, dan herinnert de app je er zelf aan.'],
             ['Ik ben vergeten uit te klokken.', 'De app merkt dat de volgende ochtend en helpt je de dag netjes af te sluiten. Klopt de tijd niet? Vraag een aanpassing aan.'],
             ['Mijn kilometers kloppen niet.', 'De app rekent de rit uit met je dagplanning: vanaf het bureau of van thuis naar je eerste werf, en van je laatste werf terug. Moest je een omweg maken? Zet het in "Opmerking voor het bureel". Alleen het bureel kan kilometers aanpassen.'],
@@ -378,23 +403,25 @@
         ] },
     ] },
 
-    /* ══ DEEL: AANVRAGEN ══ */
-    { slug: 'verlof', deel: 'Aanvragen', kick: 'Vrij vragen', titel: 'Verlof aanvragen', lead: 'Een dagje vrij of een week vakantie — rechtstreeks vanuit de app.', scherm: 'screenAanvragen', blokken: [
-        { t: 'stap', n: 1, h: 'Tik onderaan op <b>Aanvragen</b>. Je staat meteen op <b>Verlof</b>. Bovenaan zie je je <b>saldo</b>.' },
-        { t: 'stap', n: 2, h: 'Kies de <b>eerste dag</b> en de <b>laatste dag</b>. Tik op <b>"Verlof aanvragen"</b>. Klaar!' },
-        { t: 'stap', n: 3, h: 'Je aanvraag verschijnt onderaan met een status: eerst <b>Aangevraagd</b>, daarna <b>Goedgekeurd</b> of <b>Geweigerd</b>.' },
-        { t: 'stap', n: 4, h: '<b>Tik op een aanvraag</b> voor het detail: de beslissing van kantoor en hun bericht. Typ onderaan om <b>zelf te reageren</b> — je bericht staat op jouw naam.' },
-        { t: 'letop', h: '<b>Ziek?</b> Dat gaat NIET via de app. <b>Bel ’s morgens naar het bureau.</b> Verlof = app, ziekte = bellen.' },
+    /* ══ DEEL: AANVRAGEN ══ (v427: zelfde volgorde als de tabbladen: Materiaal, Materieel, Verlof) */
+    { slug: 'materiaal-bestellen', deel: 'Aanvragen', kick: 'Iets nodig voor een werf?', titel: 'Materiaal bestellen', lead: 'Vul een mandje in de webshop. Het bureel kijkt het na en bestelt.', scherm: 'screenAanvragen', blokken: [
+        { t: 'stap', n: 1, h: 'Tik onderaan op <b>Organisatie</b> en dan op <b>Aanvragen</b>: je staat meteen op <b>Materiaal</b>. Tik op <b>"+ Nieuwe bestelling"</b>. Sta je in een werkorder? Tik dan in het tabblad <b>Materiaal</b> op <b>"Materiaal bestellen"</b>: de werf staat er dan al bij.' },
+        { t: 'stap', n: 2, h: 'Kies bovenaan <b>waarvoor</b>: een <b>werf</b> uit je planning (of zoek een ander project) of de <b>stock</b>: het magazijn of je camionet.' },
+        { t: 'stap', n: 3, h: 'Zoek je artikels en zet ze in je <b>mandje</b>. Je ziet de <b>brutoprijs</b>. Staat iets er niet in? Typ het bij het versturen onder <b>"Staat iets niet in de webshop?"</b>.' },
+        { t: 'stap', n: 4, h: 'Tik op <b>Bestellen</b>, kies <b>tegen wanneer</b>, zet er eventueel een opmerking bij en tik op <b>"Bestelling versturen"</b>.' },
+        { t: 'stap', n: 5, h: 'Volg je bestelling bij <b>Mijn bestellingen</b>: Ingediend, Wordt nagekeken, Wordt besteld, Besteld. Tik op een bestelling voor de artikels en het bericht van het bureel.' },
+        { t: 'letop', h: '<b>Er wordt nog niets besteld</b> als je op "Bestelling versturen" tikt. Het bureel kijkt je mandje na, past het aan als het moet en bestelt dan bij de juiste leverancier.' },
         { t: 'faq', items: [
-            ['Hoe lang duurt de goedkeuring?', 'Kantoor krijgt je aanvraag meteen binnen. Je ziet de beslissing in de app zodra ze beslist hebben — meestal dezelfde dag.'],
-            ['Kan ik een aanvraag intrekken?', 'Stuur een berichtje in het detail van je aanvraag, of bel even.'],
-            ['Mijn saldo klopt niet volgens mij.', 'Bel Levi — het jaartotaal staat op je fiche op kantoor en kan daar aangepast worden.'],
-            ['Eén losse dag of een halve dag?', 'Eén dag: kies dezelfde dag als eerste én laatste dag. Halve dag: zet het erbij in je aanvraag of stuur een berichtje.'],
+            ['Kan ik een bestelling intrekken?', 'Ja, zolang ze op <b>Ingediend</b> staat: tik erop en dan op "Intrekken". Kijkt het bureel ze al na? Bel of stuur een bericht.'],
+            ['Mijn werf staat er niet bij.', 'Zoek bij <b>Werf</b> op de naam, het projectnummer of de gemeente. Niets gevonden? Tik op <b>"Andere werf"</b> met de naam die je typte: het bureel zoekt de juiste werf.'],
+            ['Het bureel paste mijn bestelling aan.', 'Dan staat er "Aangepast door het bureel" bij. Tik op de bestelling: je ziet de artikels zoals ze besteld worden, en onder "Wat je vroeg" je eigen mandje.'],
+            ['Wie krijgt mijn bestelling?', 'Het bureel, in de webshop. Bestel je voor een werf, dan krijgt de projectleider ook een mail.'],
+            ['Waarom zie ik geen nettoprijzen?', 'De webshop in de app toont de brutoprijs. De prijs die QE betaalt, regelt het bureel.'],
         ] },
     ] },
 
     { slug: 'materieel', deel: 'Aanvragen', kick: 'Camionet of machine nodig?', titel: 'Materieel lenen', lead: 'Reserveer in de app — dan weet iedereen dat hij bezet is.', scherm: 'screenAanvragen', blokken: [
-        { t: 'stap', n: 1, h: 'Tik onderaan op <b>Aanvragen</b> en dan bovenaan op <b>Materieel</b>. Je ziet per machine of hij <b>nu vrij</b> is (groen), in gebruik (oranje) of gereserveerd (blauw).' },
+        { t: 'stap', n: 1, h: 'Tik onderaan op <b>Organisatie</b>, dan op <b>Aanvragen</b> en bovenaan op <b>Materieel</b>. Je ziet per machine of hij <b>nu vrij</b> is (groen), in gebruik (oranje) of gereserveerd (blauw).' },
         { t: 'stap', n: 2, h: 'Tik op wat je nodig hebt en kijk in de <b>agenda</b> welke dagen al bezet zijn (oranje).' },
         { t: 'stap', n: 3, h: 'Kies je <b>datums</b>, typ kort waarvoor, en tik op <b>"Reserveren aanvragen"</b>. Botsen je datums met een andere reservatie? Dan blokkeert de app dat meteen.' },
         { t: 'stap', n: 4, h: 'Volg de status via <b>"Vorige aanvragingen"</b>: Aangevraagd → Goedgekeurd → In gebruik → Teruggebracht.' },
@@ -404,6 +431,20 @@
             ['Ik heb hem maar een halve dag nodig.', 'Reserveer die ene dag en zet het in de opmerking ("enkel voormiddag"). Breng hem daarna meteen terug en tik "Teruggebracht".'],
             ['Iets kapot aan de machine?', 'Meld het meteen aan het bureau. Niet stilletjes terugzetten.'],
             ['Ik heb hem dringend NU nodig, zonder reservatie.', 'Staat hij op "Nu beschikbaar"? Reserveer hem snel voor vandaag en neem hem mee. Bezet? Bel kantoor — niet zomaar meenemen.'],
+        ] },
+    ] },
+
+    { slug: 'verlof', deel: 'Aanvragen', kick: 'Vrij vragen', titel: 'Verlof aanvragen', lead: 'Een dagje vrij of een week vakantie — rechtstreeks vanuit de app.', scherm: 'screenAanvragen', blokken: [
+        { t: 'stap', n: 1, h: 'Tik onderaan op <b>Organisatie</b>, dan op <b>Aanvragen</b> en bovenaan op <b>Verlof</b> (het laatste tabblad). Bovenaan zie je je <b>saldo</b>.' },
+        { t: 'stap', n: 2, h: 'Kies de <b>eerste dag</b> en de <b>laatste dag</b>. Tik op <b>"Verlof aanvragen"</b>. Klaar!' },
+        { t: 'stap', n: 3, h: 'Je aanvraag verschijnt onderaan met een status: eerst <b>Aangevraagd</b>, daarna <b>Goedgekeurd</b> of <b>Geweigerd</b>.' },
+        { t: 'stap', n: 4, h: '<b>Tik op een aanvraag</b> voor het detail: de beslissing van kantoor en hun bericht. Typ onderaan om <b>zelf te reageren</b> — je bericht staat op jouw naam.' },
+        { t: 'letop', h: '<b>Ziek?</b> Dat gaat NIET via de app. <b>Bel ’s morgens naar het bureau.</b> Verlof = app, ziekte = bellen.' },
+        { t: 'faq', items: [
+            ['Hoe lang duurt de goedkeuring?', 'Kantoor krijgt je aanvraag meteen binnen. Je ziet de beslissing in de app zodra ze beslist hebben — meestal dezelfde dag.'],
+            ['Kan ik een aanvraag intrekken?', 'Stuur een berichtje in het detail van je aanvraag, of bel even.'],
+            ['Mijn saldo klopt niet volgens mij.', 'Bel Levi — het jaartotaal staat op je fiche op kantoor en kan daar aangepast worden.'],
+            ['Eén losse dag of een halve dag?', 'Eén dag: kies dezelfde dag als eerste én laatste dag. Halve dag: zet het erbij in je aanvraag of stuur een berichtje.'],
         ] },
     ] },
 
@@ -435,6 +476,19 @@
         { t: 'stap', n: 2, h: 'Je krijgt uitleg over <b>precies dat scherm</b>, stap voor stap. De <b>oranje ring</b> wijst aan waar je moet tikken.' },
         { t: 'stap', n: 3, h: 'Onderaan die uitleg start je ook de <b>volledige rondleiding</b> — of open je deze <b>handleiding</b>.' },
         { t: 'tip', h: 'De ⓘ-uitleg en deze handleiding kan je <b>zo vaak openen als je wil</b>. Niemand ziet hoe vaak je ze gebruikt.' },
+    ] },
+
+    { slug: 'meldingen', deel: 'Jouw app', kick: 'Op de hoogte blijven', titel: 'Meldingen en nieuwigheden', lead: 'Wat het bureel je laat weten, en wat er na een update veranderde.', scherm: 'screenPlanning', blokken: [
+        { t: 'stap', n: 1, h: 'Heeft het bureel iets belangrijks te melden, zoals <b>"Iedereen binnenkomen vanavond"</b>, dan verschijnt dat <b>meteen</b> als je de app opent. Staat de app al open, dan komt het binnen enkele minuten.' },
+        { t: 'stap', n: 2, h: 'Lees het en tik op <b>Begrepen</b>. Het bureel ziet dan dat jij het gelezen hebt.' },
+        { t: 'stap', n: 3, h: 'Tot de einddatum staat de melding ook <b>bovenaan je planning</b>. Tik erop om ze nog eens te lezen.' },
+        { t: 'stap', n: 4, h: 'Na een <b>update</b> toont de app één keer wat er sinds je vorige versie veranderd is. Tik op een regel voor de uitleg. Alles teruglezen: Profiel → <b>App bijwerken</b> → <b>Wat is er nieuw?</b>' },
+        { t: 'faq', items: [
+            ['Ik tikte de melding te snel weg.', 'Geen probleem: zolang ze geldt, staat ze bovenaan je planning. Tik erop en je leest ze opnieuw.'],
+            ['Krijg ik een melding als de app dicht is?', 'Ja, met de nieuwste versie van de app. Je gsm kijkt elk kwartier of er iets nieuws is en toont het als melding op je gsm. Tik erop en je leest ze in de app. Krijg je niets? Kijk dan of meldingen voor de QE-app aan staan in de instellingen van je gsm.'],
+            ['Kan ik zelf een melding sturen?', 'Nee, meldingen komen van het bureel. Wil je iedereen iets laten weten, vraag het dan aan het bureel.'],
+            ['Waar lees ik wat er in de vorige updates veranderde?', 'Profiel → App bijwerken → Wat is er nieuw?'],
+        ] },
     ] },
 
     /* ══ DEEL: ALS HET MISLOOPT ══ */
