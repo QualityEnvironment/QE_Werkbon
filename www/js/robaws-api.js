@@ -5282,6 +5282,33 @@ const RobawsAPI = {
         return dayItems.filter(it => !met.has(String(it.id))).length;
     },
 
+    /** v438 (vraag Levi 23 okt 2026: "dat de werknemers de weekenddagen in de app zien wanneer er iets gepland staat op deze
+     *  dagen"): op welke dagen tussen van en tot (YYYY-MM-DD) staat er iets gepland voor deze werknemer? Verlof telt niet.
+     *  Zelfde lijst en zelfde adres als getPlanning (de cache deelt ze: meestal geen extra vraag aan Robaws). */
+    async geplandeDagen(employeeId, van, tot) {
+        const uit = new Set(), seen = new Set();
+        if (!employeeId || !van || !tot) return uit;
+        let offset = 0; const PAGE = 100;
+        for (let p = 0; p < 10; p++) {
+            const r = await this.get(`planning-items?employeeId=${employeeId}&limit=${PAGE}&offset=${offset}&sort=startDate:desc`);
+            if (r.code !== 200) break;
+            const items = (r.data && r.data.items) || [];
+            if (!items.length) break;
+            let added = 0;
+            for (const it of items) {
+                const k = String(it.id);
+                if (seen.has(k)) continue;
+                seen.add(k); added++;
+                const d = ((it.startDate || '') + '').split('T')[0];
+                if (d >= van && d <= tot && !it.timeOffCategoryId && !it.unavailableReason) uit.add(d);
+            }
+            const last = ((items[items.length - 1].startDate || '') + '').split('T')[0];
+            if (last < van || added === 0 || items.length < PAGE) break;
+            offset += PAGE;
+        }
+        return uit;
+    },
+
     /** opts.vers (v423): de werkbonnen LIVE lezen i.p.v. de replica — bij het uitklokken telt ook een werkbon die een
      *  collega net verstuurde. */
     async getPlanning(employeeId, date, userId = null, opts = null) {

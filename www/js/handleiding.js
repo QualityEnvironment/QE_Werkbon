@@ -485,6 +485,7 @@
         { t: 'stap', n: 4, h: 'Na een <b>update</b> toont de app één keer wat er sinds je vorige versie veranderd is. Tik op een regel voor de uitleg. Alles teruglezen: Profiel → <b>App bijwerken</b> → <b>Wat is er nieuw?</b>' },
         { t: 'faq', items: [
             ['Ik tikte de melding te snel weg.', 'Geen probleem: zolang ze geldt, staat ze bovenaan je planning. Tik erop en je leest ze opnieuw.'],
+            ['Het bureel vraagt een bevestiging of een antwoord. Wat nu?', 'Tik op <b>Ik bevestig</b>, of op <b>Ja</b> of <b>Nee</b>. Een opmerking erbij mag (niet verplicht). Van gedacht veranderen kan: tik op het andere antwoord. Tik je op <b>Later</b>, dan komt de vraag terug als je de app opnieuw opent.'],
             ['Krijg ik een melding als de app dicht is?', 'Ja, met de nieuwste versie van de app. Je gsm kijkt elk kwartier of er iets nieuws is en toont het als melding op je gsm. Tik erop en je leest ze in de app. Krijg je niets? Kijk dan of meldingen voor de QE-app aan staan in de instellingen van je gsm.'],
             ['Kan ik zelf een melding sturen?', 'Nee, meldingen komen van het bureel. Wil je iedereen iets laten weten, vraag het dan aan het bureel.'],
             ['Waar lees ik wat er in de vorige updates veranderde?', 'Profiel → App bijwerken → Wat is er nieuw?'],

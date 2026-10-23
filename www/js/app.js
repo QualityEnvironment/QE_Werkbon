@@ -752,6 +752,7 @@ const app = {
         } catch (_e) {}
         // v428: eerst de meldingen van het bureel, daarna (na een update) één keer wat er voor deze werknemer nieuw is
         try { this._medStart(); } catch (_e) { try { this._nieuwPlan(); } catch (_e2) {} }
+        try { this._vmzStart(); } catch (_e) {}   // v436: het vrijdagmuziekje vooraf ophalen
     },
 
     // ========================================
@@ -2675,12 +2676,14 @@ const app = {
             screenOrganisatie: 'Organisatie',  // v391
             screenReken: 'Rekenmachine',  // v408
             screenMeldingen: 'Meldingen',  // v428
+            screenVrijdagmuziek: 'Vrijdagmuziekje',  // v436
             screenMagazijn: 'Magazijn',  // v429
             screenProjecten: 'Projecten',  // v391
             screenProjectDetail: 'Project',  // v391
             screenDagplanningNieuw: 'Dagplanning maken',  // v391
             screenToestel: 'Toestel & toestemmingen',  // v391
             screenTaakOntvangers: 'Taak-ontvangers',  // v381
+            screenStilte: 'Meldingen op de gsm',  // v437
             screenAppRechten: 'Toegang tot onderdelen',  // v384
             screenVerlofDetail: 'Verlofaanvraag',  // v278
             screenGoedkeuren: 'Goedkeuren',  // v278
@@ -2716,6 +2719,8 @@ const app = {
         if (screenId === 'screenOrganisatie') this.loadOrganisatie();
         if (screenId === 'screenReken') this.loadReken();   // v408
         if (screenId === 'screenMeldingen') this.loadMeldingen();   // v428
+        if (screenId === 'screenVrijdagmuziek') this.loadVrijdagmuziek();   // v436
+        else if (this._vmzProef) this._vmzProefStop();
         if (screenId === 'screenProjecten') this.loadProjecten();
         if (screenId === 'screenProjectDetail') { this.renderProjectDetail(); this.loadProjectPlanning(); }
         if (screenId === 'screenDagplanningNieuw' && !this._dp) setTimeout(() => this.goBack(), 0);
@@ -2842,6 +2847,10 @@ const app = {
     //   - woensdag → ma, di, wo, do
     //   - vrijdag  → ma, di, wo, do, vr + ma volgende week
     //   - maandag  → vr vorige week, ma, di
+    // v438 (vraag Levi 23 okt 2026: "dat de werknemers de weekenddagen in de app zien wanneer er iets gepland staat op deze
+    // dagen"): een zaterdag of zondag komt erbij als er voor jou iets op gepland staat (verlof telt niet). Welke: de weekenddagen
+    // tussen de eerste chip en de eerstvolgende werkdag, en het weekend van deze week. _stripWeekend = de gevonden dagen;
+    // _weekendNakijken zoekt ze op (zelfde lijst als de planning, uit de cache) en tekent de strip opnieuw als er iets verandert.
     // ========================================
     buildDateStrip() {
         const strip = document.getElementById('dateStrip');
@@ -2875,6 +2884,20 @@ const app = {
         dates.push(new Date(today));
         dates.push(next);
 
+        // v438: weekenddagen met iets gepland (en de gekozen dag zelf, als dat een weekenddag is)
+        const zondagDezeWeek = new Date(today);
+        zondagDezeWeek.setDate(today.getDate() + ((7 - today.getDay()) % 7));
+        const bereikVan = this._localDateStr(dates[0]);
+        const bereikTot = this._localDateStr(next > zondagDezeWeek ? next : zondagDezeWeek);
+        const extra = new Set(this._stripWeekend || []);
+        if (this.currentDate && (this.currentDate.getDay() === 0 || this.currentDate.getDay() === 6)) extra.add(this._localDateStr(this.currentDate));
+        for (const ds of extra) {
+            if (ds < bereikVan || ds > bereikTot) continue;
+            if (dates.some(d => this._localDateStr(d) === ds)) continue;
+            dates.push(new Date(ds + 'T12:00:00'));
+        }
+        dates.sort((a, b) => a - b);
+
         const days = ['zo', 'ma', 'di', 'wo', 'do', 'vr', 'za'];
         const months = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
         const dayNames = ['Zondag', 'Maandag', 'Dinsdag', 'Woensdag', 'Donderdag', 'Vrijdag', 'Zaterdag'];
@@ -2895,8 +2918,9 @@ const app = {
                         ? 'Morgen'
                         : dayNames[d.getDay()];
 
+            const isWeekend = d.getDay() === 0 || d.getDay() === 6;   // v438
             return `
-                <div class="date-chip ${isActive ? 'active' : ''} ${isToday ? 'today' : ''}"
+                <div class="date-chip ${isActive ? 'active' : ''} ${isToday ? 'today' : ''} ${isWeekend ? 'weekend' : ''}"
                      onclick="app.selectDate('${dateStr}')"
                      data-date="${dateStr}">
                     <div class="d-day">${days[d.getDay()]}</div>
@@ -2912,6 +2936,28 @@ const app = {
         const actief = strip.querySelector('.date-chip.today');
         if (actief && strip.scrollWidth > strip.clientWidth) {
             actief.scrollIntoView({ block: 'nearest', inline: 'center' });
+        }
+        this._weekendNakijken(bereikVan, bereikTot);
+    },
+
+    /** v438: staat er iets gepland op een zaterdag of zondag binnen het bereik van de strip? Zo ja (of niet meer): opnieuw tekenen.
+     *  Hoogstens één keer per minuut per bereik; een fout of geen verbinding laat de strip zoals hij is. */
+    async _weekendNakijken(van, tot) {
+        const sleutel = van + '|' + tot;
+        const nu = Date.now();
+        if (this._weekendKeek && this._weekendKeek.sleutel === sleutel && nu - this._weekendKeek.t < 60000) return;
+        this._weekendKeek = { sleutel, t: nu };
+        try {
+            const user = RobawsAPI.getLoggedInUser();
+            if (!user || !user.robawsEmployeeId) return;
+            const dagen = await RobawsAPI.geplandeDagen(user.robawsEmployeeId, van, tot);
+            const weekend = [...dagen].filter(ds => { const g = new Date(ds + 'T12:00:00').getDay(); return g === 0 || g === 6; }).sort();
+            const oud = [...(this._stripWeekend || [])].sort();
+            if (weekend.join() === oud.join()) return;
+            this._stripWeekend = weekend;
+            this.buildDateStrip();
+        } catch (e) {
+            console.warn('[Planning] weekenddagen niet nagekeken:', e && e.message);
         }
     },
 
@@ -16830,6 +16876,115 @@ const app = {
         }
     },
 
+    // ============================================================
+    // v437 + APK 1.249: STILLE UREN (vraag Levi 19 okt 2026: "Ik wil ook dat de werknemers in de instellingen kunnen kiezen
+    // om notificaties in het weekend uit te zetten en na bepaalde uren in de week"). Per gsm: weekend (za + zo de hele dag)
+    // en/of elke dag van … tot … (over middernacht mag). De gsm houdt een melding die in de stille uren valt vast en toont ze
+    // na de stille uren alsnog (MededelingWorker/ApprovalNotifier + StilteRegel in de APK). Lokaal wijzigen, één knop
+    // Opslaan + ongedaan maken. Bewaard op de gsm (QENative.zetStilte) én in localStorage qe_stilte (zet het na een
+    // herinstallatie terug). Vóór brugversie 6 (APK < 1.249) kan het niet: dan een uitleg.
+    // ============================================================
+    _STILTE_STD: { weekend: false, avond: false, van: '18:00', tot: '07:00' },
+    _stilteKan() {
+        try { return !!(window.QENative && QENative.versie() >= 6); } catch (_e) { return false; }
+    },
+    _stilteBewaard() {
+        let o = null;
+        try { if (this._stilteKan()) o = QENative.leesStilte(); } catch (_e) {}
+        if (!o) { try { o = JSON.parse(localStorage.getItem('qe_stilte') || 'null'); } catch (_e) {} }
+        const s = Object.assign({}, this._STILTE_STD, o || {});
+        if (!/^[0-9]{1,2}:[0-9]{2}$/.test(String(s.van || ''))) s.van = this._STILTE_STD.van;
+        if (!/^[0-9]{1,2}:[0-9]{2}$/.test(String(s.tot || ''))) s.tot = this._STILTE_STD.tot;
+        return { weekend: !!s.weekend, avond: !!s.avond, van: s.van.padStart(5, '0'), tot: s.tot.padStart(5, '0') };
+    },
+    _stilteTekst(s) {
+        const d = [];
+        if (s.weekend) d.push('in het weekend');
+        if (s.avond && s.van !== s.tot) d.push('elke dag van ' + s.van + ' tot ' + s.tot);
+        return d.length ? 'Stil ' + d.join(' en ') : 'Altijd meldingen';
+    },
+    /** Na het opstarten: de gsm kent de keuze nog niet (bv. na een herinstallatie) → terugzetten. */
+    _stilteNaarGsm() {
+        try {
+            if (!this._stilteKan()) return;
+            const l = JSON.parse(localStorage.getItem('qe_stilte') || 'null');
+            const g = QENative.leesStilte();
+            if (l && g && !g.weekend && !g.avond && (l.weekend || l.avond)) QENative.zetStilte(l);
+            const sub = document.getElementById('pgStilteSub');
+            if (sub && (l || g)) sub.textContent = this._stilteTekst(this._stilteBewaard());
+        } catch (_e) {}
+    },
+    openStilte() {
+        this.navigate('screenStilte', true);
+        const s = this._stilteBewaard();
+        this._stilteOud = s;
+        const uren = [];
+        for (let m = 0; m < 1440; m += 30) uren.push(String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'));
+        for (const id of ['stilteVan', 'stilteTot']) {
+            const sel = document.getElementById(id);
+            if (!sel) continue;
+            const w = id === 'stilteVan' ? s.van : s.tot;
+            const lijst = uren.indexOf(w) < 0 ? uren.concat([w]).sort() : uren;
+            sel.innerHTML = lijst.map(u => '<option value="' + u + '"' + (u === w ? ' selected' : '') + '>' + u + '</option>').join('');
+        }
+        document.getElementById('stilteWeekend').checked = s.weekend;
+        document.getElementById('stilteAvond').checked = s.avond;
+        const kan = this._stilteKan();
+        const mld = document.getElementById('stilteMelding');
+        if (mld) {
+            mld.style.display = kan ? 'none' : '';
+            mld.textContent = window.QENative
+                ? 'Werk eerst de app bij (versie 1.249 of nieuwer, vraag het bureel). Daarna kan je dit hier instellen.'
+                : 'Dit werkt alleen in de app op de gsm.';
+        }
+        for (const id of ['stilteWeekend', 'stilteAvond', 'stilteVan', 'stilteTot']) {
+            const el = document.getElementById(id);
+            if (el) el.disabled = !kan;
+        }
+        this._stilteGewijzigd();
+    },
+    _stilteLees() {
+        return {
+            weekend: !!document.getElementById('stilteWeekend').checked,
+            avond: !!document.getElementById('stilteAvond').checked,
+            van: document.getElementById('stilteVan').value || this._STILTE_STD.van,
+            tot: document.getElementById('stilteTot').value || this._STILTE_STD.tot,
+        };
+    },
+    _stilteGewijzigd() {
+        const s = this._stilteLees(), oud = this._stilteOud || this._STILTE_STD;
+        const uren = document.getElementById('stilteUren');
+        if (uren) uren.style.display = s.avond ? 'flex' : 'none';
+        // weekend en avond tellen elk als één wijziging; andere uren tellen apart alleen als avond al aan stond
+        const n = (s.weekend !== oud.weekend ? 1 : 0)
+            + (s.avond !== oud.avond ? 1 : (s.avond && (s.van !== oud.van || s.tot !== oud.tot) ? 1 : 0));
+        const knop = document.getElementById('stilteOpslaan');
+        if (knop) {
+            knop.disabled = !n || !this._stilteKan();
+            knop.textContent = n ? 'Opslaan (' + n + (n === 1 ? ' wijziging)' : ' wijzigingen)') : 'Opslaan';
+        }
+        const terug = document.getElementById('stilteTerug');
+        if (terug) terug.style.display = n ? '' : 'none';
+        const samen = document.getElementById('stilteSamen');
+        if (samen) samen.textContent = (s.avond && s.van === s.tot)
+            ? 'Kies twee verschillende uren.'
+            : this._stilteTekst(s) + (n ? ' (nog niet opgeslagen)' : '') + '.';
+    },
+    stilteOpslaan() {
+        if (!this._stilteKan()) return;
+        const s = this._stilteLees();
+        if (s.avond && s.van === s.tot) { this.toast('Kies twee verschillende uren', true); return; }
+        let ok = false;
+        try { ok = QENative.zetStilte(s); } catch (_e) {}
+        if (!ok) { this.toast('Opslaan op de gsm lukte niet', true); return; }
+        try { localStorage.setItem('qe_stilte', JSON.stringify(s)); } catch (_e) {}
+        this._stilteOud = s;
+        this._stilteGewijzigd();
+        const sub = document.getElementById('pgStilteSub');
+        if (sub) sub.textContent = this._stilteTekst(s);
+        this.toast('Opgeslagen: ' + this._stilteTekst(s).toLowerCase());
+    },
+
     openTaakOntvangers() {
         if (!this._adminIsBureel()) { this.toast('Alleen voor bureel', true); return; }
         this.navigate('screenTaakOntvangers', true);
@@ -22391,20 +22546,506 @@ const app = {
     // Speelt Levi's eigen mp3 (www/assets/sounds/weekend.mp3); ontbreekt die
     // of blokkeert het toestel de weergave, dan valt het terug op een korte
     // gesynthetiseerde fanfare. Mag NOOIT de uitklok-flow breken.
+    // v436: eerst het muziekje dat het bureel voor deze vrijdag koos (Worker v566, vooraf op de gsm bewaard: _vmzSync).
+    // Terugval: het ingebouwde weekend.mp3, dan de fanfare. Veiligheidsstop 15 s blijft.
     _playWeekendJingle() {
         try { if (navigator.vibrate) navigator.vibrate([90, 60, 90, 60, 240]); } catch (_) {}
+        let e = null;
+        try { e = this._vmzVoorDag(this._vmzVandaag()); } catch (_) { e = null; }
+        if (!e || e.ingebouwd) { this._vmzSpeel(this._VMZ_INGEBOUWD, false); return; }
+        if (this._vmzKlaar && this._vmzKlaar.id === e.id) { this._vmzSpeel(this._vmzKlaar.url, true); return; }
+        // nog niet klaargezet: hoogstens 1,5 s in de opslag van de gsm zoeken, anders meteen het ingebouwde
+        let gedaan = false;
+        const ingebouwd = () => { if (gedaan) return; gedaan = true; this._vmzSpeel(this._VMZ_INGEBOUWD, false); };
+        const t = setTimeout(ingebouwd, 1500);
         try {
-            const audio = new Audio('assets/sounds/weekend.mp3');
+            this._vmzIdbGet(e.id).then((buf) => {
+                if (gedaan) return;
+                if (!buf) { clearTimeout(t); ingebouwd(); return; }
+                gedaan = true; clearTimeout(t);
+                let url = null;
+                try { url = URL.createObjectURL(new Blob([buf], { type: 'audio/mpeg' })); } catch (_) {}
+                if (url) this._vmzSpeel(url, true); else this._vmzSpeel(this._VMZ_INGEBOUWD, false);
+            }, () => { clearTimeout(t); ingebouwd(); });
+        } catch (_) { clearTimeout(t); ingebouwd(); }
+    },
+
+    /** Speel src (eigen = een gekozen muziekje: lukt het niet, dan het ingebouwde; anders de fanfare). Gooit nooit. */
+    _vmzSpeel(src, eigen) {
+        let terug = false;
+        let audio = null;
+        const val = () => {
+            if (terug) return; terug = true;
+            try { if (audio) audio.pause(); } catch (_) {}
+            if (eigen) this._vmzSpeel(this._VMZ_INGEBOUWD, false);
+            else { try { this._playWeekendJingleSynth(); } catch (_) {} }
+        };
+        try {
+            audio = new Audio(src);
             audio.volume = 1.0;
+            audio.onerror = val;
             const p = audio.play();
-            if (p && p.catch) {
-                p.catch(() => { try { this._playWeekendJingleSynth(); } catch (_) {} });
-            }
+            if (p && p.catch) p.catch(val);
             // Veiligheidsstop na 15 s (mocht de mp3 lang zijn)
             setTimeout(() => { try { audio.pause(); } catch (_) {} }, 15000);
-        } catch (_) {
-            try { this._playWeekendJingleSynth(); } catch (_) {}
+        } catch (_) { val(); }
+    },
+
+    // ========== v436: VRIJDAGMUZIEKJE (Worker v566; het bureel kiest voor iedereen) ==========
+    // Het plan (muziekje van de komende vrijdag + die erna) komt van GET /bel-api/app-vrijdag-nu en staat in localStorage
+    // qe_vrijdag_plan; de mp3's zelf staan in IndexedDB qe_vrijdag (een id verandert nooit). Zo speelt het meteen, ook zonder
+    // netwerk. Lukt iets niet, dan blijft het vorige plan of speelt het ingebouwde muziekje: nooit een fout in de uitklok.
+    _VMZ_INGEBOUWD: 'assets/sounds/weekend.mp3',
+    _VMZ_MAANDEN: ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'],
+    _vmzDbP: null,
+
+    _vmzIdb() {
+        if (this._vmzDbP) return this._vmzDbP;
+        this._vmzDbP = new Promise((resolve) => {
+            try {
+                if (!window.indexedDB) { resolve(null); return; }
+                const req = indexedDB.open('qe_vrijdag', 1);
+                req.onupgradeneeded = () => { try { req.result.createObjectStore('mp3', { keyPath: 'id' }); } catch (_) {} };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(null);
+                req.onblocked = () => resolve(null);
+            } catch (_) { resolve(null); }
+        });
+        return this._vmzDbP;
+    },
+    async _vmzIdbGet(id) {
+        const db = await this._vmzIdb();
+        if (!db) return null;
+        return new Promise((resolve) => {
+            try {
+                const rq = db.transaction('mp3', 'readonly').objectStore('mp3').get(String(id));
+                rq.onsuccess = () => resolve(rq.result && rq.result.data instanceof ArrayBuffer ? rq.result.data : null);
+                rq.onerror = () => resolve(null);
+            } catch (_) { resolve(null); }
+        });
+    },
+    async _vmzIdbPut(id, buf) {
+        const db = await this._vmzIdb();
+        if (!db) return false;
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction('mp3', 'readwrite');
+                tx.objectStore('mp3').put({ id: String(id), data: buf, t: Date.now() });
+                tx.oncomplete = () => resolve(true);
+                tx.onerror = () => resolve(false);
+            } catch (_) { resolve(false); }
+        });
+    },
+    /** Alles weg wat niet in houd staat (een muziekje van een vorige periode). */
+    async _vmzIdbHoud(houd) {
+        const db = await this._vmzIdb();
+        if (!db) return;
+        await new Promise((resolve) => {
+            try {
+                const tx = db.transaction('mp3', 'readwrite');
+                const st = tx.objectStore('mp3');
+                const rq = st.getAllKeys();
+                rq.onsuccess = () => { (rq.result || []).forEach((k) => { if (houd.indexOf(String(k)) < 0) st.delete(k); }); };
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => resolve();
+            } catch (_) { resolve(); }
+        });
+    },
+    /** Vandaag als JJJJ-MM-DD in de tijd van de gsm. */
+    _vmzVandaag(d) {
+        const x = d || new Date();
+        return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
+    },
+    _vmzPlan() {
+        try { const p = JSON.parse(localStorage.getItem('qe_vrijdag_plan') || 'null'); return (p && Array.isArray(p.items)) ? p : null; }
+        catch (_) { return null; }
+    },
+    /** Het muziekje van een dag uit het plan, of null (geen plan, of het plan gaat niet over die dag). */
+    _vmzVoorDag(datum) {
+        const p = this._vmzPlan();
+        if (!p) return null;
+        return p.items.find((x) => x && x.datum === datum && (x.ingebouwd || /^[a-f0-9]{12}$/.test(String(x.id || '')))) || null;
+    },
+    /** Vanuit showApp: na 20 s een eerste keer, daarna bij terugkeer in de app en elk uur (op vrijdag elk half uur). */
+    _vmzStart() {
+        if (!this._vmzLuistert) {
+            this._vmzLuistert = true;
+            document.addEventListener('visibilitychange', () => { if (!document.hidden) this._vmzSync().catch(() => {}); });
+            setInterval(() => { if (!document.hidden) this._vmzSync().catch(() => {}); }, 30 * 60000);
         }
+        clearTimeout(this._vmzT);
+        this._vmzT = setTimeout(() => { this._vmzSync(true).catch(() => {}); }, 20000);
+        this._vmzKlaarMaken().catch(() => {});
+    },
+    async _vmzSync(dwing) {
+        if (this._vmzBezig || !this.currentUser) return;
+        const s = RobawsAPI.sessieLees();
+        if (!s) return;
+        const nu = Date.now();
+        const wacht = new Date().getDay() === 5 ? 30 * 60000 : 3 * 3600000;
+        if (!dwing && nu - (this._vmzLaatst || 0) < wacht) return;
+        this._vmzBezig = true;
+        this._vmzLaatst = nu - wacht + 10 * 60000;   // mislukt het, dan over 10 minuten opnieuw
+        try {
+            const url = RobawsAPI.WORKER_AUTH_URL + '/bel-api/';
+            const r = await RobawsAPI._fetchWithTimeout(url + 'app-vrijdag-nu', { headers: { 'X-App-Sessie': s.token } }, 10000);
+            let j = null; try { j = await r.json(); } catch (_) {}
+            if (!r.ok || !j || !j.ok || !j.vrijdag) return;   // oude Worker of verlopen sessie: het vorige plan blijft
+            const items = [j.vrijdag, j.daarna].filter((x) => x && x.datum)
+                .map((x) => ({ datum: String(x.datum), id: String(x.id), naam: String(x.naam || ''), ingebouwd: !!x.ingebouwd }));
+            const nodig = items.filter((x) => !x.ingebouwd).map((x) => x.id).filter((x, i, a) => a.indexOf(x) === i);
+            for (const id of nodig) {
+                if (await this._vmzIdbGet(id)) continue;
+                const rb = await RobawsAPI._fetchWithTimeout(url + 'app-vrijdag-bestand?id=' + encodeURIComponent(id), { headers: { 'X-App-Sessie': s.token } }, 60000);
+                if (!rb.ok) continue;
+                const buf = await rb.arrayBuffer();
+                if (buf.byteLength > 1000 && buf.byteLength <= 2.2 * 1048576) await this._vmzIdbPut(id, buf);
+            }
+            try { localStorage.setItem('qe_vrijdag_plan', JSON.stringify({ t: nu, rev: j.rev, items })); } catch (_) {}
+            this._vmzLaatst = nu;
+            await this._vmzIdbHoud(nodig);
+            await this._vmzKlaarMaken();
+        } catch (_) {
+            // geen netwerk: het vorige plan en de bewaarde muziekjes blijven
+        } finally { this._vmzBezig = false; }
+    },
+    /** Op vrijdag het muziekje van vandaag al klaarzetten (blob-URL), zodat het bij de uitklok meteen speelt. */
+    async _vmzKlaarMaken() {
+        const e = this._vmzVoorDag(this._vmzVandaag());
+        if (!e || e.ingebouwd || new Date().getDay() !== 5) return;
+        if (this._vmzKlaar && this._vmzKlaar.id === e.id) return;
+        const buf = await this._vmzIdbGet(e.id);
+        if (!buf) return;
+        try {
+            const url = URL.createObjectURL(new Blob([buf], { type: 'audio/mpeg' }));
+            if (this._vmzKlaar) { try { URL.revokeObjectURL(this._vmzKlaar.url); } catch (_) {} }
+            this._vmzKlaar = { id: e.id, url };
+        } catch (_) {}
+    },
+
+    // ---- v436: beheer (Organisatie → Vrijdagmuziekje, alleen het bureel; ontwerp A "lijst met paneel") ----
+    // Lokaal wijzigen, teller, één knop Opslaan + Ongedaan maken. Opladen gaat meteen naar de bibliotheek, maar een nieuw
+    // muziekje is niet in gebruik: voor de werknemers verandert pas iets na Opslaan.
+    _vmzMagBeheer() { const u = RobawsAPI.getLoggedInUser(); return !!(u && u.role === 'bureel'); },
+    openVrijdagmuziek() {
+        if (!this._vmzMagBeheer()) { this.toast('Alleen het bureel kiest het vrijdagmuziekje', true); return; }
+        this.navigate('screenVrijdagmuziek', true);
+    },
+    async _vmzBeheerFetch(pad, init, ms) {
+        const s = RobawsAPI.sessieLees();
+        if (!s) throw new Error('Meld je opnieuw aan in de app om het vrijdagmuziekje te kiezen.');
+        const i = Object.assign({}, init || {});
+        i.headers = Object.assign({ 'X-App-Sessie': s.token }, i.headers || {});
+        const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/' + pad, i, ms || 12000);
+        let j = null; try { j = await r.json(); } catch (_e) {}
+        if (r.status === 404 && !(j && j.ok === false)) throw new Error('Nog niet beschikbaar (de server wordt bijgewerkt). Probeer later opnieuw.');
+        if (!j) throw new Error('Geen antwoord van de server (' + r.status + ')');
+        if (r.status === 409 && j.conflict) return j;
+        if (!r.ok || j.ok === false) throw new Error(j.error || ('Fout ' + r.status));
+        return j;
+    },
+    _vmzVanServer(j) {
+        const lijst = (j.items || []).map((x) => ({ id: String(x.id), naam: String(x.naam || ''), kb: Number(x.kb) || 0, duur: Number(x.duur) || 0,
+            ingebouwd: !!x.ingebouwd, per: x.per || null, door: x.door || '', t: x.t || 0 }));
+        return { srv: { rev: j.rev, std: j.std, items: JSON.parse(JSON.stringify(lijst)), vrijdag: j.vrijdag, daarna: j.daarna, max: j.max || 2097152 },
+            lijst, std: j.std, weg: [], fout: '', bezig: false, oplaad: null };
+    },
+    async loadVrijdagmuziek() {
+        const el = document.getElementById('vmzHost');
+        if (!el) return;
+        if (this._vmzB && this._vmzTel() > 0) { this._vmzRender(); return; }   // niet opgeslagen wijzigingen blijven staan
+        if (!this._vmzB) el.innerHTML = '<div class="spinner"></div>';
+        try {
+            this._vmzB = this._vmzVanServer(await this._vmzBeheerFetch('app-vrijdag-beheer'));
+            this._vmzRender();
+        } catch (e) {
+            el.innerHTML = '<p style="font-size:13px;color:var(--qe-red);margin:10px 0">' + this.escapeHtml((e && e.message) || 'Kon het vrijdagmuziekje niet laden') + '</p>';
+            const b = document.getElementById('vmzBewaar'); if (b) b.classList.remove('toon');
+        }
+    },
+    _vmzPerTekst(p) { return p ? p.vd + ' ' + this._VMZ_MAANDEN[p.vm - 1] + ' – ' + p.td + ' ' + this._VMZ_MAANDEN[p.tm - 1] : ''; },
+    _vmzDagTekst(ds, lang) {
+        const d = new Date(ds + 'T12:00:00Z');
+        return (lang ? 'vrijdag ' : '') + d.getUTCDate() + ' ' + this._VMZ_MAANDEN[d.getUTCMonth()];
+    },
+    _vmzDuur(s) { s = Math.round(Number(s) || 0); return s > 0 ? Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') : ''; },
+    _vmzMeta(x) { return [this._vmzDuur(x.duur), x.kb ? x.kb + ' kB' : ''].filter(Boolean).join(' · '); },
+    /** Zelfde regel als de Worker: de kortste periode die de dag bevat (gelijk = de jongste), anders de standaard. */
+    _vmzKies(st, ds) {
+        const m = Number(ds.slice(5, 7)), d = Number(ds.slice(8, 10)), x = m * 100 + d;
+        const dagen = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        const dvj = (dd, mm) => dagen.slice(0, mm - 1).reduce((s, n) => s + n, 0) + dd;
+        const lengte = (p) => { const a = dvj(p.vd, p.vm), b = dvj(p.td, p.tm); return b >= a ? b - a : b + 366 - a; };
+        const inP = (p) => { const a = p.vm * 100 + p.vd, b = p.tm * 100 + p.td; return a <= b ? (x >= a && x <= b) : (x >= a || x <= b); };
+        const pas = st.lijst.filter((y) => !y.ingebouwd && y.id !== st.std && y.per && inP(y.per)).sort((a, b) => (lengte(a.per) - lengte(b.per)) || ((b.t || 0) - (a.t || 0)));
+        return pas[0] || st.lijst.find((y) => y.id === st.std) || st.lijst.find((y) => y.ingebouwd) || st.lijst[0];
+    },
+    /** Eerste vrijdag na ds met een ander muziekje (hoogstens een jaar vooruit). */
+    _vmzWissel(st, ds) {
+        const nu = this._vmzKies(st, ds);
+        const d = new Date(ds + 'T12:00:00Z');
+        for (let i = 0; i < 53; i++) {
+            d.setUTCDate(d.getUTCDate() + 7);
+            const v = d.toISOString().slice(0, 10), k = this._vmzKies(st, v);
+            if (k && nu && k.id !== nu.id) return { datum: v, item: k };
+        }
+        return null;
+    },
+    /** Aantal wijzigingen tegenover wat op de server staat (verwijderd, naam, periode, standaard). */
+    _vmzTel() {
+        const st = this._vmzB;
+        if (!st) return 0;
+        let n = 0;
+        st.srv.items.forEach((o) => {
+            const x = st.lijst.find((y) => y.id === o.id);
+            if (!x) { n++; return; }
+            if (x.naam !== o.naam || JSON.stringify(x.per || null) !== JSON.stringify(o.per || null) || (st.std === x.id) !== (st.srv.std === o.id)) n++;
+        });
+        return n;
+    },
+    _VMZ_IC_SPEEL: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg>',
+    _VMZ_IC_PAUZE: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="2.5" width="3" height="11" rx="1" fill="currentColor"/><rect x="9.5" y="2.5" width="3" height="11" rx="1" fill="currentColor"/></svg>',
+    _vmzSpeelKnop(id, groot) {
+        const aan = this._vmzProef && this._vmzProef.id === id;
+        return '<button type="button" class="vmz-speel' + (groot ? ' groot' : '') + (aan ? ' aan' : '') + '" data-vmz-speel="' + this.escapeHtml(id) + '" aria-label="Beluisteren" onclick="event.stopPropagation();app._vmzProefToggle(\'' + this.escapeHtml(id) + '\')">' + (aan ? this._VMZ_IC_PAUZE : this._VMZ_IC_SPEEL) + '</button>';
+    },
+    _vmzRender() {
+        const st = this._vmzB, el = document.getElementById('vmzHost');
+        if (!st || !el) return;
+        const esc = (s) => this.escapeHtml(s);
+        const ds = (st.srv.vrijdag && st.srv.vrijdag.datum) || this._vmzVandaag();
+        const vandaag = ds === this._vmzVandaag();
+        const nu = this._vmzKies(st, ds), wissel = this._vmzWissel(st, ds);
+        let h = '<p class="vmz-sub">Speelt voor iedereen bij de laatste uitklok op vrijdag.</p>';
+        h += '<div class="card vmz-nu"><div class="vmz-boven">' + (vandaag ? 'Vanavond, ' + this._vmzDagTekst(ds, true) : 'Deze vrijdag, ' + this._vmzDagTekst(ds)) + '</div>'
+            + '<div class="vmz-hoofd">' + this._vmzSpeelKnop(nu.id, true) + '<div class="vmz-hoofd-t"><div class="vmz-groot">' + esc(nu.naam) + '</div>'
+            + '<div class="vmz-hint">' + (nu.id === st.std ? 'Standaardmuziekje' : 'Periode ' + this._vmzPerTekst(nu.per)) + (this._vmzDuur(nu.duur) ? ' · ' + this._vmzDuur(nu.duur) : '') + '</div>'
+            + '<div class="vmz-balk" data-vmz-balk="' + esc(nu.id) + '"><i></i></div></div></div>'
+            + (wissel ? '<div class="vmz-daarna">Vanaf ' + this._vmzDagTekst(wissel.datum, true) + ': <b>' + esc(wissel.item.naam) + '</b></div>' : '') + '</div>';
+        h += '<div class="vmz-sectie"><span>Bibliotheek</span><span>' + st.lijst.length + '</span></div><div class="card vmz-lijst">';
+        st.lijst.forEach((x) => {
+            let chips = '';
+            if (x.id === nu.id) chips += '<span class="vmz-chip nu">' + (vandaag ? 'Vanavond' : 'Deze vrijdag') + '</span>';
+            if (x.id === st.std) chips += '<span class="vmz-chip std">Standaard</span>';
+            else if (x.per) chips += '<span class="vmz-chip per">' + this._vmzPerTekst(x.per) + '</span>';
+            h += '<div class="vmz-rij" data-vmz-rij="' + esc(x.id) + '" onclick="app._vmzOpen(\'' + esc(x.id) + '\')">' + this._vmzSpeelKnop(x.id)
+                + '<div class="vmz-rij-t"><div class="vmz-naam">' + esc(x.naam) + '</div><div class="vmz-meta">' + esc(this._vmzMeta(x) || 'Meegeleverd met de app') + '</div>'
+                + (chips ? '<div class="vmz-chips">' + chips + '</div>' : '') + '</div><span class="vmz-pijl">›</span></div>';
+        });
+        if (st.oplaad) h += '<div class="vmz-rij"><div class="spinner" style="margin:0;width:28px;height:28px"></div><div class="vmz-rij-t"><div class="vmz-naam">' + esc(st.oplaad) + '</div><div class="vmz-meta">Bezig met opladen…</div></div></div>';
+        h += '</div>';
+        if (st.fout) h += '<div class="dp-fout" style="margin-top:10px">' + esc(st.fout) + '</div>';
+        h += '<button type="button" class="btn btn-outline btn-full vmz-op" onclick="app.vmzKiesBestand()"' + (st.oplaad ? ' disabled' : '') + '>+ Muziekje opladen</button>'
+            + '<div class="dp-hint" style="text-align:center">mp3, hoogstens 2 MB. Speelt hoogstens 15 seconden. Een nieuw muziekje is niet in gebruik tot je het kiest.</div>';
+        el.innerHTML = h;
+        const n = this._vmzTel(), b = document.getElementById('vmzBewaar');
+        if (b) {
+            b.classList.toggle('toon', n > 0);
+            const t = document.getElementById('vmzTeller'); if (t) t.textContent = n + (n === 1 ? ' wijziging' : ' wijzigingen');
+            const k = document.getElementById('btnVmzOpslaan'); if (k) { k.disabled = !!st.bezig; k.textContent = st.bezig ? 'Bezig…' : 'Opslaan'; }
+        }
+        this._vmzProefUi();
+    },
+    // ---- het paneel van één muziekje ----
+    _vmzOpen(id) {
+        const st = this._vmzB, x = st && st.lijst.find((y) => y.id === id);
+        if (!x) return;
+        this._vmzS = { id, naam: x.naam, w: id === st.std ? 'std' : x.per ? 'per' : 'niet', per: x.per ? Object.assign({}, x.per) : { vd: 1, vm: 12, td: 31, tm: 12 } };
+        this.showModal('<div class="vmz-sheet" id="vmzSheet"></div>');
+        this._vmzSheetRender();
+    },
+    _vmzSheetRender() {
+        const el = document.getElementById('vmzSheet'), st = this._vmzB, s = this._vmzS;
+        if (!el || !st || !s) return;
+        const x = st.lijst.find((y) => y.id === s.id);
+        if (!x) return;
+        const esc = (v) => this.escapeHtml(v);
+        const isStd = x.id === st.std;
+        const opties = (n, kies, lbl) => { let o = ''; for (let i = 1; i <= n; i++) o += '<option value="' + i + '"' + (i === kies ? ' selected' : '') + '>' + (lbl ? lbl[i - 1] : i) + '</option>'; return o; };
+        const datum = (pref, d, m) => '<div class="vmz-datum"><select class="form-input" aria-label="Dag" onchange="app._vmzSheetPer(\'' + pref + 'd\',this.value)">' + opties(31, d) + '</select>'
+            + '<select class="form-input" aria-label="Maand" onchange="app._vmzSheetPer(\'' + pref + 'm\',this.value)">' + opties(12, m, this._VMZ_MAANDEN) + '</select></div>';
+        const keuze = (w, t, sub, uit) => '<label class="vmz-keuze' + (uit ? ' uit' : '') + '"><input type="radio" name="vmzW" value="' + w + '"' + (s.w === w ? ' checked' : '') + (uit ? ' disabled' : '')
+            + ' onchange="app._vmzSheetW(this.value)"><span><b>' + t + '</b><small>' + sub + '</small></span></label>';
+        let h = '<div class="modal-header"><h2>' + esc(x.naam) + '</h2></div>'
+            + '<div class="vmz-hint">' + esc([this._vmzMeta(x), x.ingebouwd ? 'meegeleverd met de app' : (x.door ? 'opgeladen door ' + x.door : '')].filter(Boolean).join(' · ')) + '</div>'
+            + '<button type="button" class="btn btn-outline btn-full vmz-luister" data-vmz-speel="' + esc(x.id) + '" onclick="app._vmzProefToggle(\'' + esc(x.id) + '\')">' + (this._vmzProef && this._vmzProef.id === x.id ? 'Stoppen' : 'Beluisteren') + '</button>';
+        if (!x.ingebouwd) h += '<div class="form-group" style="margin:14px 0 0"><label for="vmzNaam">Naam</label><input id="vmzNaam" class="form-input" maxlength="60" value="' + esc(s.naam) + '" oninput="app._vmzS.naam=this.value"></div>';
+        h += '<div class="dp-groep" style="margin-top:16px">Wanneer speelt dit?</div>'
+            + keuze('std', 'Standaard', 'Elke vrijdag, behalve tijdens een periode')
+            + keuze('per', 'In een periode', x.ingebouwd ? 'Kan niet met het meegeleverde muziekje' : 'Elk jaar opnieuw, daarna weer het standaardmuziekje', x.ingebouwd);
+        if (s.w === 'per') h += '<div class="vmz-twee"><div><div class="vmz-lbl">Van</div>' + datum('v', s.per.vd, s.per.vm) + '</div><div><div class="vmz-lbl">Tot en met</div>' + datum('t', s.per.td, s.per.tm) + '</div></div>';
+        h += keuze('niet', 'Niet gebruiken', 'Blijft in de bibliotheek');
+        if (isStd && s.w !== 'std') h += '<div class="vmz-let-op">Dit is het standaardmuziekje. Kies eerst een ander muziekje als standaard: er moet er altijd één zijn.</div>';
+        if (s.w === 'per' && !this._vmzPerOk(s.per)) h += '<div class="vmz-let-op">Die datum bestaat niet. Kijk de dagen na.</div>';
+        h += '<div class="vmz-knoppen">' + (x.ingebouwd ? '' : '<button type="button" class="btn vmz-weg"' + (isStd ? ' disabled' : '') + ' onclick="app._vmzSheetWeg()">Verwijderen</button>')
+            + '<button type="button" class="btn btn-primary" onclick="app._vmzSheetKlaar()">Klaar</button></div>';
+        el.innerHTML = h;
+    },
+    _vmzPerOk(p) {
+        const dagen = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        return !!p && p.vd >= 1 && p.vd <= dagen[p.vm - 1] && p.td >= 1 && p.td <= dagen[p.tm - 1];
+    },
+    _vmzSheetW(w) { if (this._vmzS) { this._vmzS.w = w; this._vmzSheetRender(); } },
+    _vmzSheetPer(k, v) { if (this._vmzS) { this._vmzS.per[k] = Number(v); this._vmzSheetRender(); } },
+    _vmzSheetKlaar() {
+        const st = this._vmzB, s = this._vmzS, x = st && s && st.lijst.find((y) => y.id === s.id);
+        if (!x) { this.closeModal(); return; }
+        if (s.w === 'per' && !this._vmzPerOk(s.per)) { this._vmzSheetRender(); return; }
+        if (!x.ingebouwd) x.naam = String(s.naam || '').replace(/\s+/g, ' ').trim().slice(0, 60) || x.naam;
+        if (s.w === 'std') { st.std = x.id; x.per = null; }
+        else if (x.id !== st.std) x.per = s.w === 'per' ? Object.assign({}, s.per) : null;
+        this._vmzS = null;
+        this.closeModal();
+        this._vmzRender();
+    },
+    _vmzSheetWeg() {
+        const st = this._vmzB, s = this._vmzS;
+        if (!st || !s || s.id === st.std) return;
+        if (!confirm('Dit muziekje verwijderen? Het verdwijnt pas na Opslaan.')) return;
+        st.lijst = st.lijst.filter((y) => y.id !== s.id);
+        if (st.weg.indexOf(s.id) < 0) st.weg.push(s.id);
+        if (this._vmzProef && this._vmzProef.id === s.id) this._vmzProefStop();
+        this._vmzS = null;
+        this.closeModal();
+        this._vmzRender();
+    },
+    vmzOngedaan() {
+        const st = this._vmzB;
+        if (!st) return;
+        st.lijst = JSON.parse(JSON.stringify(st.srv.items));
+        st.std = st.srv.std; st.weg = []; st.fout = '';
+        this._vmzRender();
+    },
+    async vmzOpslaan() {
+        const st = this._vmzB;
+        if (!st || st.bezig || !this._vmzTel()) return;
+        st.bezig = true; st.fout = ''; this._vmzRender();
+        try {
+            const body = { rev: st.srv.rev, std: st.std, weg: st.weg.slice(),
+                items: st.lijst.filter((x) => !x.ingebouwd).map((x) => ({ id: x.id, naam: x.naam, per: x.per || null })) };
+            const j = await this._vmzBeheerFetch('app-vrijdag-bewaar', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            this._vmzB = this._vmzVanServer(j);
+            if (j.conflict) { this._vmzRender(); this.toast(j.error || 'Iemand anders paste het intussen aan', true); return; }
+            this._vmzRender();
+            const v = j.vrijdag;
+            this.toast('Opgeslagen' + (v && v.naam ? '. Vrijdag speelt ' + v.naam : ''));
+            this._vmzSync(true).catch(() => {});   // ook deze gsm meteen bij
+        } catch (e) {
+            st.bezig = false;
+            st.fout = (e && e.message) || 'Opslaan mislukte';
+            this._vmzRender();
+        }
+    },
+    // ---- opladen ----
+    vmzKiesBestand() {
+        const i = document.getElementById('vmzBestand');
+        if (!i) return;
+        i.value = '';
+        i.click();
+    },
+    _vmzDuurVan(file) {
+        return new Promise((resolve) => {
+            let url = null, klaar = false;
+            const af = (d) => { if (klaar) return; klaar = true; try { if (url) URL.revokeObjectURL(url); } catch (_) {} resolve(d); };
+            try {
+                url = URL.createObjectURL(file);
+                const a = new Audio();
+                a.preload = 'metadata';
+                a.onloadedmetadata = () => af(isFinite(a.duration) ? a.duration : 0);
+                a.onerror = () => af(0);
+                a.src = url;
+                setTimeout(() => af(0), 4000);
+            } catch (_) { af(0); }
+        });
+    },
+    async _vmzOplaad(input) {
+        const st = this._vmzB, f = input && input.files && input.files[0];
+        if (!st || !f) return;
+        const mb = (n) => (n / 1048576).toFixed(1).replace('.', ',');
+        if (f.size > (st.srv.max || 2097152)) { st.fout = '"' + f.name + '" is ' + mb(f.size) + ' MB. Een muziekje mag hoogstens 2 MB zijn.'; this._vmzRender(); return; }
+        st.fout = ''; st.oplaad = f.name; this._vmzRender();
+        try {
+            const duur = await this._vmzDuurVan(f);
+            const naam = String(f.name || 'Muziekje').replace(/\.mp3$/i, '');
+            const j = await this._vmzBeheerFetch('app-vrijdag-oplaad?naam=' + encodeURIComponent(naam) + '&duur=' + encodeURIComponent(Math.round(duur * 10) / 10),
+                { method: 'POST', headers: { 'Content-Type': 'audio/mpeg' }, body: f }, 90000);
+            const st2 = this._vmzB;
+            const nieuw = (j.items || []).find((x) => String(x.id) === String(j.nieuw));
+            if (st2 === st && nieuw && Number(j.rev) === Number(st.srv.rev) + 1) {
+                // alleen het nieuwe muziekje erbij: de wijzigingen die nog niet opgeslagen zijn, blijven staan
+                const kort = this._vmzVanServer({ items: [nieuw] }).lijst[0];
+                st.srv.rev = j.rev; st.srv.items.push(JSON.parse(JSON.stringify(kort))); st.lijst.push(kort);
+                st.oplaad = null;
+            } else {
+                this._vmzB = this._vmzVanServer(j);
+            }
+            this._vmzRender();
+            this.toast('Opgeladen. Tik erop om het te kiezen.');
+        } catch (e) {
+            st.oplaad = null;
+            st.fout = (e && e.message) || 'Opladen mislukte';
+            this._vmzRender();
+        }
+    },
+    // ---- beluisteren in het beheer (zelfde 15 s als op vrijdag) ----
+    async _vmzProefToggle(id) {
+        if (this._vmzProef && this._vmzProef.id === id) { this._vmzProefStop(); return; }
+        this._vmzProefStop();
+        const st = this._vmzB, x = st && st.lijst.find((y) => y.id === id);
+        if (!x) return;
+        const p = { id, audio: null };
+        this._vmzProef = p;
+        this._vmzProefUi();
+        try {
+            let src = this._VMZ_INGEBOUWD;
+            if (!x.ingebouwd) {
+                this._vmzBlobs = this._vmzBlobs || {};
+                if (!this._vmzBlobs[id]) {
+                    let buf = await this._vmzIdbGet(id);
+                    if (!buf) {
+                        const s = RobawsAPI.sessieLees();
+                        const r = await RobawsAPI._fetchWithTimeout(RobawsAPI.WORKER_AUTH_URL + '/bel-api/app-vrijdag-bestand?id=' + encodeURIComponent(id), { headers: { 'X-App-Sessie': s ? s.token : '' } }, 60000);
+                        if (!r.ok) throw new Error('niet gevonden');
+                        buf = await r.arrayBuffer();
+                    }
+                    this._vmzBlobs[id] = URL.createObjectURL(new Blob([buf], { type: 'audio/mpeg' }));
+                }
+                src = this._vmzBlobs[id];
+            }
+            if (this._vmzProef !== p) return;   // intussen op iets anders getikt
+            p.audio = new Audio(src);
+            p.audio.ontimeupdate = () => this._vmzProefUi();
+            p.audio.onended = () => { if (this._vmzProef === p) this._vmzProefStop(); };
+            p.audio.onerror = () => { if (this._vmzProef === p) { this._vmzProefStop(); this.toast('Dit muziekje speelt niet af op deze gsm', true); } };
+            p.stop = setTimeout(() => { if (this._vmzProef === p) this._vmzProefStop(); }, 15000);
+            await p.audio.play();
+        } catch (e) {
+            if (this._vmzProef === p) { this._vmzProefStop(); this.toast('Beluisteren lukte niet', true); }
+        }
+    },
+    _vmzProefStop() {
+        const p = this._vmzProef;
+        this._vmzProef = null;
+        if (p) { clearTimeout(p.stop); try { if (p.audio) p.audio.pause(); } catch (_) {} }
+        this._vmzProefUi();
+    },
+    _vmzProefUi() {
+        const p = this._vmzProef;
+        document.querySelectorAll('[data-vmz-speel]').forEach((b) => {
+            const aan = !!(p && b.getAttribute('data-vmz-speel') === p.id);
+            b.classList.toggle('aan', aan);
+            if (b.classList.contains('vmz-speel')) b.innerHTML = aan ? this._VMZ_IC_PAUZE : this._VMZ_IC_SPEEL;
+            else b.textContent = aan ? 'Stoppen' : 'Beluisteren';
+        });
+        document.querySelectorAll('[data-vmz-balk]').forEach((bk) => {
+            const i = bk.firstElementChild;
+            let w = 0;
+            if (p && p.audio && bk.getAttribute('data-vmz-balk') === p.id) {
+                const lang = Math.min(isFinite(p.audio.duration) && p.audio.duration > 0 ? p.audio.duration : 15, 15);
+                w = Math.min(100, Math.round(100 * p.audio.currentTime / lang));
+            }
+            if (i) i.style.width = w + '%';
+        });
     },
 
     /** v220: fallback-fanfare via Web Audio (origineel deuntje, ±2,4 s) —
@@ -25301,6 +25942,7 @@ const app = {
         if (!j || !this._medKanVragen()) return;
         this._medAfzender = !!j.afzender;
         this._medNativeZet();
+        this._stilteNaarGsm();   // v437
         this._medKaartBij();
         this._medActief = j.items;
         // al gelezen op een ander toestel: ook hier onthouden
@@ -26215,6 +26857,9 @@ const app = {
         if (kp) kp.style.display = mag ? '' : 'none';
         // v428: Meldingen alleen voor wie de Worker als afzender kent (antwoord van de laatste controle)
         try { this._medKaartBij(); if (this._medAfzender == null) this._medControle({ stil: true }); } catch (_e) {}
+        // v436: Vrijdagmuziekje alleen voor het bureel (de Worker kijkt het ook na)
+        const kvm = document.getElementById('orgKaartVrijdag');
+        if (kvm) kvm.style.display = this._vmzMagBeheer() ? '' : 'none';
         const sub = document.getElementById('orgProjectenSub');
         if (!sub || !mag) return;
         Promise.all([RobawsAPI.getProjectenOverzicht(), RobawsAPI.getActiveEmployees().catch(() => [])]).then(([lijst, emps]) => {
