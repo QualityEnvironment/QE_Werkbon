@@ -21247,6 +21247,12 @@ const app = {
             </button>`;
     },
 
+    /** v439: zijn de uren van deze dag nagekeken door het bureel? (klok-werkbonnen van één dag) */
+    urenNagekeken(wos) {
+        const klok = (wos || []).filter((w) => /tijdsregistratie/i.test(String(w.status || '')));
+        return klok.length > 0 && klok.every((w) => /gecontrolleerd|gecontroleerd/i.test(String(w.status || '')) || !!w.lockedAt);
+    },
+
     async loadDagoverzicht(monthOffset) {
         if (typeof monthOffset === 'number') this._dagoverzichtMonthOffset = monthOffset;
         const offset = this._dagoverzichtMonthOffset || 0;
@@ -21563,6 +21569,8 @@ const app = {
 
             // v324: hint BOVEN de daglijst (stond onder 31 blokken verstopt)
             html += `<div style="font-size:12px;color:var(--g1);margin:2px 0 6px">Klopt een dag niet? Tik erop om een aanpassing aan te vragen.</div>`;
+            // v439: bij elke voorbije dag zie je of het bureel je uren al nakeek (vraag Levi 27 okt 2026)
+            const vandaagStr = this._localDateStr ? this._localDateStr(new Date()) : new Date().toISOString().slice(0, 10);
 
             // Per dag: huidige maand t/m vandaag; een vorige maand = volledige
             // maand (laatste dag t/m de 1e). v179.
@@ -21609,6 +21617,15 @@ const app = {
                             <span style="font-size:14px;font-weight:700;color:var(--ink)">${dayName} ${dateStr}${fietsPerDag[date] ? ' <span title="Met de fiets naar het werk" style="font-size:13px">&#128690;</span>' : ''}</span>
                             <span style="font:600 17px var(--font);color:var(--ink);font-variant-numeric:tabular-nums;letter-spacing:-0.3px">${fmt1(dayTotal)} u${clickWo ? ' <span style="color:var(--g3);font-weight:400">&rsaquo;</span>' : ''}</span>
                         </div>`;
+
+                    // v439: nagekeken door het bureel = de klok-werkbon staat op "tijdsregistratie gecontrolleerd" (dubbele l,
+                    // zo in Robaws) of is vergrendeld. Vandaag zelf zegt niets (de dag loopt nog).
+                    const nagekeken = this.urenNagekeken(wos);
+                    if (nagekeken || date < vandaagStr) {
+                        html += nagekeken
+                            ? `<div class="uren-nagekeken ja" style="display:inline-flex;align-items:center;gap:5px;margin:0 0 6px;padding:2px 9px;border-radius:99px;background:var(--gwash);color:var(--green2);font-size:11.5px;font-weight:700">&#10003; Nagekeken door het bureel</div>`
+                            : `<div class="uren-nagekeken nee" style="display:inline-flex;align-items:center;gap:5px;margin:0 0 6px;padding:2px 9px;border-radius:99px;background:var(--l2);color:var(--g2);font-size:11.5px;font-weight:600">Nog niet nagekeken</div>`;
+                    }
 
                     // v379: heeft bureel iets aangepast aan deze dag, dan
                     // staat de reden in het extraveld "Opmerking
@@ -23741,6 +23758,12 @@ const app = {
         const self = this;
         const esc = (s) => self.escapeHtml(String(s == null ? '' : s));
         const cap = (s) => { const x = String(s || ''); return x ? x.charAt(0).toUpperCase() + x.slice(1) : x; };
+        // v440: de gebruikte camionet. Bureel klokt vrij uit (v259): geen vraag. Voorkeur = de camionet van de gescande tag,
+        // anders de eigen camionet (RobawsAPI.EIGEN_CAMIONET / toegewezen in Robaws). De volledige lijst laadt hieronder.
+        const rolNu = String(((RobawsAPI.getLoggedInUser && RobawsAPI.getLoggedInUser()) || {}).role || '');
+        const vraagVoertuig = rolNu !== 'bureel';
+        const tagVoertuig = (tag && tag.type === 'camionet' && /^[0-9]-[A-Z]{2,3}-[0-9]{3}$/.test(String(tag.name || '').trim())) ? String(tag.name).trim() : '';
+        let voorkeur = tagVoertuig || (vraagVoertuig ? RobawsAPI.eigenCamionet(employeeId, null) : '');
         return new Promise((resolve) => {
             let m = document.getElementById('kmPromptModal');
             if (m) m.remove();
@@ -23778,6 +23801,16 @@ const app = {
                 +       radio('-3', 'Chauffeur zonder passagiers', true) + radio('-1', 'Chauffeur met passagiers', false) + radio('-2', 'Passagier', false)
                 +     '</div>'
                 +   '</div>'
+                // v440: met welke camionet reed je vandaag? (verplicht voor monteurs en techniekers, standaard de eigen camionet)
+                +   (vraagVoertuig
+                    ? '<div id="kmVoertuigBlok" style="margin-top:16px">'
+                      + '<label for="kmVoertuig" style="font:500 12px var(--font,inherit);color:var(--g1);display:block;margin-bottom:8px">Met welke camionet reed je vandaag?</label>'
+                      + '<select id="kmVoertuig" style="width:100%;box-sizing:border-box;padding:12px;border:1px solid var(--b1);border-radius:10px;background:var(--card);color:var(--ink);font:500 15px var(--font,inherit)">'
+                      +   (voorkeur ? '<option value="' + esc(voorkeur) + '" selected>' + esc(RobawsAPI.voertuigLabel(voorkeur)) + '</option>' : '<option value="" selected>Kies een camionet</option>')
+                      + '</select>'
+                      + '<div style="font-size:11.5px;color:var(--g2);margin-top:4px;line-height:1.4">' + (voorkeur ? 'Staat op je eigen camionet. Reed je met een andere? Kies die dan.' : 'Kies de camionet waarmee je vandaag reed.') + '</div>'
+                      + '</div>'
+                    : '')
                 +   '<div id="kmOpmBlok" style="margin:16px 0 14px">'
                 +     '<div id="kmOpmHint" style="display:none;margin-bottom:8px;padding:10px 12px;border-radius:10px;background:var(--awash2);border:1px solid var(--aborder2,var(--aborder));color:var(--amber2);font-size:12.5px;line-height:1.45">'
                 +       '<div id="kmOpmHintTekst" style="font-weight:700"></div>'
@@ -23794,6 +23827,20 @@ const app = {
                 + '</div>'
                 + '</div>';
             document.body.appendChild(m);
+
+            // v440: de volledige lijst camionetten (Robaws Materieel) + "Geen camionet"; de keuze blijft staan
+            const voertuigEl = document.getElementById('kmVoertuig');
+            if (voertuigEl) {
+                RobawsAPI.klokVoertuigen().then((lijst) => {
+                    if (!document.body.contains(voertuigEl)) return;
+                    const gekozen = voertuigEl.value || tagVoertuig || RobawsAPI.eigenCamionet(employeeId, lijst);
+                    const namen = lijst.map(x => x.naam);
+                    if (gekozen && gekozen !== RobawsAPI.VOERTUIG_GEEN && namen.indexOf(gekozen) < 0) lijst.unshift({ naam: gekozen, label: RobawsAPI.voertuigLabel(gekozen) });
+                    voertuigEl.innerHTML = (gekozen ? '' : '<option value="" selected>Kies een camionet</option>')
+                        + lijst.map(x => '<option value="' + esc(x.naam) + '"' + (x.naam === gekozen ? ' selected' : '') + '>' + esc(x.label) + '</option>').join('')
+                        + '<option value="' + esc(RobawsAPI.VOERTUIG_GEEN) + '"' + (gekozen === RobawsAPI.VOERTUIG_GEEN ? ' selected' : '') + '>Geen camionet gebruikt</option>';
+                }).catch(() => {});
+            }
 
             const errEl = document.getElementById('kmPromptError');
             const btn = document.getElementById('kmPromptSubmit');
@@ -23925,6 +23972,15 @@ const app = {
                     try { opmEl.focus({ preventScroll: true }); } catch (_) {}
                     return;
                 }
+                // v440: de camionet is verplicht (monteurs en techniekers)
+                const voertuigKeuze = voertuigEl ? String(voertuigEl.value || '').trim() : '';
+                if (voertuigEl && !voertuigKeuze) {
+                    errEl.textContent = 'Kies met welke camionet je vandaag reed.';
+                    errEl.setAttribute('data-soort', 'voertuig');
+                    errEl.style.display = 'block';
+                    try { document.getElementById('kmVoertuigBlok').scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
+                    return;
+                }
                 if (eindeBureau && !vervoer) {
                     errEl.textContent = 'Kies hoe je vandaag naar het werk gekomen bent.';
                     errEl.setAttribute('data-soort', 'vervoer');
@@ -23938,6 +23994,7 @@ const app = {
                 errEl.style.display = 'none';
                 errEl.removeAttribute('data-soort');
                 if (opmEl) opmEl.readOnly = true;
+                if (voertuigEl) voertuigEl.disabled = true;   // v440
                 try {
                     const k = await kmMetLimiet;
                     btn.textContent = 'Bevestigen…';
@@ -23972,13 +24029,14 @@ const app = {
                     self.toast(eindeBureau
                         ? 'Uitklokken bevestigd' + (kmTxt ? ' · ' + kmTxt : '') + ' · ' + RobawsAPI.WOONWERK_VERVOER[vervoer]
                         : (kmTxt ? 'Kilometers opgeslagen: ' + kmTxt : 'Uitklokken bevestigd'));
-                    resolve({ bevestigd: true, opmerking: opmerking, extraRegels: regels });
+                    resolve({ bevestigd: true, opmerking: opmerking, extraRegels: regels, voertuig: voertuigKeuze });
                 } catch (e) {
                     console.warn('[App] kilometers boeken faalde:', e && e.message);
                     errEl.textContent = 'Opslaan mislukt: ' + ((e && e.message) || '?');
                     errEl.style.display = 'block';
                     btn.disabled = false;
                     if (opmEl) opmEl.readOnly = false;
+                    if (voertuigEl) voertuigEl.disabled = false;   // v440
                     btn.textContent = knopTekst();
                 } finally {
                     self._kmSubmitBusy = false;

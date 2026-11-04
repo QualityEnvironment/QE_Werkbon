@@ -340,7 +340,7 @@
             ['Ik werkte vandaag op meerdere werven. Op welke werkbon komen mijn uren?', 'Op de werkbonnen die jij kiest. Bij het uitklokken verdeel je je gewerkte uren over je openstaande dagplanningen, bv. 1u, 4u en 3u. De app laat je pas verder als het samen precies klopt en verstuurt dan alle werkbonnen. Wie je aanvinkt bij "Voor wie zijn de uren?" krijgt dezelfde verdeling.', 'monteur'],
             ['Ik zette de uren van een collega mee op mijn werkbon. Moet hij nog iets doen?', 'Nee. Zodra jouw werkbon verstuurd is, verdwijnt die dagplanning uit zijn planning en vult hij zijn uren daar niet nog eens in. Staat een collega bij "Voor wie zijn de uren?" in het grijs? Dan staan zijn uren al op een werkbon van die dagplanning.', 'monteur'],
             ['Ik ben vroeger begonnen omdat het zo afgesproken was.', 'Zet het bij het uitklokken in het vak "Opmerking voor het bureel" (met wie het afgesproken was). Dan staat het bij je uren en hoeft niemand het te onthouden. Begon je duidelijk vroeger dan je startuur, dan herinnert de app je er zelf aan.'],
-            ['Ik ben vergeten uit te klokken.', 'De app merkt dat de volgende ochtend en helpt je de dag netjes af te sluiten. Klopt de tijd niet? Vraag een aanpassing aan.'],
+            ['Ik ben vergeten uit te klokken.', 'De app merkt dat bij je volgende scan en sluit die dag af om 15:30. Werkte je langer? Vraag dan een aanpassing aan via Mijn uren.'],
             ['Mijn kilometers kloppen niet.', 'De app rekent de rit uit met je dagplanning: vanaf het bureau of van thuis naar je eerste werf, en van je laatste werf terug. Moest je een omweg maken? Zet het in "Opmerking voor het bureel". Alleen het bureel kan kilometers aanpassen.'],
             ['Ik reed rechtstreeks van de werf naar huis.', 'Dat weet de app al: klok je uit op de werf en scan je daarna geen woon-werkverkeer-tag, dan rekent ze je terugrit naar huis.'],
             ['Ik was passagier.', 'Kies "Passagier" bij mobiliteit. De kilometers rekent de app uit.'],
@@ -374,6 +374,7 @@
         { t: 'faq', items: [
             ['Er staat "te laat" bij een dag, maar dat klopt niet.', 'Tik op de dag en vraag een aanpassing aan met de echte tijden. Vince kijkt het na.'],
             ['Waar zie ik mijn overuren?', 'Bovenaan bij de maandtotalen (paars cijfer) en per dag met een paars label. Weekend telt automatisch als overuren.'],
+            ['Heeft het bureel mijn uren al nagekeken?', 'Kijk onder de datum. <b style="color:var(--green2,#2e7d32)">✓ Nagekeken door het bureel</b> betekent dat de dag klaar is. Staat er <b>Nog niet nagekeken</b>, dan moet het bureel die dag nog bekijken.'],
             ['Ziekte of verlof — staat dat er ook tussen?', 'Ja, die dagen staan gewoon in de lijst met hun eigen label.'],
             ['Ik ging in de namiddag naar de dokter of het ziekenhuis, met een ziektebriefje. Hoe staat dat?', 'Geef het briefje af op kantoor. Het bureel zet dan de rest van die dag op <b>ziek</b>: bij die dag zie je een rode regel "Ziek · rest van de dag". Die uren gaan <b>niet</b> van je overuren af en tellen niet bij je gewerkte uren. Bij een halve dag verlof werkt het net zo.'],
             ['Kloppen deze cijfers met mijn loonbrief?', 'Dit zijn de geklokte uren waar kantoor mee rekent. Zie je een verschil? Bel Vince.'],

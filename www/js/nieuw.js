@@ -14,6 +14,19 @@
 (function (root) {
     'use strict';
     var LIJST = [
+        { v: 442, datum: '2026-11-04', items: [
+            { s: 'beter', rol: ['bureel'], titel: 'Je goedkeuringen staan er weer', tekst: 'Facturen en verlof die op jouw goedkeuring wachten, zie je weer onder Aanvragen. Goedkeuren en afkeuren gaat zoals vroeger.' },
+        ] },
+        { v: 441, datum: '2026-10-30', items: [
+            { s: 'beter', titel: 'Laden en lossen per kwartier', tekst: 'Laden en lossen wordt nu afgerond op het dichtste kwartier, net als je andere uren. Een korte scan telt altijd minstens een kwartier.' },
+        ] },
+        { v: 440, datum: '2026-10-28', items: [
+            { s: 'nieuw', rol: ['monteur', 'technieker'], titel: 'Met welke camionet reed je?', tekst: 'Bij het uitklokken vraagt de app met welke camionet je vandaag reed. Je eigen camionet staat al klaar. Reed je met een andere, kies die dan. Scande je de tag van een camionet, dan staat die klaar.' },
+        ] },
+        { v: 439, datum: '2026-10-27', items: [
+            { s: 'nieuw', titel: 'Zie of je uren nagekeken zijn', tekst: 'Bij Mijn uren staat nu onder elke dag of het bureel je uren al nakeek. Een groen vinkje betekent: klaar.', hoofdstuk: 'uren-nakijken' },
+            { s: 'beter', titel: 'Vergeten uit te klokken', tekst: 'Vergeet je uit te klokken, dan sluit de app die dag bij je volgende scan af om 15:30. Werkte je langer? Tik bij Mijn uren op die dag en vraag een aanpassing.', hoofdstuk: 'aanpassing' },
+        ] },
         { v: 438, datum: '2026-10-23', items: [
             { s: 'nieuw', titel: 'Werk in het weekend', tekst: 'Staat er voor jou iets gepland op zaterdag of zondag? Dan zie je die dag nu ook bovenaan in de planning. Tik erop om te zien wat er gepland is.' },
         ] },
