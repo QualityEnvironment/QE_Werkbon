@@ -14,6 +14,18 @@
 (function (root) {
     'use strict';
     var LIJST = [
+        { v: 447, datum: '2026-11-06', items: [
+            { s: 'opgelost', rol: ['bureel'], titel: 'Goedkeurder toevoegen', tekst: 'Een goedkeurder toevoegen aan een factuur gaf een foutmelding met 404. Dat werkt nu weer. Krijg je nog een 404, dan is de aanvraag niet meer open of staat ze niet op jouw naam.' },
+        ] },
+        { v: 445, datum: '2026-11-05', items: [
+            { s: 'beter', rol: ['bureel'], titel: 'Gasflessen volgens het contract', tekst: 'Bij de gasflessen zie je bovenaan per gas en maat hoeveel flessen er zijn tegenover het contract. Bij elke fles staat waar ze is en wie ze heeft. De dagen in huur zijn weg: de huur ligt nu vast.' },
+        ] },
+        { v: 444, datum: '2026-11-05', items: [
+            { s: 'beter', rol: ['monteur', 'technieker'], titel: 'Met de camionet via het bureau', tekst: 'Reed je als chauffeur met de camionet van thuis naar het bureau en daarna naar de werf? Dan telt dat hele stuk nu bij je heenrit. De heenrit telt die dag niet meer als woon-werkverkeer.' },
+        ] },
+        { v: 443, datum: '2026-11-05', items: [
+            { s: 'beter', rol: ['bureel', 'monteur', 'technieker'], titel: 'Nieuwe gasflessen van Air Liquide', tekst: 'De gasflessen van Air Liquide staan in de app. Bij een nieuwe fles kies je het gas en klein of groot. Is een fles niet meer vol maar ook nog niet leeg, dan duid je In gebruik aan.' },
+        ] },
         { v: 442, datum: '2026-11-04', items: [
             { s: 'beter', rol: ['bureel'], titel: 'Je goedkeuringen staan er weer', tekst: 'Facturen en verlof die op jouw goedkeuring wachten, zie je weer onder Aanvragen. Goedkeuren en afkeuren gaat zoals vroeger.' },
         ] },

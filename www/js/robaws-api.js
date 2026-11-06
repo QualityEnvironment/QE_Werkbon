@@ -1108,6 +1108,7 @@ const RobawsAPI = {
         const res = eigenKey
             ? await this._personalFetch('POST', 'approval-requests/' + approvalId + '/' + action, { reason: reason || '' })
             : await this.post('approval-requests/' + approvalId + '/' + action, { reason: reason || '' });
+        if (res.code === 404) throw new Error(this._AANVRAAG_404);
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) {
             throw new Error('Robaws gaf status ' + res.code);
         }
@@ -1116,7 +1117,7 @@ const RobawsAPI = {
         // check dat de BESLISSER (eigen user of Rolf) nu écht beslist heeft.
         const verwachtUid = (eigenKey && uid) ? uid : String(this.KEY_OWNER_USER_ID);
         try {
-            const chk = await this.get('approval-requests/' + approvalId + '?include=userStates', { bypassCache: true });
+            const chk = await this._aanvraagLees(approvalId, 'userStates');
             const st = ((chk.data && chk.data.userStates) || []).find(s => String(s.userId) === verwachtUid);
             if (st && String(st.status) === 'AWAITING_DECISION') {
                 throw new Error('Robaws registreerde de beslissing niet');
@@ -1254,10 +1255,18 @@ const RobawsAPI = {
                 if (w.ok) { const j = await w.json(); if (j && j.ok && j.item) return j.item; }
             }
         } catch (_e) {}
-        const r = await this.get('approval-requests/' + approvalId + '?include=supplier,userStates', { bypassCache: true });
+        const r = await this._aanvraagLees(approvalId, 'supplier,userStates');
         if (r.code !== 200) throw new Error('Robaws gaf status ' + r.code);
         return r.data || null;
     },
+
+    /** v447 (melding Levi 6 nov 2026: Rolf krijgt een 404; gemeten: de algemene sleutel krijgt 404 op elke aanvraag, de eigen
+     *  sleutel van wie erop staat 200): één aanvraag lezen gaat met de eigen sleutel als die er is. */
+    async _aanvraagLees(approvalId, include) {
+        const pad = 'approval-requests/' + approvalId + '?include=' + include;
+        return this.hasOwnKey() ? await this._personalFetch('GET', pad) : await this.get(pad, { bypassCache: true });
+    },
+    _AANVRAAG_404: 'Robaws vindt deze aanvraag niet (404). Ze is niet meer open of staat niet op jouw naam. Ververs de lijst.',
 
     /** De document-id (meestal de PDF) van een aankoopfactuur ophalen. */
     async getPurchaseInvoiceDocumentId(invoiceId) {
@@ -1267,12 +1276,22 @@ const RobawsAPI = {
     },
 
     /** Voeg een extra goedkeurder (Robaws userId) toe aan een approval-request
-     *  (POST .../add-approver, geverifieerd → 204). */
+     *  (POST .../add-approver, geverifieerd → 204). v447: met de eigen sleutel, net als goedkeuren;
+     *  de algemene sleutel krijgt hier altijd 404. */
     async addApprovalApprover(approvalId, userId) {
-        const res = await this.post('approval-requests/' + approvalId + '/add-approver', { userId: String(userId) });
+        const eigenKey = this.hasOwnKey();
+        if (!eigenKey && this.isApiAccountActief()) {
+            throw new Error('er is nog geen eigen API-key actief voor jouw login. Voeg de goedkeurder toe in Robaws of vraag een kluis-key aan.');
+        }
+        const body = { userId: String(userId) };
+        const res = eigenKey
+            ? await this._personalFetch('POST', 'approval-requests/' + approvalId + '/add-approver', body)
+            : await this.post('approval-requests/' + approvalId + '/add-approver', body);
+        if (res.code === 404) throw new Error(this._AANVRAAG_404);
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) {
             throw new Error('Robaws gaf status ' + res.code);
         }
+        this._goedkMem = null;   // de lijst opnieuw vragen: de aanvraag kan nu bij iemand anders staan
         return true;
     },
 
@@ -1769,13 +1788,13 @@ const RobawsAPI = {
         { naam: 'Messer Belgium',   supplierId: '55',   match: /messer/i },
         { naam: 'Westfalen',        supplierId: '623',  match: /westfalen/i },
     ],
-    GAS_LEVERANCIER_STANDAARD: 'Antwerp Gasdepot',
+    GAS_LEVERANCIER_STANDAARD: 'Air Liquide',   // v443: de echte leverancier komt uit het contract: gasLeverancier()
     // ---- v397: vulstand + logboek (vraag Levi 16 sep) ----
     /** Hoeveel zit er nog in? De sleutel staat in de code, het LABEL gaat naar
      *  Robaws (leesbaar in het extraveld "Vulstand"). */
     GAS_VULSTANDEN: [
         { key: 'vol',     label: 'Vol',     kleur: '#3E7A54', wash: '#E3F0E7', emoji: '🟢' },
-        { key: 'halfvol', label: 'Halfvol', kleur: '#B37514', wash: '#FAEFD9', emoji: '🟡' },
+        { key: 'halfvol', label: 'Halfvol', toon: 'In gebruik', kleur: '#B37514', wash: '#FAEFD9', emoji: '🟡' },
         { key: 'leeg',    label: 'Leeg',    kleur: '#B4372F', wash: '#FBE6E3', emoji: '🔴' },
     ],
     /** Twee extravelden op Materieel die LEVI nog moet aanmaken. Zonder die
@@ -1802,22 +1821,16 @@ const RobawsAPI = {
         bestelpunt: { zuurstof: 2, acetyleen: 2, menggas: 0, propaan: 0 },
         amber: 1,
         legeDrempel: 4,
+        leverancier: 'Air Liquide',
         gassen: [
-            { key: 'zuurstof', naam: 'Zuurstof', prefix: 'Zuurstof', eenheid: 'F', vuldruk: 200, leegOnder: 20,
-              maten: ['F10', 'F20', 'F40', 'F50'],
-              sub: { F10: '10 L \u00b7 \u00b12 m\u00b3', F20: '20 L \u00b7 \u00b14 m\u00b3', F40: '40 L \u00b7 \u00b18 m\u00b3', F50: '50 L \u00b7 \u00b110 m\u00b3' } },
-            { key: 'acetyleen', naam: 'Acetyleen', prefix: 'Acetyleen', eenheid: 'kg', vuldruk: 18, leegOnder: 5,
-              maten: ['1,75 kg', '3,5 kg', '4,9 kg', '7 kg', '8,7 kg'],
-              sub: { '1,75 kg': 'F10', '3,5 kg': 'F20', '4,9 kg': 'F28', '7 kg': 'F40', '8,7 kg': 'F50' } },
-            { key: 'menggas', naam: 'Menggas', prefix: 'Menggas Ferroline C18', eenheid: 'F', vuldruk: 200, leegOnder: 20,
-              maten: ['F10', 'F20', 'F40', 'F50'],
-              sub: { F10: '10 L', F20: '20 L', F40: '40 L', F50: '50 L' } },
-            // v404: propaan voor de dakwerken = omruilfles. Je betaalt de VULLING, geen
-            // dagprijs (gemeten: Antwerp Gasdepot 'Totalgaz/Primagaz 10.5 Kg vulling'),
-            // dus geen huurwaarschuwing en niet in de Messer-controle. Een manometer zegt
+            { key: 'acetyleen', naam: 'Acetyleen', prefix: 'Acetyleen', eenheid: '', vuldruk: 18, leegOnder: 5, kleur: '#7A2E2A', huur: false, maten: ['Klein', 'Groot'], sub: {} },
+            { key: 'zuurstof', naam: 'Zuurstof', prefix: 'Zuurstof', eenheid: '', vuldruk: 200, leegOnder: 20, kleur: '#FFFFFF', huur: false, maten: ['Klein', 'Groot'], sub: {} },
+            { key: 'stikstof', naam: 'Stikstof', prefix: 'Stikstof', eenheid: '', vuldruk: 200, leegOnder: 20, kleur: '#1E1E1E', huur: false, maten: ['Groot'], sub: {} },
+            { key: 'menggas', naam: 'Menggas', prefix: 'Menggas', eenheid: '', vuldruk: 200, leegOnder: 20, kleur: '#5BA84A', huur: false, maten: ['Groot'], sub: {} },
+            // v404: propaan voor de dakwerken = omruilfles, buiten het huurcontract. Een manometer zegt
             // niets: de druk blijft gelijk tot de fles bijna leeg is.
-            { key: 'propaan', naam: 'Propaan', prefix: 'Propaan', eenheid: 'kg', vuldruk: null, leegOnder: null, huur: false,
-              maten: ['10,5 kg', '35 kg'], sub: {} },
+            { key: 'propaan', naam: 'Propaan', prefix: 'Propaan', eenheid: '', vuldruk: null, leegOnder: null, huur: false,
+              maten: ['Klein', 'Groot'], sub: {} },
         ],
     },
     GAS_CONFIG_SLEUTEL: 'qe_gas_config',
@@ -1830,13 +1843,10 @@ const RobawsAPI = {
         if (b && b.bestelpunt && typeof b.bestelpunt === 'object') {
             Object.keys(b.bestelpunt).forEach((k) => { const n = Number(b.bestelpunt[k]); if (n >= 0 && n < 100) bestelpunt[String(k).toLowerCase()] = Math.round(n); });
         }
-        const gassen = std.gassen.map((g) => {
-            const o = Object.assign({}, g);
-            const m = b && b.maten && b.maten[g.key];
-            if (Array.isArray(m) && m.length) o.maten = m.map((x) => String(x).trim()).filter(Boolean).slice(0, 20);
-            return o;
-        });
+        // v443: de gassen en maten komen uit het huurcontract (Worker); de lijst hier is alleen de terugval
+        const gassen = (b && Array.isArray(b.gassen) && b.gassen.length ? b.gassen : std.gassen).map((g) => Object.assign({ sub: {} }, g));
         return { bestelpunt, gassen,
+            leverancier: (b && b.leverancier) || std.leverancier, supplierId: (b && b.supplierId) || '', contract: (b && b.contract) || null,
             amber: (b && Number(b.amber) >= 0) ? Math.round(Number(b.amber)) : std.amber,
             legeDrempel: (b && Number(b.legeDrempel) > 0) ? Math.round(Number(b.legeDrempel)) : std.legeDrempel };
     },
@@ -1933,8 +1943,28 @@ const RobawsAPI = {
         this._gasHuurCache = { at: nu, data: res };
         return res;
     },
+    _gasKeyVan(naam) { return String(naam || '').toLowerCase().replace(/[^a-z0-9]/g, ''); },
+    /** v445: de flessen tegenover het contract, per gas en maat. Zelfde telling als de tegels in de hub. */
+    gasContractTelling(flessen) {
+        const c = this.gasConfig().contract;
+        if (!c || !Array.isArray(c.regels)) return null;
+        const regels = c.regels.filter((r) => Number(r.aantal) > 0).map((r) => ({ gas: r.gas, maat: r.maat, aantal: Number(r.aantal), key: this._gasKeyVan(r.gas), totaal: 0, vol: 0, halfvol: 0, leeg: 0, onbekend: 0 }));
+        let buiten = 0;
+        (flessen || []).forEach((m) => {
+            const key = this.gasSoortKey(m), maat = String(this.gasMaat(m) || '').toLowerCase();
+            const r = regels.find((x) => x.key === key && String(x.maat).toLowerCase() === maat);
+            if (!r) { buiten++; return; }
+            r.totaal++;
+            r[this.gasVulstand(m) || 'onbekend']++;
+        });
+        return { leverancier: c.leverancier, regels, buiten, totaal: regels.reduce((s, r) => s + r.totaal, 0), contract: regels.reduce((s, r) => s + r.aantal, 0) };
+    },
+    /** v443: de leverancier van het huurcontract (komt van de Worker). */
+    gasLeverancier() { return this.gasConfig().leverancier || this.GAS_LEVERANCIER_STANDAARD; },
     gasSupplierId(naam) {
         const n = String(naam || '');
+        const cfg = this.gasConfig();
+        if (n && n === cfg.leverancier && cfg.supplierId) return cfg.supplierId;
         const l = this.GAS_LEVERANCIERS.find(x => x.match.test(n));
         return l ? l.supplierId : null;
     },
@@ -2371,7 +2401,9 @@ const RobawsAPI = {
         const lijst = Object.keys(per).map((k) => per[k]).sort((a, b) => a.soort.localeCompare(b.soort));
         lijst.forEach((r) => {
             r.tekort = r.min > 0 ? Math.max(0, r.min - r.beschikbaar) : 0;
-            r.stand = r.min <= 0 ? 'uit' : (r.beschikbaar <= 0 ? 'rood' : (r.beschikbaar <= c.amber ? 'amber' : 'ok'));
+            // v445: nog niet alle flessen van dit gas ingevoerd = nog geen oordeel; precies het minimum = in orde
+            const nodig = ((c.contract && c.contract.regels) || []).reduce((s, x) => s + (this._gasKeyVan(x.gas) === r.key ? (Number(x.aantal) || 0) : 0), 0);
+            r.stand = (r.min <= 0 || r.totaal < nodig) ? 'uit' : (r.beschikbaar <= 0 ? 'rood' : (r.beschikbaar < r.min ? 'amber' : 'ok'));
         });
         return { magazijn: mag, perSoort: lijst, leeg: leegTotaal,
             tekorten: lijst.filter((r) => r.stand === 'rood' || r.stand === 'amber'),
@@ -2404,7 +2436,7 @@ const RobawsAPI = {
             const typeNaam = (t ? (t.stringValue != null ? t.stringValue : t.value) : null) || this.GAS_TYPE_DEFAULT;
             nieuwId = await this.createGasfles({
                 gasKey, maat, flesnr: nr,
-                leverancier: o.leverancier || oud.brand || this.GAS_LEVERANCIER_STANDAARD,
+                leverancier: o.leverancier || this.gasLeverancier() || oud.brand,
                 huurSinds: o.huurSinds || new Date().toISOString().slice(0, 10),
                 projectId: plaats ? plaats.projectId : null, locId: plaats ? plaats.locId : null, typeNaam,
             });
@@ -8265,6 +8297,27 @@ const RobawsAPI = {
         return uit;
     },
     /** "km: heen 14 (bureau → X) · terug 9 (X → thuis)" — of "km: niet berekend (reden)". */
+    /** v444 (keuze Levi 5 nov 2026): heen = thuis → bureau + bureau → werf. Vraagt de Worker of de camionet vandaag van bij deze werknemer
+     *  thuis naar het bureau reed. → aantal km (0 = nee), null = niet na te kijken (dan telt alleen bureau → werf, zoals vroeger). */
+    async thuisBureauKm(plaat) {
+        try {
+            const s = this.sessieLees && this.sessieLees();
+            if (!s || !s.token || !plaat) return null;
+            const r = await this._fetchWithTimeout(this.WORKER_AUTH_URL + '/bel-api/app-rit-heen?plaat=' + encodeURIComponent(String(plaat)), { headers: { 'X-App-Sessie': s.token } }, 8000);
+            if (!r.ok) return null;
+            const j = await r.json();
+            return (j && j.ok && typeof j.km === 'number') ? Math.round(j.km) : null;
+        } catch (_) { return null; }
+    },
+    /** De kilometers met het stuk thuis → bureau erbij. */
+    kmMetThuisBureau(km, extra) {
+        if (!km || !km.ok || !(extra > 0)) return km;
+        return Object.assign({}, km, { heen: km.heen + extra, vanLabel: 'thuis, via het bureau' });
+    },
+    /** Regel in de opmerking van de klok-werkbon. Zelfde vorm als heenViaBureauUit in de Worker — wijzig je ze, dan beide. */
+    heenViaBureauRegel(extra, plaat) {
+        return 'heen via het bureau: ' + extra + ' km thuis → bureau met de camionet ' + this._wwSchoon(plaat).slice(0, 30);
+    },
     kmRegel(km) {
         if (!km || !km.ok) return 'km: niet berekend (' + this._wwSchoon((km && km.fout) || 'onbekend').slice(0, 120) + ')';
         const plek = (p) => this._wwSchoon(p).slice(0, 90);
